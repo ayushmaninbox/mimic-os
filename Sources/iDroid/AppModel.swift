@@ -1,6 +1,8 @@
 import Foundation
 import Observation
 import AppKit
+import AVFoundation
+import QuickLook
 
 /// The app's central state and the bridge between the SwiftUI views and the
 /// ADB/scrcpy engine. All UI-facing mutations happen on the main actor.
@@ -13,14 +15,12 @@ final class AppModel {
     enum Tab: String, CaseIterable, Identifiable {
         case control = "Control"
         case files = "Files"
-        case notifications = "Notifications"
         case settings = "Settings"
         var id: String { rawValue }
         var systemImage: String {
             switch self {
             case .control: return "rectangle.on.rectangle"
             case .files: return "folder"
-            case .notifications: return "bell"
             case .settings: return "gearshape"
             }
         }
@@ -28,9 +28,9 @@ final class AppModel {
     var selectedTab: Tab = .control
 
     var devices: [Device] = []
+    var previousPresentSerials: Set<String> = []
     var selectedSerial: String?
     var info: DeviceInfo?
-    var notifications: [String] = []
 
     /// Human-readable status line shown at the bottom of the window.
     var status: String = "Welcome to iDroid"
@@ -128,6 +128,16 @@ final class AppModel {
 
         var found = await ADB.listDevices()
         let names = DeviceStore.customNames()
+
+        // Detect newly plugged-in USB or wireless devices and automatically clear their manually-disconnected block
+        let currentlyPresentSerials = Set(found.map(\.serial))
+        for serial in currentlyPresentSerials {
+            if !previousPresentSerials.contains(serial) {
+                DeviceStore.connect(serial)
+            }
+        }
+        previousPresentSerials = currentlyPresentSerials
+
         // Enrich with friendly model names + custom names, and remember the
         // ones that are connected so they persist when offline. Record a stable
         // hardware fingerprint (serialno prop) so the same phone connected via
@@ -135,6 +145,12 @@ final class AppModel {
         var fingerprintBySerial: [String: String] = [:]
         for index in found.indices {
             let serial = found[index].serial
+            
+            // Override state to offline if manually disconnected / ignored
+            if DeviceStore.disconnectedSerials().contains(serial) {
+                found[index] = Device(serial: serial, state: .offline, model: found[index].model, customName: names[serial])
+            }
+
             found[index].customName = names[serial]
             if found[index].state.isUsable {
                 found[index].model = await ADB.model(serial)
@@ -185,6 +201,14 @@ final class AppModel {
 
         devices = found
 
+        if let serial = mirroringSerial,
+           let device = found.first(where: { $0.serial == serial }),
+           !device.state.isUsable {
+            scrcpy.stop()
+            mirroringSerial = nil
+            status = "Mirror stopped (device disconnected)"
+        }
+
         // Keep a valid selection.
         if let selectedSerial, !found.contains(where: { $0.serial == selectedSerial }) {
             self.selectedSerial = nil
@@ -212,8 +236,9 @@ final class AppModel {
 
     /// Reconnect a remembered wireless device (USB devices reconnect on plug-in).
     func reconnect(_ device: Device) async {
+        DeviceStore.connect(device.serial)
         guard device.isWireless else {
-            status = "Plug in \(device.displayName) over USB to reconnect."
+            await refreshDevices()
             return
         }
         isConnecting = true
@@ -223,6 +248,7 @@ final class AppModel {
 
     /// Drop the connection but keep the device remembered.
     func disconnect(_ device: Device) async {
+        DeviceStore.disconnect(device.serial)
         if mirroringSerial == device.serial {
             scrcpy.stop()
             mirroringSerial = nil
@@ -237,6 +263,7 @@ final class AppModel {
 
     /// Disconnect AND forget: remove from the remembered list and clear its name.
     func forget(_ device: Device) async {
+        DeviceStore.disconnect(device.serial)
         if device.state.isUsable, device.isWireless {
             _ = await ADB.disconnect(hostPort: device.serial)
         }
@@ -253,7 +280,6 @@ final class AppModel {
     func select(_ serial: String) async {
         selectedSerial = serial
         info = await ADB.info(serial)
-        notifications = await ADB.notificationSnapshot(serial)
         updateBackgroundClipboardSync()
     }
 
@@ -564,7 +590,7 @@ final class AppModel {
 
     // MARK: - File browser
 
-    var activePreviewProcess: Process?
+    var activePreviewURL: URL? = nil
     var activePreviewFilePath: String?
     var thumbnailLoadedTrigger: Bool = false
     @ObservationIgnored private var activeDownloads: Set<String> = []
@@ -715,11 +741,9 @@ final class AppModel {
         guard let serial = selectedSerial else { return }
         if let path { browsePath = path }
         
-        if let oldProc = activePreviewProcess {
-            oldProc.terminate()
-            activePreviewProcess = nil
-        }
+        activePreviewURL = nil
         activePreviewFilePath = nil
+        lastClickedFilePath = nil
 
         isBrowsing = true
         defer { isBrowsing = false }
@@ -740,9 +764,73 @@ final class AppModel {
 
     // MARK: - File multi-select & bulk actions
 
+    var lastClickedFilePath: String?
+
+    func selectFile(_ file: ADB.RemoteFile, shiftPressed: Bool, commandPressed: Bool) {
+        if commandPressed {
+            toggleSelection(file)
+            lastClickedFilePath = file.path
+        } else if shiftPressed, let last = lastClickedFilePath,
+                  let lastIdx = sortedFiles.firstIndex(where: { $0.path == last }),
+                  let curIdx = sortedFiles.firstIndex(where: { $0.path == file.path }) {
+            let start = min(lastIdx, curIdx)
+            let end = max(lastIdx, curIdx)
+            let rangeFiles = sortedFiles[start...end]
+            selectedFiles.formUnion(rangeFiles.map(\.path))
+        } else {
+            selectedFiles = [file.path]
+            lastClickedFilePath = file.path
+        }
+    }
+
     func toggleSelection(_ file: ADB.RemoteFile) {
         if selectedFiles.contains(file.path) { selectedFiles.remove(file.path) }
         else { selectedFiles.insert(file.path) }
+    }
+
+    func copySelectedFilesToClipboard() {
+        let selected = selectedRemoteFiles
+        guard !selected.isEmpty else { return }
+        
+        status = "Copying \(selected.count) item(s)..."
+        
+        Task {
+            var localURLs: [URL] = []
+            for file in selected {
+                if let localURL = await stageForDragOut(file) {
+                    localURLs.append(localURL)
+                }
+            }
+            guard !localURLs.isEmpty else {
+                status = "Failed to copy files"
+                return
+            }
+            
+            #if os(macOS)
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.writeObjects(localURLs.map { $0 as NSURL })
+            #endif
+            status = "Copied \(localURLs.count) item(s) to Mac clipboard"
+        }
+    }
+
+    func pasteFilesFromClipboard() {
+        #if os(macOS)
+        let pasteboard = NSPasteboard.general
+        guard let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL],
+              !urls.isEmpty else {
+            status = "No files on Mac clipboard to paste"
+            return
+        }
+        let filePaths = urls.filter { $0.isFileURL }.map { $0.path }
+        guard !filePaths.isEmpty else { return }
+        
+        status = "Pasting \(filePaths.count) item(s) from Mac..."
+        Task {
+            await uploadToCurrentFolder(localPaths: filePaths)
+        }
+        #endif
     }
 
     var hasSelection: Bool { !selectedFiles.isEmpty }
@@ -966,10 +1054,7 @@ final class AppModel {
     func previewFile(_ file: ADB.RemoteFile) async {
         guard let serial = selectedSerial else { return }
         
-        if let oldProc = activePreviewProcess {
-            oldProc.terminate()
-            activePreviewProcess = nil
-        }
+        activePreviewURL = nil
         activePreviewFilePath = file.path
         
         let previewDir = FileManager.default.temporaryDirectory
@@ -1014,8 +1099,7 @@ final class AppModel {
         
         if result.succeeded {
             status = "Opening preview of \(file.name)"
-            let proc = Shell.launch("/usr/bin/qlmanage", ["-p", localDest.path])
-            activePreviewProcess = proc
+            activePreviewURL = localDest
         } else {
             status = "Failed to download preview: \(result.stderr.trimmingCharacters(in: .whitespacesAndNewlines))"
         }
@@ -1027,10 +1111,11 @@ final class AppModel {
         let currentPath = selectedFiles.first
         let index = files.firstIndex(where: { $0.path == currentPath }) ?? -1
         let nextIndex = min(files.count - 1, index + 1)
-        selectedFiles = [files[nextIndex].path]
+        let nextFile = files[nextIndex]
+        selectedFiles = [nextFile.path]
+        lastClickedFilePath = nextFile.path
         
-        if let proc = activePreviewProcess, proc.isRunning {
-            let nextFile = files[nextIndex]
+        if activePreviewURL != nil {
             Task {
                 await previewFile(nextFile)
             }
@@ -1043,10 +1128,11 @@ final class AppModel {
         let currentPath = selectedFiles.first
         let index = files.firstIndex(where: { $0.path == currentPath }) ?? 0
         let prevIndex = max(0, index - 1)
-        selectedFiles = [files[prevIndex].path]
+        let prevFile = files[prevIndex]
+        selectedFiles = [prevFile.path]
+        lastClickedFilePath = prevFile.path
         
-        if let proc = activePreviewProcess, proc.isRunning {
-            let prevFile = files[prevIndex]
+        if activePreviewURL != nil {
             Task {
                 await previewFile(prevFile)
             }
@@ -1080,19 +1166,24 @@ final class AppModel {
         activeDownloads.insert(file.path)
         
         Task {
-            if isVideo { return }
-            
             let tempDir = FileManager.default.temporaryDirectory
                 .appendingPathComponent("iDroid-thumb-temp", isDirectory: true)
             try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
             
-            let tempDest = tempDir.appendingPathComponent(UUID().uuidString + ".jpg")
+            let ext = (file.name as NSString).pathExtension
+            let tempDest = tempDir.appendingPathComponent(UUID().uuidString + ".\(ext)")
             let result = await ADB.pull(serial, remotePath: file.path, localPath: tempDest.path)
             
             if result.succeeded {
-                await Task.detached(priority: .background) {
-                    saveScaledImage(from: tempDest, to: localURL)
-                }.value
+                if isVideo {
+                    await Task.detached(priority: .background) {
+                        saveVideoThumbnail(from: tempDest, to: localURL)
+                    }.value
+                } else {
+                    await Task.detached(priority: .background) {
+                        saveScaledImage(from: tempDest, to: localURL)
+                    }.value
+                }
             }
             try? FileManager.default.removeItem(at: tempDest)
             
@@ -1159,5 +1250,24 @@ func saveScaledImage(from sourceURL: URL, to destURL: URL) {
        let bitmap = NSBitmapImageRep(data: tiff),
        let jpeg = bitmap.representation(using: .jpeg, properties: [:]) {
         try? jpeg.write(to: destURL)
+    }
+}
+
+/// Video thumbnail generator (runs on background thread).
+func saveVideoThumbnail(from videoURL: URL, to destURL: URL) {
+    let asset = AVAsset(url: videoURL)
+    let generator = AVAssetImageGenerator(asset: asset)
+    generator.appliesPreferredTrackTransform = true
+    let time = CMTime(seconds: 0.0, preferredTimescale: 600)
+    do {
+        let imageRef = try generator.copyCGImage(at: time, actualTime: nil)
+        let nsImage = NSImage(cgImage: imageRef, size: NSSize(width: 120, height: 120))
+        if let tiffData = nsImage.tiffRepresentation,
+           let bitmap = NSBitmapImageRep(data: tiffData),
+           let jpegData = bitmap.representation(using: .jpeg, properties: [:]) {
+            try jpegData.write(to: destURL)
+        }
+    } catch {
+        print("Failed to generate video thumbnail: \(error)")
     }
 }

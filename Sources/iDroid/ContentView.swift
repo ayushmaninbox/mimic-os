@@ -19,6 +19,12 @@ struct ContentView: View {
             Divider()
             StatusBar()
         }
+        .onAppear {
+            #if os(macOS)
+            NSApp.setActivationPolicy(.regular)
+            NSApp.activate(ignoringOtherApps: true)
+            #endif
+        }
     }
 }
 
@@ -138,16 +144,16 @@ struct DeviceRow: View {
             Spacer()
         }
         .padding(.vertical, 2)
-        .opacity(device.isOffline ? 0.55 : 1)
+        .opacity((device.isOffline || device.state == .offline) ? 0.55 : 1)
     }
 
     private var iconColor: Color {
-        if device.isOffline { return .secondary }
+        if device.isOffline || device.state == .offline { return .secondary }
         return device.state.isUsable ? .green : .orange
     }
 
     private var stateLabel: String {
-        if device.isOffline { return "Saved · tap menu to connect" }
+        if device.isOffline || device.state == .offline { return "Disconnected · tap menu to connect" }
         switch device.state {
         case .ready: return device.isWireless ? "Wireless · ready" : "USB · ready"
         case .unauthorized: return "Unauthorized — accept the prompt on the phone"
@@ -186,16 +192,11 @@ struct DiscoveredRow: View {
 /// A small focused sheet for renaming a device. Sheets give a reliable,
 /// editable, auto-focused text field (alert text fields are flaky on macOS).
 struct RenameSheet: View {
-    @State private var name: String
+    let initialName: String
+    @State private var name: String = ""
     @FocusState private var focused: Bool
     let onSave: (String) -> Void
     let onCancel: () -> Void
-
-    init(initialName: String, onSave: @escaping (String) -> Void, onCancel: @escaping () -> Void) {
-        _name = State(initialValue: initialName)
-        self.onSave = onSave
-        self.onCancel = onCancel
-    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -217,7 +218,10 @@ struct RenameSheet: View {
         }
         .padding(20)
         .frame(width: 340)
-        .onAppear { focused = true }
+        .onAppear {
+            name = initialName
+            focused = true
+        }
     }
 }
 

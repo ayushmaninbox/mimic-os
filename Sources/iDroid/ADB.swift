@@ -377,28 +377,5 @@ enum ADB {
                                               "-p", package, "-c", "android.intent.category.LAUNCHER", "1"])
     }
 
-    // MARK: - Notifications (app-free polling)
-
-    /// A best-effort snapshot of active notifications via `dumpsys notification`.
-    /// This is a coarse text scrape — good enough for a list, not for actions.
-    static func notificationSnapshot(_ serial: String) async -> [String] {
-        let result = await Shell.run(ToolLocator.adb, ["-s", serial, "shell", "dumpsys", "notification", "--noredact"])
-        guard result.succeeded else { return [] }
-
-        var titles: [String] = []
-        for line in result.stdout.split(separator: "\n") {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            // android.title and android.text show up as "key=String (value)".
-            if trimmed.hasPrefix("android.title=") || trimmed.hasPrefix("android.text=") {
-                if let value = trimmed.split(separator: "=", maxSplits: 1).last {
-                    let cleaned = value
-                        .replacingOccurrences(of: "String (", with: "")
-                        .replacingOccurrences(of: ")", with: "")
-                        .trimmingCharacters(in: .whitespaces)
-                    if !cleaned.isEmpty { titles.append(cleaned) }
-                }
-            }
-        }
-        return titles
-    }
 }
+

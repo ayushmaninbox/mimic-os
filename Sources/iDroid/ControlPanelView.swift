@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
+import QuickLook
 
 /// The main detail pane: a top tab navbar with per-tab content.
 struct ControlPanelView: View {
@@ -8,40 +9,52 @@ struct ControlPanelView: View {
     @State private var renameRequest: RenameRequest?
 
     var body: some View {
-        if model.selectedDevice == nil {
-            ContentUnavailableView("No device selected",
-                                   systemImage: "iphone",
-                                   description: Text("Pick a device from the sidebar, or connect one over USB."))
-        } else {
-            @Bindable var model = model
-            VStack(spacing: 0) {
-                if let device = model.selectedDevice {
+        if let device = model.selectedDevice {
+            if !device.state.isUsable {
+                ContentUnavailableView {
+                    Label("\(device.displayName) is disconnected", systemImage: "cable.connector.slash")
+                } description: {
+                    Text("Reconnect this device to view files, mirror, and control it.")
+                } actions: {
+                    Button("Connect") {
+                        Task { await model.reconnect(device) }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(model.isConnecting)
+                }
+            } else {
+                @Bindable var model = model
+                VStack(spacing: 0) {
                     DeviceDetailHeader(device: device) {
                         renameRequest = RenameRequest(serial: device.serial,
                                                       initialName: device.customName ?? device.displayName)
                     }
                     Divider()
+                    TabNavBar(selection: $model.selectedTab)
+                    Divider()
+                    Group {
+                        switch model.selectedTab {
+                        case .control:        ControlTab()
+                        case .files:          FilesTab()
+                        case .settings:       SettingsTab()
+                        }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
-                TabNavBar(selection: $model.selectedTab)
-                Divider()
-                Group {
-                    switch model.selectedTab {
-                    case .control:        ControlTab()
-                    case .files:          FilesTab()
-                    case .notifications:  NotificationsTab()
-                    case .settings:       SettingsTab()
+                .quickLookPreview($model.activePreviewURL)
+                .sheet(item: $renameRequest) { request in
+                    RenameSheet(initialName: request.initialName) { newName in
+                        model.rename(request.serial, to: newName)
+                        renameRequest = nil
+                    } onCancel: {
+                        renameRequest = nil
                     }
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            .sheet(item: $renameRequest) { request in
-                RenameSheet(initialName: request.initialName) { newName in
-                    model.rename(request.serial, to: newName)
-                    renameRequest = nil
-                } onCancel: {
-                    renameRequest = nil
-                }
-            }
+        } else {
+            ContentUnavailableView("No device selected",
+                                   systemImage: "iphone",
+                                   description: Text("Pick a device from the sidebar, or connect one over USB."))
         }
     }
 }
@@ -86,18 +99,6 @@ private struct ControlTab: View {
     }
 }
 
-// MARK: - Notifications tab
-
-private struct NotificationsTab: View {
-    var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
-                NotificationsSection()
-            }
-            .padding(20)
-        }
-    }
-}
 
 // MARK: - Settings tab (mirror options + clipboard live here too)
 
@@ -194,7 +195,9 @@ private struct FilesTab: View {
 
             // Invisible Spacebar shortcut handler
             Button("") {
-                if let selected = selectedFile {
+                if model.activePreviewURL != nil {
+                    model.activePreviewURL = nil
+                } else if let selected = selectedFile {
                     Task { await model.previewFile(selected) }
                 }
             }
@@ -232,6 +235,31 @@ private struct FilesTab: View {
                 model.selectNextFile()
             }
             .keyboardShortcut(.downArrow, modifiers: [])
+            .buttonStyle(.plain)
+            .frame(width: 0, height: 0)
+            .opacity(0)
+
+            // Invisible Copy / Paste / Select All shortcut handlers
+            Button("") {
+                model.copySelectedFilesToClipboard()
+            }
+            .keyboardShortcut("c", modifiers: [.command])
+            .buttonStyle(.plain)
+            .frame(width: 0, height: 0)
+            .opacity(0)
+            
+            Button("") {
+                model.pasteFilesFromClipboard()
+            }
+            .keyboardShortcut("v", modifiers: [.command])
+            .buttonStyle(.plain)
+            .frame(width: 0, height: 0)
+            .opacity(0)
+
+            Button("") {
+                model.selectAllFiles()
+            }
+            .keyboardShortcut("a", modifiers: [.command])
             .buttonStyle(.plain)
             .frame(width: 0, height: 0)
             .opacity(0)
@@ -516,11 +544,9 @@ private struct FileGridTile: View {
         )
         .onHover { hovering = $0 }
         .onTapGesture {
-            if NSEvent.modifierFlags.contains(.command) {
-                model.toggleSelection(file)
-            } else {
-                model.selectedFiles = [file.path]
-            }
+            let shift = NSEvent.modifierFlags.contains(.shift)
+            let cmd = NSEvent.modifierFlags.contains(.command)
+            model.selectFile(file, shiftPressed: shift, commandPressed: cmd)
         }
         .onTapGesture(count: 2) {
             if file.isDirectory {
@@ -627,11 +653,9 @@ private struct FileRow: View {
         .animation(.easeInOut(duration: 0.1), value: isSelected)
         .onHover { hovering = $0 }
         .onTapGesture {
-            if NSEvent.modifierFlags.contains(.command) {
-                model.toggleSelection(file)
-            } else {
-                model.selectedFiles = [file.path]
-            }
+            let shift = NSEvent.modifierFlags.contains(.shift)
+            let cmd = NSEvent.modifierFlags.contains(.command)
+            model.selectFile(file, shiftPressed: shift, commandPressed: cmd)
         }
         .onTapGesture(count: 2) {
             if file.isDirectory { Task { await model.openFolder(file) } }
@@ -1084,23 +1108,4 @@ private struct TransferRowView: View {
     }
 }
 
-// MARK: - Notifications
 
-private struct NotificationsSection: View {
-    @Environment(AppModel.self) private var model
-
-    var body: some View {
-        SectionCard(title: "Notifications (snapshot)", systemImage: "bell") {
-            if model.notifications.isEmpty {
-                Text("No notifications captured. Press Refresh in the sidebar to re-scan.")
-                    .font(.caption).foregroundStyle(.secondary)
-            } else {
-                ForEach(Array(model.notifications.prefix(15).enumerated()), id: \.offset) { _, line in
-                    Text("• \(line)").font(.callout)
-                }
-            }
-            Text("App-free snapshot via dumpsys — coarse and not real-time.")
-                .font(.caption2).foregroundStyle(.tertiary)
-        }
-    }
-}

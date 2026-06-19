@@ -6,8 +6,27 @@ import Foundation
 struct DeviceStore {
     private static let namesKey = "iDroid.customNames"
     private static let knownKey = "iDroid.knownSerials"
+    private static let disconnectedKey = "iDroid.disconnectedSerials"
 
     private static var defaults: UserDefaults { .standard }
+
+    // MARK: - Manually disconnected devices
+
+    static func disconnectedSerials() -> Set<String> {
+        Set(defaults.stringArray(forKey: disconnectedKey) ?? [])
+    }
+
+    static func disconnect(_ serial: String) {
+        var set = disconnectedSerials()
+        set.insert(serial)
+        defaults.set(Array(set), forKey: disconnectedKey)
+    }
+
+    static func connect(_ serial: String) {
+        var set = disconnectedSerials()
+        set.remove(serial)
+        defaults.set(Array(set), forKey: disconnectedKey)
+    }
 
     // MARK: - Custom names
 
