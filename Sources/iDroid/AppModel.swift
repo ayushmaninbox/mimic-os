@@ -31,7 +31,11 @@ final class AppModel {
     var stayAwake: Bool = true
 
     private let scrcpy = Scrcpy()
-    var isMirroring: Bool { scrcpy.isRunning }
+
+    /// Serial of the device currently being mirrored, or nil. This is observable
+    /// (unlike `scrcpy.isRunning`), so the UI updates the moment we start/stop.
+    private(set) var mirroringSerial: String?
+    var isMirroring: Bool { mirroringSerial != nil }
 
     // MARK: - Wireless discovery & pairing
 
@@ -84,10 +88,26 @@ final class AppModel {
         defer { isWorking = false }
 
         var found = await ADB.listDevices()
-        // Enrich with friendly model names.
-        for index in found.indices where found[index].state.isUsable {
-            found[index].model = await ADB.model(found[index].serial)
+        let names = DeviceStore.customNames()
+        // Enrich with friendly model names + custom names, and remember the
+        // ones that are connected so they persist when offline.
+        for index in found.indices {
+            let serial = found[index].serial
+            found[index].customName = names[serial]
+            if found[index].state.isUsable {
+                found[index].model = await ADB.model(serial)
+                DeviceStore.remember(serial)
+            }
         }
+
+        // Append remembered devices that aren't currently connected, as offline
+        // entries so the user can reconnect or delete them.
+        let connectedSerials = Set(found.map(\.serial))
+        for serial in DeviceStore.knownSerials() where !connectedSerials.contains(serial) {
+            found.append(Device(serial: serial, state: .offline,
+                                model: nil, customName: names[serial], isOffline: true))
+        }
+
         devices = found
 
         // Keep a valid selection.
@@ -99,9 +119,57 @@ final class AppModel {
             await select(first.serial)
         }
 
-        status = found.isEmpty
-            ? "No devices. Connect via USB with debugging enabled."
-            : "\(found.count) device(s) connected"
+        let onlineCount = found.filter { $0.state.isUsable }.count
+        status = onlineCount == 0
+            ? "No devices connected. Use + to add one."
+            : "\(onlineCount) device(s) connected"
+    }
+
+    // MARK: - Rename / connect / disconnect / forget
+
+    func rename(_ serial: String, to name: String) {
+        DeviceStore.setCustomName(name, for: serial)
+        if let index = devices.firstIndex(where: { $0.serial == serial }) {
+            devices[index].customName = name.trimmingCharacters(in: .whitespaces).isEmpty ? nil : name
+        }
+    }
+
+    /// Reconnect a remembered wireless device (USB devices reconnect on plug-in).
+    func reconnect(_ device: Device) async {
+        guard device.isWireless else {
+            status = "Plug in \(device.displayName) over USB to reconnect."
+            return
+        }
+        await connectWireless(hostPort: device.serial)
+    }
+
+    /// Drop the connection but keep the device remembered.
+    func disconnect(_ device: Device) async {
+        if mirroringSerial == device.serial {
+            scrcpy.stop()
+            mirroringSerial = nil
+        }
+        if device.isWireless {
+            _ = await ADB.disconnect(hostPort: device.serial)
+        }
+        if selectedSerial == device.serial { selectedSerial = nil; info = nil }
+        await refreshDevices()
+        status = "Disconnected \(device.displayName)"
+    }
+
+    /// Disconnect AND forget: remove from the remembered list and clear its name.
+    func forget(_ device: Device) async {
+        if device.state.isUsable, device.isWireless {
+            _ = await ADB.disconnect(hostPort: device.serial)
+        }
+        if mirroringSerial == device.serial {
+            scrcpy.stop()
+            mirroringSerial = nil
+        }
+        DeviceStore.forget(device.serial)
+        if selectedSerial == device.serial { selectedSerial = nil; info = nil }
+        await refreshDevices()
+        status = "Removed \(device.displayName)"
     }
 
     func select(_ serial: String) async {
@@ -117,14 +185,25 @@ final class AppModel {
             status = "Select a device first"
             return
         }
-        if scrcpy.isRunning {
+        if isMirroring {
             scrcpy.stop()
+            mirroringSerial = nil
             status = "Mirror stopped"
         } else {
             var options = Scrcpy.Options()
             options.turnScreenOff = turnScreenOff
             options.stayAwake = stayAwake
-            let ok = scrcpy.start(serial: serial, options: options)
+            // Clear our observable state when scrcpy exits on its own (e.g. the
+            // user closes the mirror window) so the button flips back to Start.
+            let ok = scrcpy.start(serial: serial, options: options) { [weak self] in
+                Task { @MainActor in
+                    if self?.mirroringSerial == serial {
+                        self?.mirroringSerial = nil
+                        self?.status = "Mirror stopped"
+                    }
+                }
+            }
+            mirroringSerial = ok ? serial : nil
             status = ok
                 ? (turnScreenOff ? "Mirroring (phone screen off)" : "Mirroring")
                 : "Failed to start scrcpy"
@@ -272,6 +351,63 @@ final class AppModel {
         pairingSession = nil
         qrPhase = .showing
     }
+
+    // MARK: - USB -> wireless over hotspot (no Wi-Fi / Wireless-debugging needed)
+
+    /// Phases for the hotspot "go wireless" flow, surfaced to the UI.
+    enum HotspotPhase: Equatable {
+        case idle
+        case needsUSB                 // no USB device detected yet
+        case working(String)          // a step is running (message)
+        case connected(String)        // now reachable wirelessly at host:port
+        case failed(String)
+    }
+
+    var hotspotPhase: HotspotPhase = .idle
+
+    /// The one-click flow: requires a USB-connected device. Detects the phone's
+    /// reachable IP over USB, flips it to TCP/IP, then connects over the network
+    /// so the cable can be unplugged. Works while the phone shares a hotspot.
+    func goWirelessOverHotspot() async {
+        guard let usb = devices.first(where: { !$0.isWireless && $0.state.isUsable }) else {
+            hotspotPhase = .needsUSB
+            status = "Plug the phone in via USB first."
+            return
+        }
+
+        hotspotPhase = .working("Finding the phone's address…")
+        let ip = await ADB.wirelessIP(usb.serial)
+        guard let ip else {
+            hotspotPhase = .failed("Couldn't detect the phone's IP. Make sure the hotspot is on and the Mac is joined to it.")
+            return
+        }
+
+        hotspotPhase = .working("Switching the phone to wireless…")
+        let tcpip = await ADB.enableTcpip(usb.serial, port: 5555)
+        guard tcpip.succeeded else {
+            hotspotPhase = .failed("Couldn't enable wireless mode: \(tcpip.stderr.trimmingCharacters(in: .whitespacesAndNewlines))")
+            return
+        }
+
+        // The daemon needs a moment to restart in TCP/IP mode before it accepts
+        // a network connection.
+        try? await Task.sleep(for: .seconds(1))
+
+        let hostPort = "\(ip):5555"
+        hotspotPhase = .working("Connecting to \(hostPort)…")
+        let connect = await ADB.connect(hostPort: hostPort)
+        await refreshDevices()
+
+        if devices.contains(where: { $0.serial == hostPort && $0.state.isUsable }) {
+            hotspotPhase = .connected(hostPort)
+            status = "Wireless over hotspot — you can unplug the USB cable now."
+        } else {
+            let detail = (connect.stdout + " " + connect.stderr).trimmingCharacters(in: .whitespacesAndNewlines)
+            hotspotPhase = .failed("Connected command ran but device isn't ready: \(detail)")
+        }
+    }
+
+    func resetHotspotPhase() { hotspotPhase = .idle }
 
     // MARK: - Files
 

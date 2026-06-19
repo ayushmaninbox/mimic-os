@@ -85,6 +85,70 @@ enum ADB {
         await Shell.run(ToolLocator.adb, ["disconnect", hostPort])
     }
 
+    // MARK: - USB -> wireless (TCP/IP) — works over a phone hotspot
+
+    /// Switches a USB-connected device's adb daemon to listen over TCP/IP on the
+    /// given port. This is the classic `adb tcpip` path: it does NOT require the
+    /// phone's "Wireless debugging" toggle (which Android disables when there's
+    /// no Wi-Fi network), so it works while the phone is sharing a hotspot.
+    ///
+    /// After this succeeds the USB cable can be unplugged and we connect over
+    /// the network. Note: the device falls back to USB mode on reboot.
+    static func enableTcpip(_ serial: String, port: Int = 5555) async -> ProcessResult {
+        await Shell.run(ToolLocator.adb, ["-s", serial, "tcpip", "\(port)"])
+    }
+
+    /// Best-effort detection of the IP address the Mac can reach the phone on.
+    ///
+    /// When the phone is the hotspot, its access-point interface carries a
+    /// gateway address (commonly 192.168.43.1). We read the phone's interfaces
+    /// over the USB connection and pick the most likely LAN/hotspot address.
+    static func wirelessIP(_ serial: String) async -> String? {
+        // `ip route` / `ip addr` are the modern tools; fall back to ifconfig.
+        let candidates = [
+            ["shell", "ip", "-f", "inet", "addr", "show"],
+            ["shell", "ifconfig"]
+        ]
+        for args in candidates {
+            let result = await Shell.run(ToolLocator.adb, ["-s", serial] + args)
+            guard result.succeeded else { continue }
+            if let ip = parsePrivateIPv4(result.stdout) { return ip }
+        }
+        return nil
+    }
+
+    /// Pulls the first private (RFC1918) IPv4 out of `ip addr` / `ifconfig`
+    /// output, preferring hotspot/Wi-Fi ranges over others. Skips loopback.
+    private static func parsePrivateIPv4(_ text: String) -> String? {
+        // Collect every "inet <ip>" we see.
+        var found: [String] = []
+        for raw in text.split(separator: "\n") {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            guard line.hasPrefix("inet ") || line.contains(" inet ") else { continue }
+            let tokens = line.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+            guard let idx = tokens.firstIndex(of: "inet"), idx + 1 < tokens.count else { continue }
+            // Strip any CIDR suffix or "addr:" prefix.
+            var ip = tokens[idx + 1]
+            ip = ip.replacingOccurrences(of: "addr:", with: "")
+            ip = ip.split(separator: "/").first.map(String.init) ?? ip
+            if isPrivateIPv4(ip) { found.append(ip) }
+        }
+        // Prefer the typical Android hotspot/Wi-Fi ranges.
+        let preferred = ["192.168.43.", "192.168.", "172.", "10."]
+        for prefix in preferred {
+            if let hit = found.first(where: { $0.hasPrefix(prefix) }) { return hit }
+        }
+        return found.first
+    }
+
+    private static func isPrivateIPv4(_ ip: String) -> Bool {
+        if ip == "127.0.0.1" { return false }
+        return ip.hasPrefix("10.")
+            || ip.hasPrefix("192.168.")
+            || (172...172).contains(Int(ip.split(separator: ".").first ?? "") ?? 0)
+                && (16...31).contains(Int(ip.split(separator: ".").dropFirst().first ?? "") ?? 0)
+    }
+
     /// One service line from `adb mdns services`.
     struct MDNSService {
         let instanceName: String   // e.g. "adb-XXXX-YYYY" or our QR service name

@@ -23,6 +23,8 @@ struct ContentView: View {
 
 struct DeviceListView: View {
     @Environment(AppModel.self) private var model
+    @State private var renameTarget: String?   // serial being renamed
+    @State private var renameText: String = ""
 
     var body: some View {
         @Bindable var model = model
@@ -39,7 +41,9 @@ struct DeviceListView: View {
                         .font(.callout)
                 }
                 ForEach(model.devices) { device in
-                    DeviceRow(device: device).tag(device.serial)
+                    DeviceRow(device: device)
+                        .tag(device.serial)
+                        .contextMenu { deviceMenu(device) }
                 }
             }
 
@@ -50,6 +54,19 @@ struct DeviceListView: View {
                     }
                 }
             }
+        }
+        .alert("Rename device", isPresented: Binding(
+            get: { renameTarget != nil },
+            set: { if !$0 { renameTarget = nil } }
+        )) {
+            TextField("Name", text: $renameText)
+            Button("Cancel", role: .cancel) { renameTarget = nil }
+            Button("Save") {
+                if let serial = renameTarget { model.rename(serial, to: renameText) }
+                renameTarget = nil
+            }
+        } message: {
+            Text("Choose a name shown only in iDroid (stored on this Mac).")
         }
         .toolbar {
             ToolbarItem {
@@ -75,6 +92,30 @@ struct DeviceListView: View {
             AddDeviceSheet()
         }
     }
+
+    @ViewBuilder
+    private func deviceMenu(_ device: Device) -> some View {
+        Button {
+            renameText = device.customName ?? device.displayName
+            renameTarget = device.serial
+        } label: { Label("Rename…", systemImage: "pencil") }
+
+        if device.state.isUsable {
+            Button {
+                Task { await model.disconnect(device) }
+            } label: { Label("Disconnect", systemImage: "wifi.slash") }
+        } else {
+            Button {
+                Task { await model.reconnect(device) }
+            } label: { Label("Connect", systemImage: "link") }
+        }
+
+        Divider()
+
+        Button(role: .destructive) {
+            Task { await model.forget(device) }
+        } label: { Label("Remove from iDroid", systemImage: "trash") }
+    }
 }
 
 struct DeviceRow: View {
@@ -83,16 +124,24 @@ struct DeviceRow: View {
     var body: some View {
         HStack(spacing: 10) {
             Image(systemName: device.isWireless ? "wifi" : "cable.connector")
-                .foregroundStyle(device.state.isUsable ? .green : .orange)
+                .foregroundStyle(iconColor)
             VStack(alignment: .leading, spacing: 2) {
                 Text(device.displayName).font(.body)
                 Text(stateLabel).font(.caption).foregroundStyle(.secondary)
             }
+            Spacer()
         }
         .padding(.vertical, 2)
+        .opacity(device.isOffline ? 0.55 : 1)
+    }
+
+    private var iconColor: Color {
+        if device.isOffline { return .secondary }
+        return device.state.isUsable ? .green : .orange
     }
 
     private var stateLabel: String {
+        if device.isOffline { return "Saved · tap menu to connect" }
         switch device.state {
         case .ready: return device.isWireless ? "Wireless · ready" : "USB · ready"
         case .unauthorized: return "Unauthorized — accept the prompt on the phone"

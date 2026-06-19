@@ -8,6 +8,10 @@ struct Device: Identifiable, Hashable {
     let state: State
     /// Friendly model name, populated lazily from `getprop`.
     var model: String?
+    /// User-assigned name stored on the Mac; overrides everything when set.
+    var customName: String?
+    /// True when this is a remembered device that isn't currently connected.
+    var isOffline: Bool = false
 
     var id: String { serial }
 
@@ -18,6 +22,7 @@ struct Device: Identifiable, Hashable {
 
     /// Best label to show in the UI.
     var displayName: String {
+        if let customName, !customName.isEmpty { return customName }
         if let model, !model.isEmpty { return model }
         return serial
     }

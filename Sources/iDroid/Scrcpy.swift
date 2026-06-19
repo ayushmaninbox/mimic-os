@@ -36,13 +36,16 @@ final class Scrcpy {
     /// True while a mirror session is running.
     var isRunning: Bool { process?.isRunning ?? false }
 
-    /// Starts a mirror session for the given device serial.
+    /// Starts a mirror session for the given device serial. `onExit` fires when
+    /// scrcpy terminates for any reason (including the user closing its window).
     @discardableResult
-    func start(serial: String, options: Options = Options()) -> Bool {
+    func start(serial: String, options: Options = Options(), onExit: (@Sendable () -> Void)? = nil) -> Bool {
         stop() // never run two sessions for the same controller
         let args = ["-s", serial] + options.asArguments()
-        process = Shell.launch(ToolLocator.scrcpy, args)
-        return process != nil
+        let launched = Shell.launch(ToolLocator.scrcpy, args)
+        launched?.terminationHandler = { _ in onExit?() }
+        process = launched
+        return launched != nil
     }
 
     /// Terminates the running mirror session, if any.

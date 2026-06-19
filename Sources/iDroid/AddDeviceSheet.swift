@@ -20,31 +20,39 @@ struct AddDeviceSheet: View {
                 case .choose:   ChooserView(step: $step)
                 case .usb:      USBGuideView()
                 case .wireless: WirelessGuideView()
+                case .hotspot:  HotspotGuideView()
                 }
             }
             .padding(24)
+            .frame(maxHeight: .infinity, alignment: .top)
         }
-        .frame(width: 460)
-        .frame(minHeight: 420)
+        .frame(width: 520)
+        .frame(minHeight: 440)
     }
 
     private var header: some View {
-        HStack {
-            if step != .choose {
-                Button {
-                    step = .choose
-                } label: {
-                    Label("Back", systemImage: "chevron.left")
-                }
-                .buttonStyle(.plain)
-            }
-            Spacer()
+        ZStack {
+            // Centered title, independent of the side buttons' widths.
             Text("Add a device").font(.headline)
-            Spacer()
-            Button("Done") { dismiss() }
+
+            HStack {
+                if step != .choose {
+                    Button {
+                        step = .choose
+                    } label: {
+                        Label("Back", systemImage: "chevron.left")
+                    }
+                } else {
+                    // Reserve symmetric space so the title stays centered.
+                    Color.clear.frame(width: 60, height: 1)
+                }
+                Spacer()
+                Button("Done") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+            }
         }
         .padding(.horizontal, 16)
-        .padding(.vertical, 12)
+        .padding(.vertical, 14)
     }
 }
 
@@ -59,7 +67,7 @@ private struct ChooserView: View {
                 .font(.title3).bold()
                 .multilineTextAlignment(.center)
 
-            HStack(spacing: 16) {
+            HStack(spacing: 12) {
                 ConnectionCard(
                     title: "USB cable",
                     systemImage: "cable.connector",
@@ -67,10 +75,16 @@ private struct ChooserView: View {
                 ) { step = .usb }
 
                 ConnectionCard(
-                    title: "Wireless",
+                    title: "Wi-Fi",
                     systemImage: "wifi",
-                    subtitle: "Scan a QR once. Reconnects automatically after."
+                    subtitle: "Same Wi-Fi network. Scan a QR or enter a code once."
                 ) { step = .wireless }
+
+                ConnectionCard(
+                    title: "Hotspot",
+                    systemImage: "personalhotspot",
+                    subtitle: "No Wi-Fi — phone shares its hotspot. Plug in once, then wireless."
+                ) { step = .hotspot }
             }
         }
     }
@@ -78,7 +92,7 @@ private struct ChooserView: View {
 
 /// The steps of the Add Device flow. File-level so the chooser subview can bind
 /// to it (SwiftUI subviews can't reference a private nested enum across types).
-enum AddDeviceStep { case choose, usb, wireless }
+enum AddDeviceStep { case choose, usb, wireless, hotspot }
 
 private struct ConnectionCard: View {
     let title: String
@@ -287,6 +301,69 @@ private struct LabeledField: View {
             TextField(placeholder, text: $text).textFieldStyle(.roundedBorder)
             if autofilled {
                 Text("auto").font(.caption2).foregroundStyle(.green)
+            }
+        }
+    }
+}
+
+// MARK: - Step 2c: hotspot (USB once -> wireless TCP/IP)
+
+private struct HotspotGuideView: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Label("Connect over hotspot", systemImage: "personalhotspot").font(.title3).bold()
+
+            Text("Use this when you're on mobile data with no Wi-Fi — Android won't let Wireless debugging turn on, so we flip the phone to wireless over USB instead.")
+                .font(.caption).foregroundStyle(.secondary)
+
+            GuideStep(number: 1, text: "Turn on the phone's **hotspot** and join it from this Mac (Wi-Fi menu → the phone's network).")
+            GuideStep(number: 2, text: "Enable **USB debugging** once (Developer options), then plug the phone into this Mac.")
+            GuideStep(number: 3, text: "Press the button below. When it says connected, you can **unplug the cable** and keep using the phone wirelessly over the hotspot.")
+
+            Divider()
+            phaseView
+
+            HStack {
+                Spacer()
+                Button {
+                    Task { await model.goWirelessOverHotspot() }
+                } label: {
+                    Label("Go wireless over hotspot", systemImage: "personalhotspot.circle")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(isRunning)
+            }
+            Spacer()
+        }
+        .onAppear { model.resetHotspotPhase() }
+    }
+
+    private var isRunning: Bool {
+        if case .working = model.hotspotPhase { return true }
+        return false
+    }
+
+    @ViewBuilder private var phaseView: some View {
+        switch model.hotspotPhase {
+        case .idle:
+            Text("Ready when your phone is plugged in.").font(.callout).foregroundStyle(.secondary)
+        case .needsUSB:
+            Label("No USB device detected — plug the phone in first.", systemImage: "exclamationmark.triangle")
+                .font(.callout).foregroundStyle(.orange)
+        case .working(let msg):
+            HStack(spacing: 8) { ProgressView().controlSize(.small); Text(msg).font(.callout) }
+        case .connected(let hostPort):
+            VStack(alignment: .leading, spacing: 4) {
+                Label("Connected at \(hostPort)", systemImage: "checkmark.circle.fill")
+                    .font(.callout).foregroundStyle(.green)
+                Text("You can unplug the USB cable now.").font(.caption).foregroundStyle(.secondary)
+            }
+        case .failed(let why):
+            VStack(alignment: .leading, spacing: 4) {
+                Label("Failed", systemImage: "xmark.circle.fill").font(.callout).foregroundStyle(.red)
+                Text(why).font(.caption2).foregroundStyle(.secondary)
             }
         }
     }
