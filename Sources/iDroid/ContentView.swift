@@ -5,17 +5,20 @@ struct ContentView: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
-        NavigationSplitView {
-            DeviceListView()
-                .navigationSplitViewColumnWidth(min: 220, ideal: 260)
-        } detail: {
-            if model.toolsReady {
-                ControlPanelView()
-            } else {
-                SetupNeededView()
+        VStack(spacing: 0) {
+            NavigationSplitView {
+                DeviceListView()
+                    .navigationSplitViewColumnWidth(min: 220, ideal: 260)
+            } detail: {
+                if model.toolsReady {
+                    ControlPanelView()
+                } else {
+                    SetupNeededView()
+                }
             }
+            Divider()
+            StatusBar()
         }
-        .overlay(alignment: .bottom) { StatusBar() }
     }
 }
 
@@ -229,10 +232,10 @@ struct StatusBar: View {
                 .fill(dotColor)
                 .frame(width: 8, height: 8)
             
-            if model.isWorking {
+            if model.isConnecting {
                 ProgressView().controlSize(.small)
             }
-            Text(model.status)
+            Text(connectionStatusText)
                 .font(.callout)
                 .foregroundStyle(.secondary)
             
@@ -249,6 +252,28 @@ struct StatusBar: View {
         guard let device = model.selectedDevice else { return .red }
         if device.isOffline { return .secondary }
         return device.state.isUsable ? .green : .orange
+    }
+
+    private var connectionStatusText: String {
+        if model.isConnecting {
+            return "Connecting..."
+        }
+        guard let device = model.selectedDevice else {
+            return "No device connected"
+        }
+        if device.isOffline {
+            return "Offline"
+        }
+        switch device.state {
+        case .ready:
+            return device.isWireless ? "Wireless Connected" : "USB Connected"
+        case .unauthorized:
+            return "Unauthorized"
+        case .offline:
+            return "Offline"
+        case .unknown:
+            return "Unknown"
+        }
     }
 
     @ViewBuilder

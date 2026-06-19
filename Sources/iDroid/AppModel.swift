@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import AppKit
 
 /// The app's central state and the bridge between the SwiftUI views and the
 /// ADB/scrcpy engine. All UI-facing mutations happen on the main actor.
@@ -36,6 +37,8 @@ final class AppModel {
 
     /// True while a background refresh/command is in flight.
     var isWorking: Bool = false
+    /// True while a wireless pairing or connection attempt is in progress.
+    var isConnecting: Bool = false
 
     // MARK: - Tooling readiness
 
@@ -213,6 +216,8 @@ final class AppModel {
             status = "Plug in \(device.displayName) over USB to reconnect."
             return
         }
+        isConnecting = true
+        defer { isConnecting = false }
         await connectWireless(hostPort: device.serial)
     }
 
@@ -339,8 +344,12 @@ final class AppModel {
     }
 
     func connectWireless(hostPort: String) async {
+        isConnecting = true
         isWorking = true
-        defer { isWorking = false }
+        defer {
+            isWorking = false
+            isConnecting = false
+        }
         let result = await ADB.connect(hostPort: hostPort)
         status = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
         await refreshDevices()
@@ -369,8 +378,12 @@ final class AppModel {
     /// Returns true on a successful pair.
     @discardableResult
     func pairAndConnect(hostPort: String, code: String) async -> Bool {
+        isConnecting = true
         isWorking = true
-        defer { isWorking = false }
+        defer {
+            isWorking = false
+            isConnecting = false
+        }
 
         let pairResult = await ADB.pair(hostPort: hostPort, code: code)
         guard pairResult.succeeded else {
@@ -494,6 +507,9 @@ final class AppModel {
             return
         }
 
+        isConnecting = true
+        defer { isConnecting = false }
+
         hotspotPhase = .working("Finding the phone's address…")
         let ip = await ADB.wirelessIP(usb.serial)
         guard let ip else {
@@ -547,6 +563,11 @@ final class AppModel {
     }
 
     // MARK: - File browser
+
+    var activePreviewProcess: Process?
+    var activePreviewFilePath: String?
+    var thumbnailLoadedTrigger: Bool = false
+    @ObservationIgnored private var activeDownloads: Set<String> = []
 
     enum FileSortKey: String, CaseIterable {
         case name = "Name"
@@ -693,6 +714,13 @@ final class AppModel {
     func loadFiles(path: String? = nil) async {
         guard let serial = selectedSerial else { return }
         if let path { browsePath = path }
+        
+        if let oldProc = activePreviewProcess {
+            oldProc.terminate()
+            activePreviewProcess = nil
+        }
+        activePreviewFilePath = nil
+
         isBrowsing = true
         defer { isBrowsing = false }
         selectedFiles.removeAll()
@@ -938,6 +966,12 @@ final class AppModel {
     func previewFile(_ file: ADB.RemoteFile) async {
         guard let serial = selectedSerial else { return }
         
+        if let oldProc = activePreviewProcess {
+            oldProc.terminate()
+            activePreviewProcess = nil
+        }
+        activePreviewFilePath = file.path
+        
         let previewDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("iDroid-preview", isDirectory: true)
         try? FileManager.default.createDirectory(at: previewDir, withIntermediateDirectories: true)
@@ -956,8 +990,9 @@ final class AppModel {
         
         let totalBytes = total ?? 0
         
-        let poller = Task { [weak self, localDest, totalBytes] in
+        let poller = Task { [weak self, localDest, totalBytes, filePath = file.path] in
             while !Task.isCancelled {
+                guard self?.activePreviewFilePath == filePath else { return }
                 let isDir = (try? FileManager.default.contentsOfDirectory(atPath: localDest.path)) != nil
                 if let now = localBytes(at: localDest, isDirectory: isDir), totalBytes > 0 {
                     let pct = Int(round(Double(now) / Double(totalBytes) * 100))
@@ -975,11 +1010,94 @@ final class AppModel {
         let result = await ADB.pull(serial, remotePath: file.path, localPath: previewDir.path)
         poller.cancel()
         
+        guard activePreviewFilePath == file.path else { return }
+        
         if result.succeeded {
             status = "Opening preview of \(file.name)"
-            _ = Shell.launch("/usr/bin/qlmanage", ["-p", localDest.path])
+            let proc = Shell.launch("/usr/bin/qlmanage", ["-p", localDest.path])
+            activePreviewProcess = proc
         } else {
             status = "Failed to download preview: \(result.stderr.trimmingCharacters(in: .whitespacesAndNewlines))"
+        }
+    }
+
+    func selectNextFile() {
+        let files = sortedFiles
+        guard !files.isEmpty else { return }
+        let currentPath = selectedFiles.first
+        let index = files.firstIndex(where: { $0.path == currentPath }) ?? -1
+        let nextIndex = min(files.count - 1, index + 1)
+        selectedFiles = [files[nextIndex].path]
+        
+        if let proc = activePreviewProcess, proc.isRunning {
+            let nextFile = files[nextIndex]
+            Task {
+                await previewFile(nextFile)
+            }
+        }
+    }
+
+    func selectPreviousFile() {
+        let files = sortedFiles
+        guard !files.isEmpty else { return }
+        let currentPath = selectedFiles.first
+        let index = files.firstIndex(where: { $0.path == currentPath }) ?? 0
+        let prevIndex = max(0, index - 1)
+        selectedFiles = [files[prevIndex].path]
+        
+        if let proc = activePreviewProcess, proc.isRunning {
+            let prevFile = files[prevIndex]
+            Task {
+                await previewFile(prevFile)
+            }
+        }
+    }
+
+    func getThumbnail(for file: ADB.RemoteFile) -> URL? {
+        let ext = (file.name as NSString).pathExtension.lowercased()
+        let isImg = ["jpg", "jpeg", "png", "webp", "heic", "gif"].contains(ext)
+        let isVid = ["mp4", "mkv", "mov", "avi", "3gp"].contains(ext)
+        guard isImg || isVid else { return nil }
+        
+        let cacheDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("iDroid-thumbnails", isDirectory: true)
+        try? FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
+        
+        let hash = file.path.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? UUID().uuidString
+        let localURL = cacheDir.appendingPathComponent("\(hash).jpg")
+        
+        if FileManager.default.fileExists(atPath: localURL.path) {
+            return localURL
+        }
+        
+        triggerThumbnailDownload(file: file, localURL: localURL, isVideo: isVid)
+        return nil
+    }
+
+    private func triggerThumbnailDownload(file: ADB.RemoteFile, localURL: URL, isVideo: Bool) {
+        guard let serial = selectedSerial else { return }
+        guard !activeDownloads.contains(file.path) else { return }
+        activeDownloads.insert(file.path)
+        
+        Task {
+            if isVideo { return }
+            
+            let tempDir = FileManager.default.temporaryDirectory
+                .appendingPathComponent("iDroid-thumb-temp", isDirectory: true)
+            try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+            
+            let tempDest = tempDir.appendingPathComponent(UUID().uuidString + ".jpg")
+            let result = await ADB.pull(serial, remotePath: file.path, localPath: tempDest.path)
+            
+            if result.succeeded {
+                await Task.detached(priority: .background) {
+                    saveScaledImage(from: tempDest, to: localURL)
+                }.value
+            }
+            try? FileManager.default.removeItem(at: tempDest)
+            
+            self.activeDownloads.remove(file.path)
+            self.thumbnailLoadedTrigger.toggle()
         }
     }
 
@@ -1020,4 +1138,26 @@ func localBytes(at url: URL, isDirectory: Bool) -> Int64? {
         total += Int64(size)
     }
     return total
+}
+
+/// Scaled image saver (runs on background thread).
+func saveScaledImage(from sourceURL: URL, to destURL: URL) {
+    guard let img = NSImage(contentsOf: sourceURL) else { return }
+    let size = img.size
+    let ratio = min(120.0 / size.width, 120.0 / size.height)
+    let newSize = NSSize(width: size.width * ratio, height: size.height * ratio)
+    
+    let newImg = NSImage(size: newSize)
+    newImg.lockFocus()
+    img.draw(in: NSRect(origin: .zero, size: newSize),
+             from: NSRect(origin: .zero, size: size),
+             operation: .copy,
+             fraction: 1.0)
+    newImg.unlockFocus()
+    
+    if let tiff = newImg.tiffRepresentation,
+       let bitmap = NSBitmapImageRep(data: tiff),
+       let jpeg = bitmap.representation(using: .jpeg, properties: [:]) {
+        try? jpeg.write(to: destURL)
+    }
 }

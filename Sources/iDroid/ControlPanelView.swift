@@ -202,6 +202,39 @@ private struct FilesTab: View {
             .buttonStyle(.plain)
             .frame(width: 0, height: 0)
             .opacity(0)
+
+            // Invisible arrow key shortcut handlers
+            Button("") {
+                model.selectPreviousFile()
+            }
+            .keyboardShortcut(.leftArrow, modifiers: [])
+            .buttonStyle(.plain)
+            .frame(width: 0, height: 0)
+            .opacity(0)
+            
+            Button("") {
+                model.selectNextFile()
+            }
+            .keyboardShortcut(.rightArrow, modifiers: [])
+            .buttonStyle(.plain)
+            .frame(width: 0, height: 0)
+            .opacity(0)
+
+            Button("") {
+                model.selectPreviousFile()
+            }
+            .keyboardShortcut(.upArrow, modifiers: [])
+            .buttonStyle(.plain)
+            .frame(width: 0, height: 0)
+            .opacity(0)
+
+            Button("") {
+                model.selectNextFile()
+            }
+            .keyboardShortcut(.downArrow, modifiers: [])
+            .buttonStyle(.plain)
+            .frame(width: 0, height: 0)
+            .opacity(0)
         }
         .task(id: model.selectedSerial) {
             if model.selectedSerial != nil { await model.loadFiles(path: "/sdcard/") }
@@ -272,7 +305,7 @@ private struct FilesTab: View {
             Button { pickAndUpload() } label: { Image(systemName: "square.and.arrow.up") }
                 .buttonStyle(.bordered)
         }
-        .padding(.horizontal, 12).padding(.vertical, 8)
+        .padding(.horizontal, 12).padding(.vertical, 4)
     }
 
     private var selectionBar: some View {
@@ -316,7 +349,8 @@ private struct FilesTab: View {
             .frame(width: CGFloat(model.dateWidth), alignment: .trailing)
         }
         .font(.caption).bold().foregroundStyle(.secondary)
-        .padding(.horizontal, 14).padding(.vertical, 4)
+        .padding(.horizontal, 14)
+        .frame(height: 24)
         .background(.quaternary.opacity(0.3))
     }
 
@@ -444,15 +478,25 @@ private struct FileGridTile: View {
     private var isSelected: Bool { model.selectedFiles.contains(file.path) }
 
     var body: some View {
+        let _ = model.thumbnailLoadedTrigger // register dependency
         VStack(spacing: 8) {
             ZStack {
                 RoundedRectangle(cornerRadius: 10)
                     .fill(isSelected ? AnyShapeStyle(.tint.opacity(0.12)) : (hovering ? AnyShapeStyle(.quaternary.opacity(0.3)) : AnyShapeStyle(.clear)))
                     .frame(width: 70, height: 70)
                 
-                Image(systemName: file.isDirectory ? "folder.fill" : fileIcon)
-                    .font(.system(size: 40))
-                    .foregroundStyle(file.isDirectory ? .blue : .secondary)
+                if let thumbURL = model.getThumbnail(for: file),
+                   let nsImage = NSImage(contentsOf: thumbURL) {
+                    Image(nsImage: nsImage)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                        .frame(width: 60, height: 60)
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                } else {
+                    Image(systemName: file.isDirectory ? "folder.fill" : fileIcon)
+                        .font(.system(size: 40))
+                        .foregroundStyle(file.isDirectory ? .blue : .secondary)
+                }
             }
             
             Text(file.name)
@@ -820,6 +864,25 @@ struct PathSegment: Identifiable {
     var id: String { path }
 }
 
+private struct HUDHeaderButton: View {
+    let systemName: String
+    let action: () -> Void
+    @State private var hovering = false
+    
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundColor(.primary)
+                .frame(width: 20, height: 20)
+                .background(hovering ? Color.primary.opacity(0.12) : Color.clear)
+                .clipShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+    }
+}
+
 private struct FloatingTransferHUD: View {
     @Environment(AppModel.self) private var model
     @State private var isMinimized = false
@@ -843,7 +906,7 @@ private struct FloatingTransferHUD: View {
             )
             .shadow(color: .black.opacity(0.25), radius: 10, x: 0, y: 5)
             .padding(16)
-            .frame(width: isMinimized ? 220 : 360)
+            .frame(width: isMinimized ? 220 : 360, height: isMinimized ? 40 : nil)
             .animation(.spring(response: 0.35, dampingFraction: 0.8), value: isMinimized)
         }
     }
@@ -877,13 +940,10 @@ private struct FloatingTransferHUD: View {
                 }
             }
             Spacer()
-            Button {
+            HUDHeaderButton(systemName: "arrow.up.left.and.arrow.down.right") {
                 isMinimized = false
-            } label: {
-                Image(systemName: "arrow.up.left.and.arrow.down.right")
-                    .font(.caption)
             }
-            .buttonStyle(.plain)
+            .help("Expand")
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
@@ -897,23 +957,15 @@ private struct FloatingTransferHUD: View {
                 Spacer()
                 
                 HStack(spacing: 8) {
-                    Button {
+                    HUDHeaderButton(systemName: "minus") {
                         isMinimized = true
-                    } label: {
-                        Image(systemName: "minus")
-                            .font(.caption)
                     }
-                    .buttonStyle(.plain)
                     .help("Minimize")
 
                     if activeCount == 0 {
-                        Button {
+                        HUDHeaderButton(systemName: "xmark") {
                             model.transfers.removeAll()
-                        } label: {
-                            Image(systemName: "xmark")
-                                .font(.caption)
                         }
-                        .buttonStyle(.plain)
                         .help("Clear")
                     } else {
                         Button("Cancel All") {
