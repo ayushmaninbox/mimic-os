@@ -19,8 +19,7 @@ struct AddDeviceSheet: View {
                 switch step {
                 case .choose:   ChooserView(step: $step)
                 case .usb:      USBGuideView()
-                case .wireless: WirelessGuideView()
-                case .hotspot:  HotspotGuideView()
+                case .hotspot:  HotspotGuideView(step: $step)
                 }
             }
             .padding(24)
@@ -81,12 +80,6 @@ private struct ChooserView: View {
                 ) { step = .usb }
 
                 ConnectionCard(
-                    title: "Wi-Fi",
-                    systemImage: "wifi",
-                    subtitle: "Same Wi-Fi network. Scan a QR or enter a code once."
-                ) { step = .wireless }
-
-                ConnectionCard(
                     title: "Hotspot",
                     systemImage: "personalhotspot",
                     subtitle: "No Wi-Fi — phone shares its hotspot. Plug in once, then wireless."
@@ -98,7 +91,7 @@ private struct ChooserView: View {
 
 /// The steps of the Add Device flow. File-level so the chooser subview can bind
 /// to it (SwiftUI subviews can't reference a private nested enum across types).
-enum AddDeviceStep { case choose, usb, wireless, hotspot }
+enum AddDeviceStep { case choose, usb, hotspot }
 
 private struct ConnectionCard: View {
     let title: String
@@ -172,167 +165,11 @@ private struct USBGuideView: View {
     }
 }
 
-// MARK: - Step 2b: wireless guide + QR
-
-private struct WirelessGuideView: View {
-    private enum Method: String, CaseIterable, Identifiable {
-        case qr = "QR code"
-        case code = "Pairing code"
-        var id: String { rawValue }
-    }
-    @State private var method: Method = .qr
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Label("Connect wirelessly", systemImage: "wifi").font(.title3).bold()
-
-            GuideStep(number: 1, text: "On the phone, enable it once: **Developer options → Wireless debugging** (turn it ON). Works on the same Wi-Fi *or* when this Mac is joined to the phone's hotspot.")
-
-            Picker("Method", selection: $method) {
-                ForEach(Method.allCases) { Text($0.rawValue).tag($0) }
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-
-            switch method {
-            case .qr:   QRPairView()
-            case .code: CodePairView()
-            }
-            Spacer()
-        }
-    }
-}
-
-// MARK: - QR pairing (phone scans the Mac's QR)
-
-private struct QRPairView: View {
-    @Environment(AppModel.self) private var model
-
-    var body: some View {
-        VStack(spacing: 12) {
-            GuideStep(number: 2, text: "On the phone tap **Pair device with QR code**, then point the camera at this code:")
-
-            ZStack {
-                if let session = model.pairingSession,
-                   let image = QRPairing.qrImage(for: session) {
-                    Image(nsImage: image)
-                        .interpolation(.none).resizable()
-                        .frame(width: 180, height: 180)
-                        .padding(8).background(.white)
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
-                        .opacity(isBusy ? 0.3 : 1)
-                } else {
-                    ProgressView().frame(width: 180, height: 180)
-                }
-                phaseOverlay
-            }
-
-            phaseLabel
-        }
-        .onAppear { model.startQRPairing() }
-    }
-
-    private var isBusy: Bool {
-        if case .pairing = model.qrPhase { return true }
-        if case .success = model.qrPhase { return true }
-        return false
-    }
-
-    @ViewBuilder private var phaseOverlay: some View {
-        switch model.qrPhase {
-        case .pairing: ProgressView()
-        case .success: Image(systemName: "checkmark.circle.fill").font(.largeTitle).foregroundStyle(.green)
-        default: EmptyView()
-        }
-    }
-
-    @ViewBuilder private var phaseLabel: some View {
-        switch model.qrPhase {
-        case .showing:
-            Text("Waiting for the phone to scan…").font(.callout).foregroundStyle(.secondary)
-        case .pairing:
-            Text("Pairing…").font(.callout).foregroundStyle(.secondary)
-        case .success:
-            Text("Paired! Reconnects automatically from now on.").font(.callout).foregroundStyle(.green)
-        case .failed(let why):
-            VStack(spacing: 6) {
-                Text("Pairing failed").font(.callout).foregroundStyle(.red)
-                Text(why).font(.caption2).foregroundStyle(.secondary).multilineTextAlignment(.center)
-                Button("Try again") { model.startQRPairing() }
-            }
-        }
-    }
-}
-
-// MARK: - Pairing-code entry (typed)
-
-private struct CodePairView: View {
-    @Environment(AppModel.self) private var model
-    @State private var hostPort = ""
-    @State private var code = ""
-    @State private var hostWasAutofilled = false
-
-    private var canPair: Bool { !hostPort.isEmpty && code.count >= 6 }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            GuideStep(number: 2, text: "On the phone tap **Pair device with pairing code**. It shows an address and a 6-digit code.")
-
-            HStack(spacing: 8) {
-                if model.pairingHostPort != nil {
-                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-                    Text("Phone detected — address filled in").font(.caption)
-                } else {
-                    ProgressView().controlSize(.small)
-                    Text("Looking for your phone… (or type the address)").font(.caption).foregroundStyle(.secondary)
-                }
-            }
-
-            LabeledField(label: "Address", placeholder: "192.168.1.5:37000 (or hotspot 192.168.43.1:…)",
-                         text: $hostPort, autofilled: hostWasAutofilled)
-            LabeledField(label: "6-digit code", placeholder: "123456", text: $code, autofilled: false)
-
-            HStack {
-                Spacer()
-                Button {
-                    Task { await model.pairAndConnect(hostPort: hostPort, code: code) }
-                } label: {
-                    Label("Pair & connect", systemImage: "link")
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(!canPair || model.isWorking)
-            }
-        }
-        .onChange(of: model.pairingHostPort) { _, newValue in
-            if let newValue, hostPort.isEmpty { hostPort = newValue; hostWasAutofilled = true }
-        }
-        .onAppear {
-            if hostPort.isEmpty, let discovered = model.pairingHostPort { hostPort = discovered; hostWasAutofilled = true }
-        }
-    }
-}
-
-private struct LabeledField: View {
-    let label: String
-    let placeholder: String
-    @Binding var text: String
-    let autofilled: Bool
-
-    var body: some View {
-        HStack {
-            Text(label).font(.callout).frame(width: 90, alignment: .leading)
-            TextField(placeholder, text: $text).textFieldStyle(.roundedBorder)
-            if autofilled {
-                Text("auto").font(.caption2).foregroundStyle(.green)
-            }
-        }
-    }
-}
-
 // MARK: - Step 2c: hotspot (USB once -> wireless TCP/IP)
 
 private struct HotspotGuideView: View {
     @Environment(AppModel.self) private var model
+    @Binding var step: AddDeviceStep
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -349,6 +186,16 @@ private struct HotspotGuideView: View {
             phaseView
 
             HStack {
+                Button {
+                    step = .choose
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "chevron.left")
+                        Text("Back")
+                    }
+                }
+                .buttonStyle(.borderless)
+
                 Spacer()
                 Button {
                     Task { await model.goWirelessOverHotspot() }

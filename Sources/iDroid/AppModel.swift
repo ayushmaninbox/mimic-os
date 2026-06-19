@@ -28,6 +28,7 @@ final class AppModel {
     var selectedTab: Tab = .control
 
     var devices: [Device] = []
+    var rawDevices: [Device] = []
     var previousPresentSerials: Set<String> = []
     var selectedSerial: String?
     var info: DeviceInfo?
@@ -100,7 +101,7 @@ final class AppModel {
     /// Number of currently-connected USB (non-wireless) devices — lets the USB
     /// guide light up "Detected!" the moment a phone is authorized.
     var usbDeviceCount: Int {
-        devices.filter { !$0.isWireless && $0.state.isUsable }.count
+        rawDevices.filter { !$0.isWireless && $0.state.isUsable }.count
     }
 
     // MARK: - Lifecycle
@@ -111,12 +112,11 @@ final class AppModel {
             return
         }
         await ADB.startServer()
-        browser.start()
         await refreshDevices()
     }
 
     func onDisappear() {
-        browser.stop()
+        // Bonjour browser not used anymore
     }
 
     // MARK: - Devices
@@ -126,16 +126,23 @@ final class AppModel {
         isWorking = true
         defer { isWorking = false }
 
-        var found = await ADB.listDevices()
+        let foundRaw = await ADB.listDevices()
+        self.rawDevices = foundRaw
+        var found = foundRaw
         let names = DeviceStore.customNames()
 
-        // Detect newly plugged-in USB or wireless devices and automatically clear their manually-disconnected block
-        let currentlyPresentSerials = Set(found.map(\.serial))
-        for serial in currentlyPresentSerials {
-            if !previousPresentSerials.contains(serial) {
-                DeviceStore.connect(serial)
+        // If a USB device is newly discovered (usable but not in known list yet),
+        // do not automatically connect it. Force it to be disconnected at first.
+        let known = Set(DeviceStore.knownSerials())
+        for index in found.indices {
+            let serial = found[index].serial
+            let isWireless = serial.contains(":") && serial.split(separator: ":").first.map { $0.contains(".") } == true
+            if found[index].state.isUsable && !isWireless && !known.contains(serial) {
+                DeviceStore.disconnect(serial)
             }
         }
+
+        let currentlyPresentSerials = Set(found.map(\.serial))
         previousPresentSerials = currentlyPresentSerials
 
         // Enrich with friendly model names + custom names, and remember the
@@ -237,6 +244,7 @@ final class AppModel {
     /// Reconnect a remembered wireless device (USB devices reconnect on plug-in).
     func reconnect(_ device: Device) async {
         DeviceStore.connect(device.serial)
+        DeviceStore.remember(device.serial)
         guard device.isWireless else {
             await refreshDevices()
             return
@@ -264,7 +272,7 @@ final class AppModel {
     /// Disconnect AND forget: remove from the remembered list and clear its name.
     func forget(_ device: Device) async {
         DeviceStore.disconnect(device.serial)
-        if device.state.isUsable, device.isWireless {
+        if device.isWireless {
             _ = await ADB.disconnect(hostPort: device.serial)
         }
         if mirroringSerial == device.serial {
@@ -527,11 +535,17 @@ final class AppModel {
     /// reachable IP over USB, flips it to TCP/IP, then connects over the network
     /// so the cable can be unplugged. Works while the phone shares a hotspot.
     func goWirelessOverHotspot() async {
-        guard let usb = devices.first(where: { !$0.isWireless && $0.state.isUsable }) else {
+        await refreshDevices()
+        guard let usb = rawDevices.first(where: { !$0.isWireless && $0.state.isUsable }) else {
             hotspotPhase = .needsUSB
             status = "Plug the phone in via USB first."
             return
         }
+
+        // Use the same logic as the "usb way" - connect and remember the USB device
+        DeviceStore.connect(usb.serial)
+        DeviceStore.remember(usb.serial)
+        await refreshDevices()
 
         isConnecting = true
         defer { isConnecting = false }
