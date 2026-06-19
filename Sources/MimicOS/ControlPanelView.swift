@@ -112,12 +112,26 @@ private struct SettingsTab: View {
                 SectionCard(title: "Mirror options", systemImage: "rectangle.on.rectangle") {
                     Toggle("Turn phone screen off while mirroring", isOn: $model.turnScreenOff)
                     Toggle("Keep device awake", isOn: $model.stayAwake)
+                    Picker("Phone audio plays on", selection: $model.audioRoute) {
+                        ForEach(Scrcpy.AudioRoute.allCases) { route in
+                            Text(route.label).tag(route)
+                        }
+                    }
+                    Text("Applies next time you start mirroring. “Phone / its connected device” keeps audio on the phone — its own speaker, Bluetooth, or wired output.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
                 Divider()
                 SectionCard(title: "Clipboard", systemImage: "doc.on.clipboard") {
                     Toggle("Sync clipboard in background (even when not mirroring)", isOn: $model.clipboardSyncEnabled)
                         .font(.body)
                     Text("When active, MimicOS automatically syncs copy/paste between this Mac and your phone in the background using a headless session.\n\nNote: If you start screen mirroring, the full scrcpy session takes over clipboard synchronization seamlessly.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Divider()
+                SectionCard(title: "Screenshots", systemImage: "camera.on.rectangle") {
+                    Toggle("Copy phone screenshots to this Mac's clipboard", isOn: $model.copyPhoneScreenshotsToMac)
+                        .font(.body)
+                    Text("When you take a screenshot on the phone, MimicOS detects it and places the image on your Mac's clipboard so you can paste it straight into any app.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }

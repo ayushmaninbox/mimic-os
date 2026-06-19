@@ -22,6 +22,8 @@ final class Scrcpy {
         /// ⌘A/⌘C/⌘V/⌘X, ⇧+Enter for a newline, Enter to submit, ⌥/⇧+arrows for
         /// word/selection movement. Default `sdk` injection lacks these.
         var useHIDKeyboard: Bool = true
+        /// Where the phone's audio should play while mirroring.
+        var audio: AudioRoute = .mac
 
         func asArguments() -> [String] {
             var args: [String] = []
@@ -30,7 +32,33 @@ final class Scrcpy {
             if let maxSize { args.append(contentsOf: ["--max-size", "\(maxSize)"]) }
             if let bitRateMbps { args.append(contentsOf: ["--video-bit-rate", "\(bitRateMbps)M"]) }
             if useHIDKeyboard { args.append("--keyboard=uhid") }
+            args.append(contentsOf: audio.arguments)
             return args
+        }
+    }
+
+    /// Where phone audio plays during mirroring. The phone's own routing
+    /// (speaker / Bluetooth / wired) is the phone's choice — these decide
+    /// whether the Mac also receives it and whether the phone keeps playing.
+    enum AudioRoute: String, CaseIterable, Identifiable {
+        case mac        // forward to the Mac, phone goes silent
+        case phone      // keep audio on the phone (its own speaker/BT/wired)
+        case both       // play on the Mac AND keep playing on the phone
+
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .mac: return "This Mac"
+            case .phone: return "Phone / its connected device"
+            case .both: return "Both (Mac + phone)"
+            }
+        }
+        var arguments: [String] {
+            switch self {
+            case .mac:   return ["--audio-source=output"]
+            case .phone: return ["--no-audio"]
+            case .both:  return ["--audio-source=playback", "--audio-dup"]
+            }
         }
     }
 

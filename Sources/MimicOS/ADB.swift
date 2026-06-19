@@ -371,6 +371,24 @@ enum ADB {
         return false
     }
 
+    // MARK: - Screenshot folder watching
+
+    /// Returns the full path of the most recently modified file in the phone's
+    /// Screenshots folder, or nil. Used to detect when the user takes a phone
+    /// screenshot so MimicOS can mirror it to the Mac's clipboard.
+    static func latestScreenshotPath(_ serial: String) async -> String? {
+        let dir = "/sdcard/Pictures/Screenshots/"
+        // `ls -t` sorts newest-first; take the first real entry.
+        let result = await Shell.run(ToolLocator.adb, ["-s", serial, "shell", "ls", "-t", dir])
+        guard result.succeeded else { return nil }
+        let first = result.stdout
+            .split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .first { !$0.isEmpty && !$0.hasPrefix("ls:") }
+        guard let name = first else { return nil }
+        return dir + name
+    }
+
     // MARK: - Automation (input injection)
 
     static func tap(_ serial: String, x: Int, y: Int) async {

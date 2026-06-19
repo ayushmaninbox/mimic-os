@@ -51,6 +51,8 @@ final class AppModel {
 
     var turnScreenOff: Bool = false
     var stayAwake: Bool = true
+    /// Where the phone's audio plays while mirroring.
+    var audioRoute: Scrcpy.AudioRoute = .mac
 
     // MARK: - Clipboard sync
     //
@@ -61,11 +63,11 @@ final class AppModel {
     // This flag just reflects that scrcpy handles it; there's no background
     // poller to run.
 
-    /// Background clipboard sync via a headless scrcpy session. OFF by default:
-    /// on Android 16 the repeated headless sessions destabilize the (already
-    /// fragile) wireless connection. Clipboard still syncs reliably during real
-    /// mirroring, which is the recommended path.
-    var clipboardSyncEnabled: Bool = false {
+    /// Background clipboard sync via a headless scrcpy session. ON by default
+    /// per user preference. (Note: on Android 16 the headless session can be
+    /// flaky over a fragile wireless link; clipboard always syncs reliably
+    /// during real mirroring.)
+    var clipboardSyncEnabled: Bool = true {
         didSet {
             updateBackgroundClipboardSync()
         }
@@ -291,6 +293,52 @@ final class AppModel {
         selectedSerial = serial
         info = await ADB.info(serial)
         updateBackgroundClipboardSync()
+        startScreenshotWatch()
+    }
+
+    // MARK: - Phone screenshot -> Mac clipboard
+
+    private var screenshotWatchTask: Task<Void, Never>?
+    private var lastSeenScreenshot: String?
+
+    /// Whether to mirror phone screenshots onto the Mac's clipboard.
+    var copyPhoneScreenshotsToMac: Bool = true {
+        didSet { startScreenshotWatch() }
+    }
+
+    /// Polls the phone's Screenshots folder; when a new file appears, pulls it
+    /// and places the image on the Mac clipboard. (Android 16 blocks reading the
+    /// phone clipboard over adb, so we watch the folder instead — the reliable
+    /// app-free path.)
+    private func startScreenshotWatch() {
+        screenshotWatchTask?.cancel()
+        guard copyPhoneScreenshotsToMac, let serial = selectedSerial,
+              devices.contains(where: { $0.serial == serial && $0.state.isUsable }) else { return }
+
+        screenshotWatchTask = Task { [weak self] in
+            // Seed the baseline so we don't grab an old screenshot on connect.
+            self?.lastSeenScreenshot = await ADB.latestScreenshotPath(serial)
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(2))
+                guard let self else { return }
+                let latest = await ADB.latestScreenshotPath(serial)
+                if let latest, latest != self.lastSeenScreenshot {
+                    self.lastSeenScreenshot = latest
+                    await self.copyScreenshotToMacClipboard(serial: serial, remotePath: latest)
+                }
+            }
+        }
+    }
+
+    private func copyScreenshotToMacClipboard(serial: String, remotePath: String) async {
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MimicOS-shot-\(UUID().uuidString).png")
+        let result = await ADB.pull(serial, remotePath: remotePath, localPath: tmp.path)
+        guard result.succeeded, let image = NSImage(contentsOf: tmp) else { return }
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.writeObjects([image])
+        status = "Phone screenshot copied to Mac clipboard"
     }
 
     // MARK: - Mirroring
@@ -313,6 +361,7 @@ final class AppModel {
             var options = Scrcpy.Options()
             options.turnScreenOff = turnScreenOff
             options.stayAwake = stayAwake
+            options.audio = audioRoute
             // Clear our observable state when scrcpy exits on its own (e.g. the
             // user closes the mirror window) so the button flips back to Start.
             let ok = scrcpy.start(serial: serial, options: options) { [weak self] in
