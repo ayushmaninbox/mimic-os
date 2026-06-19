@@ -13,7 +13,7 @@ import AppKit
 /// `pairing_code` is a shared secret. When the phone scans this, it connects to
 /// the advertised pairing service and authenticates with the code — no typing.
 ///
-/// NOTE: For the QR path to fully work, iDroid must *advertise* a matching
+/// NOTE: For the QR path to fully work, MimicOS must *advertise* a matching
 /// `_adb-tls-pairing._tcp` service (a small NWListener) so the phone has
 /// something to connect to. That advertiser is a follow-up; this type owns the
 /// payload + image generation and the `adb pair` fallback for the typed-code
@@ -35,7 +35,7 @@ enum QRPairing {
     /// The QR flow uses a random alphanumeric *password* (not the 6-digit code
     /// used for typed pairing) and a unique service name. When the phone scans
     /// the QR it starts advertising `_adb-tls-pairing._tcp` under this exact
-    /// service name; iDroid then finds that service via `adb mdns services` and
+    /// service name; MimicOS then finds that service via `adb mdns services` and
     /// runs `adb pair <host:port> <password>`, which performs the handshake.
     static func newSession() -> Session {
         let suffix = String(format: "%06d", Int.random(in: 0..<1_000_000))

@@ -119,7 +119,7 @@ struct DeviceListView: View {
 
         Button(role: .destructive) {
             Task { await model.forget(device) }
-        } label: { Label("Remove from iDroid", systemImage: "trash") }
+        } label: { Label("Remove from MimicOS", systemImage: "trash") }
     }
 }
 
@@ -171,7 +171,7 @@ struct RenameSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Rename device").font(.headline)
-            Text("Shown only in iDroid, stored on this Mac.")
+            Text("Shown only in MimicOS, stored on this Mac.")
                 .font(.caption).foregroundStyle(.secondary)
             TextField("Device name", text: $name)
                 .textFieldStyle(.roundedBorder)

@@ -34,7 +34,7 @@ final class AppModel {
     var info: DeviceInfo?
 
     /// Human-readable status line shown at the bottom of the window.
-    var status: String = "Welcome to iDroid"
+    var status: String = "Welcome to MimicOS"
 
     /// True while a background refresh/command is in flight.
     var isWorking: Bool = false
@@ -987,7 +987,7 @@ final class AppModel {
     func stageForDragOut(_ file: ADB.RemoteFile) async -> URL? {
         guard let serial = selectedSerial else { return nil }
         let tmp = FileManager.default.temporaryDirectory
-            .appendingPathComponent("iDroid-dragout", isDirectory: true)
+            .appendingPathComponent("MimicOS-dragout", isDirectory: true)
         try? FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
         let id = addTransfer(file.name, .toMac, totalBytes: file.sizeBytes)
         let staged = tmp.appendingPathComponent(file.name)
@@ -1003,6 +1003,34 @@ final class AppModel {
         finishTransfer(id, failed: !result.succeeded)
         guard result.succeeded else { return nil }
         return staged
+    }
+
+    /// Stages every currently-selected file into one temp folder and returns
+    /// that folder, so a single drag drops all of them onto the Mac. (SwiftUI's
+    /// per-row `.onDrag` can only carry one item, so we bundle the selection
+    /// into a folder rather than losing all but the grabbed file.)
+    func stageSelectedForDragOut() async -> URL? {
+        guard let serial = selectedSerial else { return nil }
+        let items = selectedRemoteFiles
+        guard items.count > 1 else {
+            // Single selection — drop the file itself, not a folder.
+            return items.first.map { _ in nil } ?? nil
+        }
+        let stamp = Int(Date().timeIntervalSince1970)
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MimicOS-\(stamp)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+
+        let totalBytes = items.reduce(Int64(0)) { $0 + ($1.sizeBytes ?? 0) }
+        let id = addTransfer("\(items.count) items", .toMac, totalBytes: totalBytes > 0 ? totalBytes : nil)
+
+        var ok = true
+        for item in items {
+            let r = await ADB.pull(serial, remotePath: item.path, localPath: folder.path)
+            if !r.succeeded { ok = false }
+        }
+        finishTransfer(id, failed: !ok)
+        return ok ? folder : nil
     }
 
     var sortedFiles: [ADB.RemoteFile] {
@@ -1079,7 +1107,7 @@ final class AppModel {
         activePreviewFilePath = file.path
         
         let previewDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("iDroid-preview", isDirectory: true)
+            .appendingPathComponent("MimicOS-preview", isDirectory: true)
         try? FileManager.default.createDirectory(at: previewDir, withIntermediateDirectories: true)
         
         let localDest = previewDir.appendingPathComponent(file.name)
@@ -1167,7 +1195,7 @@ final class AppModel {
         guard isImg || isVid else { return nil }
         
         let cacheDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("iDroid-thumbnails", isDirectory: true)
+            .appendingPathComponent("MimicOS-thumbnails", isDirectory: true)
         try? FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
         
         let hash = file.path.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? UUID().uuidString
@@ -1188,7 +1216,7 @@ final class AppModel {
         
         Task {
             let tempDir = FileManager.default.temporaryDirectory
-                .appendingPathComponent("iDroid-thumb-temp", isDirectory: true)
+                .appendingPathComponent("MimicOS-thumb-temp", isDirectory: true)
             try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
             
             let ext = (file.name as NSString).pathExtension

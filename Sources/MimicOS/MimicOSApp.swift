@@ -1,11 +1,11 @@
 import SwiftUI
 
 @main
-struct iDroidApp: App {
+struct MimicOSApp: App {
     @State private var model = AppModel()
 
     var body: some Scene {
-        Window("iDroid", id: "main") {
+        Window("MimicOS", id: "main") {
             ContentView()
                 .environment(model)
                 .frame(minWidth: 720, minHeight: 480)

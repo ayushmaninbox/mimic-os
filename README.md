@@ -1,8 +1,8 @@
-# iDroid
+# MimicOS
 
 > Control your Android phone from your Mac — mirror the screen, run it with the screen off, transfer files, and automate taps. **No app to install on the phone.**
 
-iDroid is an open-source, native **SwiftUI** Mac app that wraps the two best open-source Android tools — [`adb`](https://developer.android.com/tools/adb) and [`scrcpy`](https://github.com/Genymobile/scrcpy) — in a friendly GUI.
+MimicOS is an open-source, native **SwiftUI** Mac app that wraps the two best open-source Android tools — [`adb`](https://developer.android.com/tools/adb) and [`scrcpy`](https://github.com/Genymobile/scrcpy) — in a friendly GUI.
 
 ## Features (Phase 1)
 
@@ -70,7 +70,7 @@ The Swift code is a **controller and UI** over the engine — it does not reimpl
 ## Distribution
 
 Releases ship as a `.dmg` via **GitHub Releases** (direct download — no App Store).
-The Mac App Store is intentionally not targeted; its sandbox forbids the process/USB control iDroid needs.
+The Mac App Store is intentionally not targeted; its sandbox forbids the process/USB control MimicOS needs.
 
 > First launch on an unsigned build: **right-click the app → Open** to bypass Gatekeeper.
 

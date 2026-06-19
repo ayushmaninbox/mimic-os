@@ -2,14 +2,14 @@
 import PackageDescription
 
 let package = Package(
-    name: "iDroid",
+    name: "MimicOS",
     platforms: [
         .macOS(.v14)
     ],
     targets: [
         .executableTarget(
-            name: "iDroid",
-            path: "Sources/iDroid"
+            name: "MimicOS",
+            path: "Sources/MimicOS"
         )
     ]
 )

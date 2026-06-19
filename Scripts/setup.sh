@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# iDroid setup — installs the app-free engine (adb + scrcpy) and verifies it.
+# MimicOS setup — installs the app-free engine (adb + scrcpy) and verifies it.
 # Phase 0: prove the whole concept works before touching any Swift.
 #
 set -euo pipefail
@@ -10,7 +10,7 @@ green() { printf "\033[32m%s\033[0m\n" "$1"; }
 yellow(){ printf "\033[33m%s\033[0m\n" "$1"; }
 red()   { printf "\033[31m%s\033[0m\n" "$1"; }
 
-bold "iDroid setup"
+bold "MimicOS setup"
 echo
 
 # 1. Homebrew --------------------------------------------------------------

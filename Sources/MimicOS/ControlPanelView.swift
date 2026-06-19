@@ -117,7 +117,7 @@ private struct SettingsTab: View {
                 SectionCard(title: "Clipboard", systemImage: "doc.on.clipboard") {
                     Toggle("Sync clipboard in background (even when not mirroring)", isOn: $model.clipboardSyncEnabled)
                         .font(.body)
-                    Text("When active, iDroid automatically syncs copy/paste between this Mac and your phone in the background using a headless session.\n\nNote: If you start screen mirroring, the full scrcpy session takes over clipboard synchronization seamlessly.")
+                    Text("When active, MimicOS automatically syncs copy/paste between this Mac and your phone in the background using a headless session.\n\nNote: If you start screen mirroring, the full scrcpy session takes over clipboard synchronization seamlessly.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
@@ -566,12 +566,16 @@ private struct FileGridTile: View {
             Button("Delete", role: .destructive) { Task { await model.deleteFromPhone(file) } }
         }
         .onDrag {
+            // If this row is part of a multi-selection, drag ALL selected files
+            // (bundled into one folder); otherwise drag just this file.
+            let multi = model.selectedFiles.count > 1 && model.selectedFiles.contains(file.path)
             let provider = NSItemProvider()
-            provider.suggestedName = file.name
+            provider.suggestedName = multi ? "MimicOS Files" : file.name
             provider.registerFileRepresentation(forTypeIdentifier: UTType.data.identifier,
                                                  fileOptions: [], visibility: .all) { completion in
                 Task {
-                    let url = await model.stageForDragOut(file)
+                    let url = multi ? await model.stageSelectedForDragOut()
+                                    : await model.stageForDragOut(file)
                     completion(url, true, nil)
                 }
                 return nil

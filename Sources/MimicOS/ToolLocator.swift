@@ -15,7 +15,7 @@ enum ToolLocator {
         var dirs: [URL] = []
 
         // 1. Bundled tools, relative to the running executable.
-        //    <App>.app/Contents/MacOS/iDroid  ->  .../Resources/tools
+        //    <App>.app/Contents/MacOS/MimicOS  ->  .../Resources/tools
         let exeDir = Bundle.main.executableURL?.deletingLastPathComponent()
         if let exeDir {
             dirs.append(exeDir.appendingPathComponent("../Resources/tools").standardizedFileURL)

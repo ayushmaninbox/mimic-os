@@ -4,9 +4,9 @@ import Foundation
 /// the user has chosen to "remember." Keyed by ADB serial. Nothing is written
 /// to the phone itself.
 struct DeviceStore {
-    private static let namesKey = "iDroid.customNames"
-    private static let knownKey = "iDroid.knownSerials"
-    private static let disconnectedKey = "iDroid.disconnectedSerials"
+    private static let namesKey = "MimicOS.customNames"
+    private static let knownKey = "MimicOS.knownSerials"
+    private static let disconnectedKey = "MimicOS.disconnectedSerials"
 
     private static var defaults: UserDefaults { .standard }
 

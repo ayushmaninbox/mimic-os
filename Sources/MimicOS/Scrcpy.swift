@@ -2,7 +2,7 @@ import Foundation
 
 /// Launches and manages scrcpy mirroring sessions.
 ///
-/// scrcpy opens its own native window for the mirror; iDroid's job is to launch
+/// scrcpy opens its own native window for the mirror; MimicOS's job is to launch
 /// it with the right flags and keep track of the running process so it can be
 /// stopped. (Embedding scrcpy's video directly into a SwiftUI view is a Phase 2+
 /// effort — it means consuming scrcpy-server's H.264 stream ourselves.)
@@ -18,6 +18,10 @@ final class Scrcpy {
         var maxSize: Int? = nil
         /// Bitrate in Mbps. Maps to `--video-bit-rate`.
         var bitRateMbps: Int? = nil
+        /// Simulate a physical HID keyboard so Mac-style text editing works:
+        /// ⌘A/⌘C/⌘V/⌘X, ⇧+Enter for a newline, Enter to submit, ⌥/⇧+arrows for
+        /// word/selection movement. Default `sdk` injection lacks these.
+        var useHIDKeyboard: Bool = true
 
         func asArguments() -> [String] {
             var args: [String] = []
@@ -25,6 +29,7 @@ final class Scrcpy {
             if stayAwake { args.append("--stay-awake") }
             if let maxSize { args.append(contentsOf: ["--max-size", "\(maxSize)"]) }
             if let bitRateMbps { args.append(contentsOf: ["--video-bit-rate", "\(bitRateMbps)M"]) }
+            if useHIDKeyboard { args.append("--keyboard=uhid") }
             return args
         }
     }
