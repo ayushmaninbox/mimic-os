@@ -8,6 +8,24 @@ import Observation
 final class AppModel {
     // MARK: - Published state
 
+    /// Tabs in the main detail navbar.
+    enum Tab: String, CaseIterable, Identifiable {
+        case control = "Control"
+        case files = "Files"
+        case notifications = "Notifications"
+        case settings = "Settings"
+        var id: String { rawValue }
+        var systemImage: String {
+            switch self {
+            case .control: return "rectangle.on.rectangle"
+            case .files: return "folder"
+            case .notifications: return "bell"
+            case .settings: return "gearshape"
+            }
+        }
+    }
+    var selectedTab: Tab = .control
+
     var devices: [Device] = []
     var selectedSerial: String?
     var info: DeviceInfo?
@@ -27,8 +45,27 @@ final class AppModel {
 
     // MARK: - Mirror options (bound to the UI)
 
-    var turnScreenOff: Bool = true
+    var turnScreenOff: Bool = false
     var stayAwake: Bool = true
+
+    // MARK: - Clipboard sync
+
+    private let clipboard = ClipboardSync()
+    /// When on, the Mac and phone clipboards stay in sync automatically. On by
+    /// default; it activates once a usable device is selected.
+    var clipboardSyncEnabled: Bool = true {
+        didSet { applyClipboardSync() }
+    }
+
+    private func applyClipboardSync() {
+        if clipboardSyncEnabled, let serial = selectedSerial,
+           devices.contains(where: { $0.serial == serial && $0.state.isUsable }) {
+            clipboard.start(serial: serial)
+            status = "Clipboard sync on"
+        } else {
+            clipboard.stop()
+        }
+    }
 
     private let scrcpy = Scrcpy()
 
@@ -90,22 +127,58 @@ final class AppModel {
         var found = await ADB.listDevices()
         let names = DeviceStore.customNames()
         // Enrich with friendly model names + custom names, and remember the
-        // ones that are connected so they persist when offline.
+        // ones that are connected so they persist when offline. Record a stable
+        // hardware fingerprint (serialno prop) so the same phone connected via
+        // both USB and Wi-Fi can be collapsed into one row.
+        var fingerprintBySerial: [String: String] = [:]
         for index in found.indices {
             let serial = found[index].serial
             found[index].customName = names[serial]
             if found[index].state.isUsable {
                 found[index].model = await ADB.model(serial)
-                DeviceStore.remember(serial)
+                fingerprintBySerial[serial] = await ADB.getProp(serial, "ro.serialno") ?? serial
+                // Only remember stable USB serials. Wireless serials are an
+                // ephemeral ip:port (hotspot IPs change), so persisting them
+                // just creates stale ghost rows — they're rediscovered via mDNS.
+                if !found[index].isWireless {
+                    DeviceStore.remember(serial)
+                }
             }
         }
 
+        // Collapse duplicates of the same physical phone (USB + wireless show up
+        // as two adb serials). Prefer the wireless entry, since it survives
+        // unplugging; fall back to the first seen.
+        var seenFingerprints: [String: Int] = [:]   // fingerprint -> index kept
+        var deduped: [Device] = []
+        for device in found {
+            guard device.state.isUsable,
+                  let fp = fingerprintBySerial[device.serial] else {
+                deduped.append(device)
+                continue
+            }
+            if let keptIndex = seenFingerprints[fp] {
+                // Already have this phone — keep whichever is wireless.
+                if device.isWireless && !deduped[keptIndex].isWireless {
+                    deduped[keptIndex] = device
+                }
+            } else {
+                seenFingerprints[fp] = deduped.count
+                deduped.append(device)
+            }
+        }
+        found = deduped
+
         // Append remembered devices that aren't currently connected, as offline
-        // entries so the user can reconnect or delete them.
+        // entries — but skip any whose custom name already matches a connected
+        // device (avoids a ghost row for a phone that reconnected on a new IP).
         let connectedSerials = Set(found.map(\.serial))
+        let connectedNames = Set(found.compactMap { $0.customName })
         for serial in DeviceStore.knownSerials() where !connectedSerials.contains(serial) {
+            let name = names[serial]
+            if let name, connectedNames.contains(name) { continue }
             found.append(Device(serial: serial, state: .offline,
-                                model: nil, customName: names[serial], isOffline: true))
+                                model: nil, customName: name, isOffline: true))
         }
 
         devices = found
@@ -176,6 +249,7 @@ final class AppModel {
         selectedSerial = serial
         info = await ADB.info(serial)
         notifications = await ADB.notificationSnapshot(serial)
+        applyClipboardSync()   // re-point sync at the newly selected device
     }
 
     // MARK: - Mirroring
@@ -425,6 +499,193 @@ final class AppModel {
         defer { isWorking = false }
         let result = await ADB.installAPK(serial, apkPath: localPath)
         status = result.succeeded ? "APK installed" : "Install failed: \(result.stderr.trimmingCharacters(in: .whitespacesAndNewlines))"
+    }
+
+    // MARK: - File browser
+
+    /// Current directory shown in the in-app file browser.
+    var browsePath: String = "/sdcard/"
+    var browseFiles: [ADB.RemoteFile] = []
+    var isBrowsing: Bool = false
+
+    /// In-flight / recent file transfers, shown as progress bars in the UI.
+    struct Transfer: Identifiable {
+        let id = UUID()
+        let name: String
+        let direction: Direction
+        var totalBytes: Int64?       // known up front for the source file
+        var fraction: Double = 0     // 0...1, computed by polling the dest size
+        var done: Bool = false
+        var failed: Bool = false
+        enum Direction { case toPhone, toMac }
+
+        /// True when we can show a determinate bar (we know the total size).
+        var isDeterminate: Bool { (totalBytes ?? 0) > 0 }
+    }
+    var transfers: [Transfer] = []
+
+    private func addTransfer(_ name: String, _ dir: Transfer.Direction, totalBytes: Int64?) -> UUID {
+        let t = Transfer(name: name, direction: dir, totalBytes: totalBytes)
+        transfers.append(t)
+        return t.id
+    }
+
+    private func updateProgress(_ id: UUID, fraction: Double) {
+        guard let idx = transfers.firstIndex(where: { $0.id == id }) else { return }
+        // Never go backwards or hit 100% before we mark it done.
+        transfers[idx].fraction = max(transfers[idx].fraction, min(fraction, 0.99))
+    }
+
+    private func finishTransfer(_ id: UUID, failed: Bool) {
+        guard let idx = transfers.firstIndex(where: { $0.id == id }) else { return }
+        transfers[idx].done = true
+        transfers[idx].failed = failed
+        transfers[idx].fraction = failed ? transfers[idx].fraction : 1
+        if !failed {
+            let tid = id
+            Task {
+                try? await Task.sleep(for: .seconds(4))
+                transfers.removeAll { $0.id == tid }
+            }
+        }
+    }
+
+    func clearTransfer(_ id: UUID) {
+        transfers.removeAll { $0.id == id }
+    }
+
+    /// Local file size on the Mac (for source totals and pull progress).
+    private func localSize(_ path: String) -> Int64? {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: path)
+        return (attrs?[.size] as? NSNumber)?.int64Value
+    }
+
+    /// Polls the destination file's growing size to drive a real progress bar
+    /// while the adb transfer runs. Cancelled when the transfer finishes.
+    private func pollProgress(id: UUID, total: Int64,
+                              currentBytes: @escaping @Sendable () async -> Int64?) -> Task<Void, Never> {
+        Task { [weak self] in
+            while !Task.isCancelled {
+                if let now = await currentBytes() {
+                    await MainActor.run { self?.updateProgress(id, fraction: Double(now) / Double(total)) }
+                }
+                try? await Task.sleep(for: .milliseconds(250))
+            }
+        }
+    }
+
+    /// True once we're somewhere below the starting root, so "up" makes sense.
+    var canGoUp: Bool { browsePath != "/" && browsePath != "/sdcard/" }
+
+    func loadFiles(path: String? = nil) async {
+        guard let serial = selectedSerial else { return }
+        if let path { browsePath = path }
+        isBrowsing = true
+        defer { isBrowsing = false }
+        browseFiles = await ADB.listFiles(serial, path: browsePath)
+    }
+
+    func openFolder(_ file: ADB.RemoteFile) async {
+        guard file.isDirectory else { return }
+        await loadFiles(path: file.path + "/")
+    }
+
+    func goUp() async {
+        var trimmed = browsePath
+        if trimmed.hasSuffix("/") { trimmed.removeLast() }
+        let parent = (trimmed as NSString).deletingLastPathComponent
+        await loadFiles(path: parent.isEmpty ? "/" : parent + "/")
+    }
+
+    /// Copy a file/folder from the phone to a chosen Mac folder (with progress).
+    func downloadFromPhone(_ file: ADB.RemoteFile, toLocalDir localDir: String) async {
+        guard let serial = selectedSerial else { return }
+        let total = file.sizeBytes
+        let id = addTransfer(file.name, .toMac, totalBytes: total)
+
+        // Poll the growing local file to show a real bar (only for plain files).
+        let localFile = (localDir as NSString).appendingPathComponent(file.name)
+        var poller: Task<Void, Never>?
+        if let total, total > 0, !file.isDirectory {
+            poller = pollProgress(id: id, total: total) { [localFile] in
+                let attrs = try? FileManager.default.attributesOfItem(atPath: localFile)
+                return (attrs?[.size] as? NSNumber)?.int64Value
+            }
+        }
+
+        let result = await ADB.pull(serial, remotePath: file.path, localPath: localDir)
+        poller?.cancel()
+        finishTransfer(id, failed: !result.succeeded)
+        status = result.succeeded ? "Copied \(file.name) to Mac"
+            : "Copy failed: \(result.stderr.trimmingCharacters(in: .whitespacesAndNewlines))"
+    }
+
+    /// Copy one or more Mac files into the directory currently shown (with progress).
+    func uploadToCurrentFolder(localPaths: [String]) async {
+        guard let serial = selectedSerial else { return }
+        for localPath in localPaths {
+            let name = (localPath as NSString).lastPathComponent
+            let total = localSize(localPath)
+            let id = addTransfer(name, .toPhone, totalBytes: total)
+
+            // Poll the growing file on the phone to show a real progress bar.
+            let base = browsePath.hasSuffix("/") ? browsePath : browsePath + "/"
+            let remoteFile = base + name
+            var poller: Task<Void, Never>?
+            if let total, total > 0 {
+                poller = pollProgress(id: id, total: total) { [serial, remoteFile] in
+                    await ADB.fileSize(serial, path: remoteFile)
+                }
+            }
+
+            let result = await ADB.push(serial, localPath: localPath, remotePath: browsePath)
+            poller?.cancel()
+            finishTransfer(id, failed: !result.succeeded)
+            if !result.succeeded {
+                status = "Copy failed: \(result.stderr.trimmingCharacters(in: .whitespacesAndNewlines))"
+            }
+        }
+        status = "Copied to phone"
+        await loadFiles()
+    }
+
+    /// Delete a file/folder on the phone.
+    func deleteFromPhone(_ file: ADB.RemoteFile) async {
+        guard let serial = selectedSerial else { return }
+        let result = await ADB.delete(serial, path: file.path)
+        status = result.succeeded ? "Deleted \(file.name)" : "Delete failed"
+        await loadFiles()
+    }
+
+    /// Create a new folder in the current directory.
+    func makeFolder(named name: String) async {
+        guard let serial = selectedSerial, !name.isEmpty else { return }
+        let base = browsePath.hasSuffix("/") ? browsePath : browsePath + "/"
+        _ = await ADB.makeDirectory(serial, path: base + name)
+        await loadFiles()
+    }
+
+    /// Pulls a phone file to a temp dir and returns the local URL, for drag-out
+    /// to Finder. Returns nil on failure.
+    func stageForDragOut(_ file: ADB.RemoteFile) async -> URL? {
+        guard let serial = selectedSerial else { return nil }
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("iDroid-dragout", isDirectory: true)
+        try? FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        let id = addTransfer(file.name, .toMac, totalBytes: file.sizeBytes)
+        let staged = tmp.appendingPathComponent(file.name)
+        var poller: Task<Void, Never>?
+        if let total = file.sizeBytes, total > 0, !file.isDirectory {
+            poller = pollProgress(id: id, total: total) { [staged] in
+                let attrs = try? FileManager.default.attributesOfItem(atPath: staged.path)
+                return (attrs?[.size] as? NSNumber)?.int64Value
+            }
+        }
+        let result = await ADB.pull(serial, remotePath: file.path, localPath: tmp.path)
+        poller?.cancel()
+        finishTransfer(id, failed: !result.succeeded)
+        guard result.succeeded else { return nil }
+        return staged
     }
 
     // MARK: - Automation shortcuts

@@ -21,10 +21,18 @@ struct ContentView: View {
 
 // MARK: - Sidebar: device list
 
+/// Identifiable rename request so we can drive a `.sheet(item:)` (which can
+/// coexist with the Add-Device `.sheet(isPresented:)` — two `isPresented`
+/// sheets on one view collide and silently break).
+struct RenameRequest: Identifiable {
+    let serial: String
+    let initialName: String
+    var id: String { serial }
+}
+
 struct DeviceListView: View {
     @Environment(AppModel.self) private var model
-    @State private var renameTarget: String?   // serial being renamed
-    @State private var renameText: String = ""
+    @State private var renameRequest: RenameRequest?
 
     var body: some View {
         @Bindable var model = model
@@ -55,18 +63,13 @@ struct DeviceListView: View {
                 }
             }
         }
-        .alert("Rename device", isPresented: Binding(
-            get: { renameTarget != nil },
-            set: { if !$0 { renameTarget = nil } }
-        )) {
-            TextField("Name", text: $renameText)
-            Button("Cancel", role: .cancel) { renameTarget = nil }
-            Button("Save") {
-                if let serial = renameTarget { model.rename(serial, to: renameText) }
-                renameTarget = nil
+        .sheet(item: $renameRequest) { request in
+            RenameSheet(initialName: request.initialName) { newName in
+                model.rename(request.serial, to: newName)
+                renameRequest = nil
+            } onCancel: {
+                renameRequest = nil
             }
-        } message: {
-            Text("Choose a name shown only in iDroid (stored on this Mac).")
         }
         .toolbar {
             ToolbarItem {
@@ -96,8 +99,8 @@ struct DeviceListView: View {
     @ViewBuilder
     private func deviceMenu(_ device: Device) -> some View {
         Button {
-            renameText = device.customName ?? device.displayName
-            renameTarget = device.serial
+            renameRequest = RenameRequest(serial: device.serial,
+                                          initialName: device.customName ?? device.displayName)
         } label: { Label("Rename…", systemImage: "pencil") }
 
         if device.state.isUsable {
@@ -172,6 +175,46 @@ struct DiscoveredRow: View {
             .padding(.vertical, 2)
         }
         .buttonStyle(.plain)
+    }
+}
+
+// MARK: - Rename sheet
+
+/// A small focused sheet for renaming a device. Sheets give a reliable,
+/// editable, auto-focused text field (alert text fields are flaky on macOS).
+struct RenameSheet: View {
+    @State private var name: String
+    @FocusState private var focused: Bool
+    let onSave: (String) -> Void
+    let onCancel: () -> Void
+
+    init(initialName: String, onSave: @escaping (String) -> Void, onCancel: @escaping () -> Void) {
+        _name = State(initialValue: initialName)
+        self.onSave = onSave
+        self.onCancel = onCancel
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Rename device").font(.headline)
+            Text("Shown only in iDroid, stored on this Mac.")
+                .font(.caption).foregroundStyle(.secondary)
+            TextField("Device name", text: $name)
+                .textFieldStyle(.roundedBorder)
+                .focused($focused)
+                .onSubmit { onSave(name) }
+            HStack {
+                Spacer()
+                Button("Cancel", role: .cancel) { onCancel() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Save") { onSave(name) }
+                    .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(20)
+        .frame(width: 340)
+        .onAppear { focused = true }
     }
 }
 
