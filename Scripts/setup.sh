@@ -18,15 +18,15 @@ if ! command -v brew >/dev/null 2>&1; then
   red "Homebrew not found. Install it from https://brew.sh and re-run."
   exit 1
 fi
-green "✓ Homebrew found"
+green "[ok] Homebrew found"
 
 # 2. adb + scrcpy ----------------------------------------------------------
 install_if_missing() {
   local tool="$1" cask_or_formula="$2" kind="$3"
   if command -v "$tool" >/dev/null 2>&1; then
-    green "✓ $tool already installed ($(command -v "$tool"))"
+    green "[ok] ${tool} already installed ($(command -v "$tool"))"
   else
-    yellow "Installing $tool…"
+    yellow "Installing ${tool}..."
     if [ "$kind" = "cask" ]; then
       brew install --cask "$cask_or_formula"
     else
@@ -47,21 +47,21 @@ scrcpy --version | head -1 || true
 
 # 3. Device check ----------------------------------------------------------
 echo
-bold "Looking for a connected device…"
+bold "Looking for a connected device..."
 adb start-server >/dev/null 2>&1 || true
 DEVICES=$(adb devices | sed '1d' | grep -v '^$' || true)
 
 if [ -z "$DEVICES" ]; then
   yellow "No device detected. To connect one:"
-  echo "  1. On the phone: Settings → About phone → tap 'Build number' 7×"
-  echo "  2. Settings → System → Developer options → enable 'USB debugging'"
+  echo "  1. On the phone: Settings > About phone > tap 'Build number' 7 times"
+  echo "  2. Settings > System > Developer options > enable 'USB debugging'"
   echo "  3. Plug the phone into this Mac with a USB cable"
   echo "  4. Accept the 'Allow USB debugging?' prompt on the phone"
   echo "  5. Re-run this script"
   exit 0
 fi
 
-green "✓ Device(s) detected:"
+green "[ok] Device(s) detected:"
 echo "$DEVICES"
 
 echo
