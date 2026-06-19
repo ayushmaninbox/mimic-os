@@ -225,13 +225,52 @@ struct StatusBar: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            if model.isWorking { ProgressView().controlSize(.small) }
-            Text(model.status).font(.callout).foregroundStyle(.secondary)
+            Circle()
+                .fill(dotColor)
+                .frame(width: 8, height: 8)
+            
+            if model.isWorking {
+                ProgressView().controlSize(.small)
+            }
+            Text(model.status)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            
             Spacer()
+            
+            diagnosticsView
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
         .background(.bar)
+    }
+
+    private var dotColor: Color {
+        guard let device = model.selectedDevice else { return .red }
+        if device.isOffline { return .secondary }
+        return device.state.isUsable ? .green : .orange
+    }
+
+    @ViewBuilder
+    private var diagnosticsView: some View {
+        if let info = model.info {
+            HStack(spacing: 12) {
+                if let res = info.resolution {
+                    Label(res, systemImage: "macbook.and.iphone")
+                }
+                if let version = info.androidVersion {
+                    Text("Android \(version)")
+                }
+                if let battery = info.batteryLevel {
+                    HStack(spacing: 4) {
+                        Image(systemName: info.isCharging == true ? "battery.100.percent.bolt" : "battery.100")
+                        Text("\(battery)%")
+                    }
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
     }
 }
 

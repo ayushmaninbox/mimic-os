@@ -548,6 +548,28 @@ final class AppModel {
 
     // MARK: - File browser
 
+    enum FileSortKey: String, CaseIterable {
+        case name = "Name"
+        case size = "Size"
+        case date = "Date Modified"
+    }
+
+    enum FileSortOrder: String {
+        case ascending
+        case descending
+    }
+
+    enum FileViewMode: String {
+        case list
+        case grid
+    }
+
+    var fileViewMode: FileViewMode = .list
+    var sortKey: FileSortKey? = nil
+    var sortOrder: FileSortOrder = .ascending
+    var sizeWidth: Double = 120.0
+    var dateWidth: Double = 160.0
+
     /// Current directory shown in the in-app file browser.
     var browsePath: String = "/sdcard/"
     var browseFiles: [ADB.RemoteFile] = []
@@ -566,6 +588,7 @@ final class AppModel {
         let name: String
         let direction: Direction
         var totalBytes: Int64?       // known up front for the source file
+        var bytesTransferred: Int64 = 0
         var fraction: Double = 0     // 0...1, computed by polling the dest size
         var done: Bool = false
         var failed: Bool = false
@@ -591,8 +614,9 @@ final class AppModel {
         return t.id
     }
 
-    private func updateProgress(_ id: UUID, fraction: Double) {
+    private func updateProgress(_ id: UUID, bytesTransferred: Int64, fraction: Double) {
         guard let idx = transfers.firstIndex(where: { $0.id == id }) else { return }
+        transfers[idx].bytesTransferred = bytesTransferred
         transfers[idx].fraction = max(transfers[idx].fraction, min(fraction, 0.995))
     }
 
@@ -602,6 +626,9 @@ final class AppModel {
         if transfers[idx].cancelled { return }   // cancel path owns the UI state
         transfers[idx].done = true
         transfers[idx].failed = failed
+        if !failed, let total = transfers[idx].totalBytes {
+            transfers[idx].bytesTransferred = total
+        }
         transfers[idx].fraction = failed ? transfers[idx].fraction : 1
         if !failed {
             let tid = id
@@ -652,7 +679,7 @@ final class AppModel {
                 if let now = await currentBytes(), total > 0 {
                     let fraction = Double(now) / Double(total)
                     if !fraction.isNaN && !fraction.isInfinite {
-                        await MainActor.run { self?.updateProgress(id, fraction: fraction) }
+                        await MainActor.run { self?.updateProgress(id, bytesTransferred: now, fraction: fraction) }
                     }
                 }
                 try? await Task.sleep(for: .milliseconds(150))
@@ -839,6 +866,121 @@ final class AppModel {
         finishTransfer(id, failed: !result.succeeded)
         guard result.succeeded else { return nil }
         return staged
+    }
+
+    var sortedFiles: [ADB.RemoteFile] {
+        if sortKey == nil {
+            return browseFiles.sorted {
+                if $0.isDirectory != $1.isDirectory {
+                    return $0.isDirectory && !$1.isDirectory
+                }
+                return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+            }
+        }
+        
+        return browseFiles.sorted { f1, f2 in
+            if f1.isDirectory != f2.isDirectory {
+                return f1.isDirectory && !f2.isDirectory
+            }
+            
+            let isAsc = sortOrder == .ascending
+            switch sortKey! {
+            case .name:
+                let cmp = f1.name.localizedCaseInsensitiveCompare(f2.name)
+                return isAsc ? (cmp == .orderedAscending) : (cmp == .orderedDescending)
+            case .size:
+                if f1.isDirectory {
+                    let sz1 = folderSizes[f1.path] ?? 0
+                    let sz2 = folderSizes[f2.path] ?? 0
+                    if sz1 == sz2 {
+                        return f1.name.localizedCaseInsensitiveCompare(f2.name) == .orderedAscending
+                    }
+                    return isAsc ? (sz1 < sz2) : (sz1 > sz2)
+                } else {
+                    let sz1 = f1.sizeBytes ?? 0
+                    let sz2 = f2.sizeBytes ?? 0
+                    if sz1 == sz2 {
+                        return f1.name.localizedCaseInsensitiveCompare(f2.name) == .orderedAscending
+                    }
+                    return isAsc ? (sz1 < sz2) : (sz1 > sz2)
+                }
+            case .date:
+                let d1 = f1.modified ?? ""
+                let d2 = f2.modified ?? ""
+                if d1 == d2 {
+                    return f1.name.localizedCaseInsensitiveCompare(f2.name) == .orderedAscending
+                }
+                return isAsc ? (d1 < d2) : (d1 > d2)
+            }
+        }
+    }
+
+    func cycleSort(for key: FileSortKey) {
+        if sortKey != key {
+            sortKey = key
+            sortOrder = .ascending
+        } else if sortOrder == .ascending {
+            sortOrder = .descending
+        } else {
+            sortKey = nil
+        }
+    }
+
+    func selectAllFiles() {
+        let allPaths = browseFiles.map(\.path)
+        selectedFiles = Set(allPaths)
+    }
+
+    func deselectAllFiles() {
+        selectedFiles.removeAll()
+    }
+
+    func previewFile(_ file: ADB.RemoteFile) async {
+        guard let serial = selectedSerial else { return }
+        
+        let previewDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("iDroid-preview", isDirectory: true)
+        try? FileManager.default.createDirectory(at: previewDir, withIntermediateDirectories: true)
+        
+        let localDest = previewDir.appendingPathComponent(file.name)
+        try? FileManager.default.removeItem(at: localDest)
+        
+        var total = file.sizeBytes
+        if file.isDirectory {
+            if let cached = folderSizes[file.path] {
+                total = cached
+            } else {
+                total = await ADB.directorySize(serial, path: file.path)
+            }
+        }
+        
+        let totalBytes = total ?? 0
+        
+        let poller = Task { [weak self, localDest, totalBytes] in
+            while !Task.isCancelled {
+                let isDir = (try? FileManager.default.contentsOfDirectory(atPath: localDest.path)) != nil
+                if let now = localBytes(at: localDest, isDirectory: isDir), totalBytes > 0 {
+                    let pct = Int(round(Double(now) / Double(totalBytes) * 100))
+                    let nowMB = Double(now) / 1_048_576.0
+                    let totalMB = Double(totalBytes) / 1_048_576.0
+                    await MainActor.run {
+                        self?.status = String(format: "Downloading preview: %.1f MB / %.1f MB (%d%%)", nowMB, totalMB, pct)
+                    }
+                }
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+        }
+        
+        status = "Downloading preview of \(file.name)..."
+        let result = await ADB.pull(serial, remotePath: file.path, localPath: previewDir.path)
+        poller.cancel()
+        
+        if result.succeeded {
+            status = "Opening preview of \(file.name)"
+            _ = Shell.launch("/usr/bin/qlmanage", ["-p", localDest.path])
+        } else {
+            status = "Failed to download preview: \(result.stderr.trimmingCharacters(in: .whitespacesAndNewlines))"
+        }
     }
 
     // MARK: - Automation shortcuts

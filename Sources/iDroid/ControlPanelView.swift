@@ -42,12 +42,6 @@ struct ControlPanelView: View {
                     renameRequest = nil
                 }
             }
-            .sheet(isPresented: Binding(
-                get: { !model.transfers.isEmpty },
-                set: { _ in }
-            )) {
-                FileTransferSheet()
-            }
         }
     }
 }
@@ -178,14 +172,36 @@ private struct FilesTab: View {
     @State private var showNewFolder = false
     @State private var newFolderName = ""
 
+    private var selectedFile: ADB.RemoteFile? {
+        model.browseFiles.first { model.selectedFiles.contains($0.path) }
+    }
+
     var body: some View {
-        VStack(spacing: 0) {
-            toolbar
-            Divider()
-            if model.hasSelection { selectionBar; Divider() }
-            columnHeader
-            Divider()
-            fileList
+        ZStack(alignment: .bottomTrailing) {
+            VStack(spacing: 0) {
+                toolbar
+                Divider()
+                if model.hasSelection { selectionBar; Divider() }
+                if model.fileViewMode == .list {
+                    columnHeader
+                    Divider()
+                }
+                fileList
+            }
+            
+            FloatingTransferHUD()
+                .zIndex(1)
+
+            // Invisible Spacebar shortcut handler
+            Button("") {
+                if let selected = selectedFile {
+                    Task { await model.previewFile(selected) }
+                }
+            }
+            .keyboardShortcut(.space, modifiers: [])
+            .buttonStyle(.plain)
+            .frame(width: 0, height: 0)
+            .opacity(0)
         }
         .task(id: model.selectedSerial) {
             if model.selectedSerial != nil { await model.loadFiles(path: "/sdcard/") }
@@ -229,6 +245,28 @@ private struct FilesTab: View {
 
             if model.isBrowsing { ProgressView().controlSize(.small) }
 
+            // Select All / None Toggle
+            Button {
+                if model.selectedFiles.count == model.browseFiles.count {
+                    model.deselectAllFiles()
+                } else {
+                    model.selectAllFiles()
+                }
+            } label: {
+                Image(systemName: model.selectedFiles.count == model.browseFiles.count ? "checkmark.circle.fill" : "checkmark.circle")
+            }
+            .help("Select All / None")
+            .buttonStyle(.bordered)
+
+            // Grid/List view mode segmented picker
+            Picker("", selection: Bindable(model).fileViewMode) {
+                Image(systemName: "list.bullet").tag(AppModel.FileViewMode.list)
+                Image(systemName: "square.grid.2x2").tag(AppModel.FileViewMode.grid)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(width: 60)
+
             Button { showNewFolder = true } label: { Image(systemName: "folder.badge.plus") }
                 .buttonStyle(.bordered)
             Button { pickAndUpload() } label: { Image(systemName: "square.and.arrow.up") }
@@ -243,7 +281,7 @@ private struct FilesTab: View {
             Spacer()
             Button("Copy to Mac…") { downloadSelected() }
             Button("Delete", role: .destructive) { Task { await model.deleteSelected() } }
-            Button("Clear") { model.clearSelection() }
+            Button("Clear") { model.deselectAllFiles() }
         }
         .padding(.horizontal, 12).padding(.vertical, 6)
         .background(.tint.opacity(0.08))
@@ -251,14 +289,34 @@ private struct FilesTab: View {
 
     private var columnHeader: some View {
         HStack(spacing: 0) {
-            // Spacer aligning with the row's selection bubble.
             Color.clear.frame(width: 26)
-            Text("Name").frame(maxWidth: .infinity, alignment: .leading)
-            Text("Size").frame(width: 90, alignment: .trailing)
-            Text("Date Modified").frame(width: 140, alignment: .trailing)
+            
+            HeaderColumnButton(title: "Name", key: .name, activeKey: model.sortKey, order: model.sortOrder) {
+                model.cycleSort(for: .name)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            
+            ResizeDivider { delta in
+                model.sizeWidth = max(60, min(300, model.sizeWidth - Double(delta)))
+            }
+            
+            HeaderColumnButton(title: "Size", key: .size, activeKey: model.sortKey, order: model.sortOrder) {
+                model.cycleSort(for: .size)
+            }
+            .frame(width: CGFloat(model.sizeWidth), alignment: .trailing)
+            .padding(.trailing, 8)
+            
+            ResizeDivider { delta in
+                model.dateWidth = max(80, min(400, model.dateWidth - Double(delta)))
+            }
+            
+            HeaderColumnButton(title: "Date Modified", key: .date, activeKey: model.sortKey, order: model.sortOrder) {
+                model.cycleSort(for: .date)
+            }
+            .frame(width: CGFloat(model.dateWidth), alignment: .trailing)
         }
         .font(.caption).bold().foregroundStyle(.secondary)
-        .padding(.horizontal, 14).padding(.vertical, 6)
+        .padding(.horizontal, 14).padding(.vertical, 4)
         .background(.quaternary.opacity(0.3))
     }
 
@@ -271,16 +329,38 @@ private struct FilesTab: View {
         Task { await model.downloadSelected(toLocalDir: dir.path) }
     }
 
+    private let gridColumns = [
+        GridItem(.adaptive(minimum: 80, maximum: 120), spacing: 12)
+    ]
+
     private var fileList: some View {
-        ScrollView {
-            LazyVStack(spacing: 0) {
-                if model.browseFiles.isEmpty && !model.isBrowsing {
-                    Text("Empty folder")
-                        .foregroundStyle(.secondary).padding(.vertical, 30)
-                } else {
-                    ForEach(model.browseFiles) { file in
-                        FileRow(file: file)
-                        Divider()
+        Group {
+            if model.fileViewMode == .grid {
+                ScrollView {
+                    LazyVGrid(columns: gridColumns, spacing: 16) {
+                        if model.browseFiles.isEmpty && !model.isBrowsing {
+                            Text("Empty folder")
+                                .foregroundStyle(.secondary).padding(.vertical, 30)
+                        } else {
+                            ForEach(model.sortedFiles) { file in
+                                FileGridTile(file: file)
+                            }
+                        }
+                    }
+                    .padding(16)
+                }
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        if model.browseFiles.isEmpty && !model.isBrowsing {
+                            Text("Empty folder")
+                                .foregroundStyle(.secondary).padding(.vertical, 30)
+                        } else {
+                            ForEach(model.sortedFiles) { file in
+                                FileRow(file: file)
+                                Divider()
+                            }
+                        }
                     }
                 }
             }
@@ -299,6 +379,161 @@ private struct FilesTab: View {
     }
 }
 
+private struct ResizeDivider: View {
+    let onDrag: (CGFloat) -> Void
+    @State private var prevTranslation: CGFloat = 0
+    @State private var isHovering = false
+    
+    var body: some View {
+        Rectangle()
+            .fill(isHovering ? Color.accentColor : Color.gray.opacity(0.3))
+            .frame(width: 2)
+            .frame(maxHeight: .infinity)
+            .contentShape(Rectangle())
+            .frame(width: 8) // wider hit test area
+            .onHover { inside in
+                isHovering = inside
+                if inside {
+                    NSCursor.resizeLeftRight.push()
+                } else {
+                    NSCursor.pop()
+                }
+            }
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { value in
+                        let delta = value.translation.width - prevTranslation
+                        prevTranslation = value.translation.width
+                        onDrag(delta)
+                    }
+                    .onEnded { _ in
+                        prevTranslation = 0
+                    }
+            )
+    }
+}
+
+private struct HeaderColumnButton: View {
+    let title: String
+    let key: AppModel.FileSortKey
+    let activeKey: AppModel.FileSortKey?
+    let order: AppModel.FileSortOrder
+    let action: () -> Void
+    
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 4) {
+                Text(title)
+                    .font(.caption).bold()
+                if activeKey == key {
+                    Image(systemName: order == .ascending ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 8))
+                }
+            }
+            .foregroundStyle(activeKey == key ? Color.primary : Color.secondary)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct FileGridTile: View {
+    @Environment(AppModel.self) private var model
+    let file: ADB.RemoteFile
+    @State private var hovering = false
+
+    private var isSelected: Bool { model.selectedFiles.contains(file.path) }
+
+    var body: some View {
+        VStack(spacing: 8) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(isSelected ? AnyShapeStyle(.tint.opacity(0.12)) : (hovering ? AnyShapeStyle(.quaternary.opacity(0.3)) : AnyShapeStyle(.clear)))
+                    .frame(width: 70, height: 70)
+                
+                Image(systemName: file.isDirectory ? "folder.fill" : fileIcon)
+                    .font(.system(size: 40))
+                    .foregroundStyle(file.isDirectory ? .blue : .secondary)
+            }
+            
+            Text(file.name)
+                .font(.caption)
+                .multilineTextAlignment(.center)
+                .lineLimit(2)
+                .frame(height: 32, alignment: .top)
+                .padding(.horizontal, 4)
+                .foregroundStyle(isSelected ? Color.accentColor : Color.primary)
+        }
+        .padding(.vertical, 8)
+        .contentShape(Rectangle())
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(isSelected ? Color.accentColor.opacity(0.3) : Color.clear, lineWidth: 1)
+                .background(isSelected ? AnyShapeStyle(Color.accentColor.opacity(0.04)) : AnyShapeStyle(Color.clear))
+        )
+        .onHover { hovering = $0 }
+        .onTapGesture {
+            if NSEvent.modifierFlags.contains(.command) {
+                model.toggleSelection(file)
+            } else {
+                model.selectedFiles = [file.path]
+            }
+        }
+        .onTapGesture(count: 2) {
+            if file.isDirectory {
+                Task { await model.openFolder(file) }
+            } else {
+                Task { await model.previewFile(file) }
+            }
+        }
+        .contextMenu {
+            if file.isDirectory {
+                Button("Open") { Task { await model.openFolder(file) } }
+            } else {
+                Button("Preview (Space)") { Task { await model.previewFile(file) } }
+            }
+            Button("Copy to Mac…") { downloadToMac() }
+            Divider()
+            Button("Delete", role: .destructive) { Task { await model.deleteFromPhone(file) } }
+        }
+        .onDrag {
+            let provider = NSItemProvider()
+            provider.suggestedName = file.name
+            provider.registerFileRepresentation(forTypeIdentifier: UTType.data.identifier,
+                                                 fileOptions: [], visibility: .all) { completion in
+                Task {
+                    let url = await model.stageForDragOut(file)
+                    completion(url, true, nil)
+                }
+                return nil
+            }
+            return provider
+        }
+    }
+
+    private var fileIcon: String {
+        let ext = (file.name as NSString).pathExtension.lowercased()
+        switch ext {
+        case "pdf": return "doc.richtext"
+        case "apk": return "app.badge"
+        case "png", "jpg", "jpeg", "gif", "webp", "heic": return "photo"
+        case "mp4", "mkv", "mov", "avi", "3gp": return "video"
+        case "mp3", "wav", "m4a", "ogg", "flac": return "music.note"
+        case "txt", "md", "json", "xml", "csv": return "doc.text"
+        case "zip", "tar", "gz", "rar", "7z": return "doc.zipper"
+        default: return "doc"
+        }
+    }
+
+    private func downloadToMac() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.prompt = "Save Here"
+        guard panel.runModal() == .OK, let dir = panel.url else { return }
+        Task { await model.downloadFromPhone(file, toLocalDir: dir.path) }
+    }
+}
+
 private struct FileRow: View {
     @Environment(AppModel.self) private var model
     let file: ADB.RemoteFile
@@ -306,7 +541,6 @@ private struct FileRow: View {
 
     private var isSelected: Bool { model.selectedFiles.contains(file.path) }
 
-    /// Size string: file size, or the lazily-loaded folder size, or a spinner.
     private var sizeText: String {
         if let bytes = file.sizeBytes { return byteString(bytes) }
         if file.isDirectory, let folderBytes = model.folderSizes[file.path] {
@@ -317,7 +551,6 @@ private struct FileRow: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            // Selection bubble (appears on hover or when anything is selected).
             Button {
                 model.toggleSelection(file)
             } label: {
@@ -329,7 +562,7 @@ private struct FileRow: View {
             .frame(width: 26)
 
             HStack(spacing: 8) {
-                Image(systemName: file.isDirectory ? "folder.fill" : "doc")
+                Image(systemName: file.isDirectory ? "folder.fill" : fileIcon)
                     .foregroundStyle(file.isDirectory ? .blue : .secondary)
                 Text(file.name).lineLimit(1)
             }
@@ -337,10 +570,11 @@ private struct FileRow: View {
 
             Text(sizeText)
                 .font(.caption).foregroundStyle(.secondary)
-                .frame(width: 90, alignment: .trailing)
+                .frame(width: CGFloat(model.sizeWidth), alignment: .trailing)
+                .padding(.trailing, 8)
             Text(file.modified ?? "—")
                 .font(.caption).foregroundStyle(.secondary)
-                .frame(width: 140, alignment: .trailing)
+                .frame(width: CGFloat(model.dateWidth), alignment: .trailing)
         }
         .padding(.horizontal, 14).padding(.vertical, 6)
         .background((isSelected || hovering) ? AnyShapeStyle(.tint.opacity(0.08)) : AnyShapeStyle(.clear))
@@ -348,11 +582,17 @@ private struct FileRow: View {
         .animation(.easeInOut(duration: 0.1), value: hovering)
         .animation(.easeInOut(duration: 0.1), value: isSelected)
         .onHover { hovering = $0 }
+        .onTapGesture {
+            if NSEvent.modifierFlags.contains(.command) {
+                model.toggleSelection(file)
+            } else {
+                model.selectedFiles = [file.path]
+            }
+        }
         .onTapGesture(count: 2) {
             if file.isDirectory { Task { await model.openFolder(file) } }
+            else { Task { await model.previewFile(file) } }
         }
-        // Drag a phone file out to Finder/Desktop. We stage it to a temp file
-        // first (adb pull), then hand Finder the resulting local URL.
         .onDrag {
             let provider = NSItemProvider()
             provider.suggestedName = file.name
@@ -369,10 +609,26 @@ private struct FileRow: View {
         .contextMenu {
             if file.isDirectory {
                 Button("Open") { Task { await model.openFolder(file) } }
+            } else {
+                Button("Preview (Space)") { Task { await model.previewFile(file) } }
             }
             Button("Copy to Mac…") { downloadToMac() }
             Divider()
             Button("Delete", role: .destructive) { Task { await model.deleteFromPhone(file) } }
+        }
+    }
+
+    private var fileIcon: String {
+        let ext = (file.name as NSString).pathExtension.lowercased()
+        switch ext {
+        case "pdf": return "doc.richtext"
+        case "apk": return "app.badge"
+        case "png", "jpg", "jpeg", "gif", "webp", "heic": return "photo"
+        case "mp4", "mkv", "mov", "avi", "3gp": return "video"
+        case "mp3", "wav", "m4a", "ogg", "flac": return "music.note"
+        case "txt", "md", "json", "xml", "csv": return "doc.text"
+        case "zip", "tar", "gz", "rar", "7z": return "doc.zipper"
+        default: return "doc"
         }
     }
 
@@ -564,73 +820,32 @@ struct PathSegment: Identifiable {
     var id: String { path }
 }
 
-// MARK: - File Transfer Modal Sheet
-
-private struct FileTransferSheet: View {
+private struct FloatingTransferHUD: View {
     @Environment(AppModel.self) private var model
+    @State private var isMinimized = false
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text("File Transfers")
-                    .font(.headline)
-                Spacer()
-                if activeCount == 0 {
-                    Button("Dismiss") {
-                        model.transfers.removeAll()
-                    }
-                    .keyboardShortcut(.defaultAction)
-                    .buttonStyle(.borderedProminent)
+        if model.transfers.isEmpty {
+            EmptyView()
+        } else {
+            VStack(spacing: 0) {
+                if isMinimized {
+                    minimizedView
                 } else {
-                    Button("Cancel All") {
-                        Task {
-                            for t in model.transfers where !t.done {
-                                await model.cancelTransfer(t.id)
-                            }
-                        }
-                    }
-                    .buttonStyle(.bordered)
+                    maximizedView
                 }
             }
-            .padding(.horizontal, 20)
-            .padding(.vertical, 14)
-            
-            Divider()
-            
-            if activeCount > 0 {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Transferring \(activeCount) item(s)…")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                    ProgressView(value: overallFraction)
-                }
-                .padding(20)
-                Divider()
-            } else {
-                VStack(spacing: 8) {
-                    Image(systemName: "checkmark.circle.fill")
-                        .font(.largeTitle)
-                        .foregroundStyle(.green)
-                    Text("All transfers completed.")
-                        .font(.subheadline)
-                        .bold()
-                }
-                .padding(.vertical, 30)
-                Divider()
-            }
-            
-            ScrollView {
-                LazyVStack(spacing: 0) {
-                    ForEach(model.transfers) { t in
-                        TransferSheetRow(transfer: t)
-                        Divider()
-                    }
-                }
-            }
-            .frame(maxHeight: 250)
+            .background(.ultraThinMaterial)
+            .clipShape(RoundedRectangle(cornerRadius: 16))
+            .overlay(
+                RoundedRectangle(cornerRadius: 16)
+                    .stroke(.white.opacity(0.15), lineWidth: 1)
+            )
+            .shadow(color: .black.opacity(0.25), radius: 10, x: 0, y: 5)
+            .padding(16)
+            .frame(width: isMinimized ? 220 : 360)
+            .animation(.spring(response: 0.35, dampingFraction: 0.8), value: isMinimized)
         }
-        .frame(width: 480)
-        .padding(.bottom, 10)
     }
 
     private var activeCount: Int {
@@ -643,43 +858,144 @@ private struct FileTransferSheet: View {
         let total = activeTransfers.reduce(0.0) { $0 + $1.fraction }
         return total / Double(activeTransfers.count)
     }
+
+    private var minimizedView: some View {
+        HStack(spacing: 12) {
+            Image(systemName: activeCount > 0 ? "arrow.up.left.and.arrow.down.right.circle.fill" : "checkmark.circle.fill")
+                .foregroundStyle(activeCount > 0 ? Color.accentColor : Color.green)
+                .font(.title3)
+            
+            VStack(alignment: .leading, spacing: 2) {
+                if activeCount > 0 {
+                    Text("Transferring \(activeCount) file\(activeCount > 1 ? "s" : "")")
+                        .font(.caption).bold()
+                    Text("\(Int(overallFraction * 100))%")
+                        .font(.system(size: 10)).foregroundStyle(.secondary)
+                } else {
+                    Text("Transfers Complete")
+                        .font(.caption).bold()
+                }
+            }
+            Spacer()
+            Button {
+                isMinimized = false
+            } label: {
+                Image(systemName: "arrow.up.left.and.arrow.down.right")
+                    .font(.caption)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+    }
+
+    private var maximizedView: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Label("File Transfers", systemImage: "arrow.left.and.right.righttriangle.left.righttriangle.right")
+                    .font(.subheadline).bold()
+                Spacer()
+                
+                HStack(spacing: 8) {
+                    Button {
+                        isMinimized = true
+                    } label: {
+                        Image(systemName: "minus")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Minimize")
+
+                    if activeCount == 0 {
+                        Button {
+                            model.transfers.removeAll()
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.caption)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Clear")
+                    } else {
+                        Button("Cancel All") {
+                            Task {
+                                for t in model.transfers where !t.done {
+                                    await model.cancelTransfer(t.id)
+                                }
+                            }
+                        }
+                        .font(.caption)
+                        .buttonStyle(.borderless)
+                    }
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            
+            Divider().background(.white.opacity(0.1))
+            
+            if activeCount > 0 {
+                VStack(alignment: .leading, spacing: 6) {
+                    ProgressView(value: overallFraction)
+                        .progressViewStyle(.linear)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                Divider().background(.white.opacity(0.1))
+            }
+            
+            ScrollView {
+                VStack(spacing: 0) {
+                    ForEach(model.transfers) { t in
+                        TransferRowView(transfer: t)
+                        if t.id != model.transfers.last?.id {
+                            Divider().background(.white.opacity(0.05))
+                        }
+                    }
+                }
+            }
+            .frame(maxHeight: 200)
+        }
+    }
 }
 
-private struct TransferSheetRow: View {
+private struct TransferRowView: View {
     @Environment(AppModel.self) private var model
     let transfer: AppModel.Transfer
 
     var body: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 10) {
             Group {
                 if transfer.done {
                     Image(systemName: transfer.failed ? "xmark.circle.fill" : "checkmark.circle.fill")
                         .foregroundStyle(transfer.failed ? .red : .green)
                 } else {
-                    Image(systemName: transfer.direction == .toPhone ? "arrow.down.circle.fill" : "arrow.up.circle.fill")
+                    Image(systemName: transfer.direction == .toPhone ? "arrow.right.to.line.circle.fill" : "arrow.left.to.line.circle.fill")
                         .foregroundStyle(.tint)
                 }
             }
-            .font(.title2)
+            .font(.title3)
 
-            VStack(alignment: .leading, spacing: 4) {
+            VStack(alignment: .leading, spacing: 3) {
                 HStack {
                     Text(transfer.name)
-                        .font(.body)
+                        .font(.caption)
                         .bold()
                         .lineLimit(1)
                     Spacer()
                     Text(statusLabel)
-                        .font(.caption)
+                        .font(.system(size: 9))
                         .foregroundStyle(.secondary)
                 }
                 
                 if transfer.done {
                     ProgressView(value: transfer.failed ? 0.0 : 1.0)
+                        .progressViewStyle(.linear)
                 } else if transfer.isDeterminate {
                     ProgressView(value: transfer.fraction)
+                        .progressViewStyle(.linear)
                 } else {
-                    ProgressView().progressViewStyle(.linear)
+                    ProgressView()
+                        .progressViewStyle(.linear)
                 }
             }
 
@@ -688,21 +1004,31 @@ private struct TransferSheetRow: View {
                     Task { await model.cancelTransfer(transfer.id) }
                 } label: {
                     Image(systemName: "xmark.circle")
+                        .font(.caption)
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
             }
         }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 10)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
     }
 
     private var statusLabel: String {
         if transfer.cancelled { return "Cancelled" }
         if transfer.failed { return "Failed" }
         if transfer.done { return "Done" }
-        if transfer.isDeterminate { return "\(Int(transfer.fraction * 100))%" }
-        return transfer.direction == .toPhone ? "Uploading…" : "Downloading…"
+        
+        let formattedSent = byteString(transfer.bytesTransferred)
+        if let total = transfer.totalBytes, total > 0 {
+            let formattedTotal = byteString(total)
+            return "\(formattedSent) / \(formattedTotal) (\(Int(transfer.fraction * 100))%)"
+        }
+        return transfer.direction == .toPhone ? "Uploading..." : "Downloading..."
+    }
+
+    private func byteString(_ bytes: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
     }
 }
 
