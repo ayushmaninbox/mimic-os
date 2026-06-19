@@ -195,6 +195,17 @@ enum ADB {
         return result
     }
 
+    /// Total size of a directory on the phone via `du -s` (returns KB on toybox,
+    /// so we multiply by 1024). nil if it can't be read.
+    static func directorySize(_ serial: String, path: String) async -> Int64? {
+        let result = await Shell.run(ToolLocator.adb, ["-s", serial, "shell", "du", "-s", shellQuote(path)])
+        guard result.succeeded else { return nil }
+        // Output: "6988\t/sdcard/Download/onboarding"
+        let firstField = result.stdout.split(whereSeparator: { $0 == " " || $0 == "\t" }).first
+        if let kb = firstField.flatMap({ Int64($0) }) { return kb * 1024 }
+        return nil
+    }
+
     /// Byte size of a single file on the phone, or nil if it doesn't exist yet.
     /// Used to compute live transfer progress (adb hides its own % when piped).
     static func fileSize(_ serial: String, path: String) async -> Int64? {
@@ -218,6 +229,22 @@ enum ADB {
 
     static func pull(_ serial: String, remotePath: String, localPath: String) async -> ProcessResult {
         await Shell.run(ToolLocator.adb, ["-s", serial, "pull", remotePath, localPath])
+    }
+
+    /// Cancellable push — exposes the running process so a transfer can be killed.
+    static func pushCancellable(_ serial: String, localPath: String, remotePath: String,
+                                onStart: @escaping @Sendable (Process) -> Void) async -> ProcessResult {
+        let result = await Shell.runCancellable(ToolLocator.adb,
+            ["-s", serial, "push", localPath, remotePath], onStart: onStart)
+        if result.succeeded { await scanMedia(serial, path: remotePath) }
+        return result
+    }
+
+    /// Cancellable pull.
+    static func pullCancellable(_ serial: String, remotePath: String, localPath: String,
+                                onStart: @escaping @Sendable (Process) -> Void) async -> ProcessResult {
+        await Shell.runCancellable(ToolLocator.adb,
+            ["-s", serial, "pull", remotePath, localPath], onStart: onStart)
     }
 
     /// Installs an APK (replacing an existing install with `-r`).

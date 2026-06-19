@@ -40,15 +40,21 @@ struct AddDeviceSheet: View {
                     Button {
                         step = .choose
                     } label: {
-                        Label("Back", systemImage: "chevron.left")
+                        HStack(spacing: 4) {
+                            Image(systemName: "chevron.left")
+                            Text("Back")
+                        }
+                        .foregroundStyle(.tint)
                     }
+                    .buttonStyle(.borderless)
                 } else {
                     // Reserve symmetric space so the title stays centered.
                     Color.clear.frame(width: 60, height: 1)
                 }
                 Spacer()
                 Button("Done") { dismiss() }
-                    .keyboardShortcut(.cancelAction)
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
             }
         }
         .padding(.horizontal, 16)
@@ -100,20 +106,37 @@ private struct ConnectionCard: View {
     let subtitle: String
     let action: () -> Void
 
+    @State private var isHovering = false
+
     var body: some View {
         Button(action: action) {
             VStack(spacing: 10) {
-                Image(systemName: systemImage).font(.system(size: 34))
+                Image(systemName: systemImage)
+                    .font(.system(size: 34))
+                    .foregroundStyle(isHovering ? Color.accentColor : Color.primary)
+                    .scaleEffect(isHovering ? 1.05 : 1.0)
+                
                 Text(title).font(.headline)
+                
                 Text(subtitle).font(.caption).foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
+                    .lineLimit(3)
+                    .minimumScaleFactor(0.9)
             }
-            .frame(maxWidth: .infinity, minHeight: 150)
+            .frame(maxWidth: .infinity, minHeight: 160)
             .padding(12)
-            .background(.quaternary.opacity(0.4))
+            .background(isHovering ? AnyShapeStyle(.tint.opacity(0.08)) : AnyShapeStyle(.quaternary.opacity(0.3)))
+            .overlay(
+                RoundedRectangle(cornerRadius: 12)
+                    .stroke(isHovering ? Color.accentColor : Color.clear, lineWidth: 1.5)
+            )
             .clipShape(RoundedRectangle(cornerRadius: 12))
+            .animation(.easeInOut(duration: 0.15), value: isHovering)
         }
         .buttonStyle(.plain)
+        .onHover { hovering in
+            isHovering = hovering
+        }
     }
 }
 

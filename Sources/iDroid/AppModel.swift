@@ -49,25 +49,24 @@ final class AppModel {
     var stayAwake: Bool = true
 
     // MARK: - Clipboard sync
+    //
+    // Modern Android (≈13+, confirmed gone on Android 16) removed the
+    // `cmd clipboard` shell interface, so there is NO app-free way to read/write
+    // the phone clipboard over adb. The working channel is scrcpy's own
+    // clipboard sync, which is automatic while a mirror session is focused.
+    // This flag just reflects that scrcpy handles it; there's no background
+    // poller to run.
 
-    private let clipboard = ClipboardSync()
-    /// When on, the Mac and phone clipboards stay in sync automatically. On by
-    /// default; it activates once a usable device is selected.
+    /// Clipboard is synced by scrcpy in the background or during mirroring.
     var clipboardSyncEnabled: Bool = true {
-        didSet { applyClipboardSync() }
-    }
-
-    private func applyClipboardSync() {
-        if clipboardSyncEnabled, let serial = selectedSerial,
-           devices.contains(where: { $0.serial == serial && $0.state.isUsable }) {
-            clipboard.start(serial: serial)
-            status = "Clipboard sync on"
-        } else {
-            clipboard.stop()
+        didSet {
+            updateBackgroundClipboardSync()
         }
     }
 
     private let scrcpy = Scrcpy()
+    private let headlessScrcpy = Scrcpy()
+    private var headlessSerial: String?
 
     /// Serial of the device currently being mirrored, or nil. This is observable
     /// (unlike `scrcpy.isRunning`), so the UI updates the moment we start/stop.
@@ -191,6 +190,7 @@ final class AppModel {
         if selectedSerial == nil, let first = found.first(where: { $0.state.isUsable }) {
             await select(first.serial)
         }
+        updateBackgroundClipboardSync()
 
         let onlineCount = found.filter { $0.state.isUsable }.count
         status = onlineCount == 0
@@ -249,7 +249,7 @@ final class AppModel {
         selectedSerial = serial
         info = await ADB.info(serial)
         notifications = await ADB.notificationSnapshot(serial)
-        applyClipboardSync()   // re-point sync at the newly selected device
+        updateBackgroundClipboardSync()
     }
 
     // MARK: - Mirroring
@@ -260,10 +260,15 @@ final class AppModel {
             return
         }
         if isMirroring {
-            scrcpy.stop()
             mirroringSerial = nil
+            scrcpy.stop()
             status = "Mirror stopped"
+            updateBackgroundClipboardSync()
         } else {
+            // Stop background clipboard sync before starting full mirror
+            headlessScrcpy.stop()
+            headlessSerial = nil
+
             var options = Scrcpy.Options()
             options.turnScreenOff = turnScreenOff
             options.stayAwake = stayAwake
@@ -274,6 +279,7 @@ final class AppModel {
                     if self?.mirroringSerial == serial {
                         self?.mirroringSerial = nil
                         self?.status = "Mirror stopped"
+                        self?.updateBackgroundClipboardSync()
                     }
                 }
             }
@@ -281,6 +287,45 @@ final class AppModel {
             status = ok
                 ? (turnScreenOff ? "Mirroring (phone screen off)" : "Mirroring")
                 : "Failed to start scrcpy"
+        }
+    }
+
+    func updateBackgroundClipboardSync() {
+        guard clipboardSyncEnabled && toolsReady else {
+            if headlessSerial != nil {
+                headlessScrcpy.stop()
+                headlessSerial = nil
+            }
+            return
+        }
+
+        guard let serial = selectedSerial,
+              let device = selectedDevice,
+              device.state.isUsable,
+              !isMirroring else {
+            if headlessSerial != nil {
+                headlessScrcpy.stop()
+                headlessSerial = nil
+            }
+            return
+        }
+
+        if headlessSerial == serial {
+            return
+        }
+
+        headlessScrcpy.stop()
+
+        let ok = headlessScrcpy.startHeadless(serial: serial) { [weak self] in
+            Task { @MainActor in
+                self?.headlessSerial = nil
+            }
+        }
+
+        if ok {
+            headlessSerial = serial
+        } else {
+            headlessSerial = nil
         }
     }
 
@@ -508,6 +553,13 @@ final class AppModel {
     var browseFiles: [ADB.RemoteFile] = []
     var isBrowsing: Bool = false
 
+    /// Lazily-computed folder sizes (path -> bytes), filled after a listing so
+    /// the list shows instantly and sizes fill in as `du` returns.
+    var folderSizes: [String: Int64] = [:]
+
+    /// Serials selected for bulk actions in the file browser.
+    var selectedFiles: Set<String> = []   // RemoteFile.path values
+
     /// In-flight / recent file transfers, shown as progress bars in the UI.
     struct Transfer: Identifiable {
         let id = UUID()
@@ -517,12 +569,21 @@ final class AppModel {
         var fraction: Double = 0     // 0...1, computed by polling the dest size
         var done: Bool = false
         var failed: Bool = false
+        var cancelled: Bool = false
         enum Direction { case toPhone, toMac }
 
-        /// True when we can show a determinate bar (we know the total size).
         var isDeterminate: Bool { (totalBytes ?? 0) > 0 }
+        var inProgress: Bool { !done }
     }
     var transfers: [Transfer] = []
+
+    /// Live process + cleanup info per transfer, kept outside the observable
+    /// array (Process isn't observable/Sendable-friendly).
+    private struct TransferControl {
+        weak var process: Process?
+        let remotePathToCleanup: String?   // delete this on cancel (uploads)
+    }
+    private var controls: [UUID: TransferControl] = [:]
 
     private func addTransfer(_ name: String, _ dir: Transfer.Direction, totalBytes: Int64?) -> UUID {
         let t = Transfer(name: name, direction: dir, totalBytes: totalBytes)
@@ -532,12 +593,13 @@ final class AppModel {
 
     private func updateProgress(_ id: UUID, fraction: Double) {
         guard let idx = transfers.firstIndex(where: { $0.id == id }) else { return }
-        // Never go backwards or hit 100% before we mark it done.
-        transfers[idx].fraction = max(transfers[idx].fraction, min(fraction, 0.99))
+        transfers[idx].fraction = max(transfers[idx].fraction, min(fraction, 0.995))
     }
 
     private func finishTransfer(_ id: UUID, failed: Bool) {
+        controls[id] = nil
         guard let idx = transfers.firstIndex(where: { $0.id == id }) else { return }
+        if transfers[idx].cancelled { return }   // cancel path owns the UI state
         transfers[idx].done = true
         transfers[idx].failed = failed
         transfers[idx].fraction = failed ? transfers[idx].fraction : 1
@@ -552,6 +614,27 @@ final class AppModel {
 
     func clearTransfer(_ id: UUID) {
         transfers.removeAll { $0.id == id }
+        controls[id] = nil
+    }
+
+    /// Cancel an in-flight transfer: kill the adb process and, for uploads,
+    /// delete the partial file left on the phone.
+    func cancelTransfer(_ id: UUID) async {
+        guard let idx = transfers.firstIndex(where: { $0.id == id }) else { return }
+        transfers[idx].cancelled = true
+        transfers[idx].done = true
+        transfers[idx].failed = true
+
+        let control = controls[id]
+        control?.process?.terminate()
+        controls[id] = nil
+
+        // Clean up a partially-written file on the phone (uploads only).
+        if let remote = control?.remotePathToCleanup, let serial = selectedSerial {
+            _ = await ADB.delete(serial, path: remote)
+            await loadFiles()
+        }
+        status = "Transfer cancelled"
     }
 
     /// Local file size on the Mac (for source totals and pull progress).
@@ -566,10 +649,13 @@ final class AppModel {
                               currentBytes: @escaping @Sendable () async -> Int64?) -> Task<Void, Never> {
         Task { [weak self] in
             while !Task.isCancelled {
-                if let now = await currentBytes() {
-                    await MainActor.run { self?.updateProgress(id, fraction: Double(now) / Double(total)) }
+                if let now = await currentBytes(), total > 0 {
+                    let fraction = Double(now) / Double(total)
+                    if !fraction.isNaN && !fraction.isInfinite {
+                        await MainActor.run { self?.updateProgress(id, fraction: fraction) }
+                    }
                 }
-                try? await Task.sleep(for: .milliseconds(250))
+                try? await Task.sleep(for: .milliseconds(150))
             }
         }
     }
@@ -582,7 +668,53 @@ final class AppModel {
         if let path { browsePath = path }
         isBrowsing = true
         defer { isBrowsing = false }
+        selectedFiles.removeAll()
+        folderSizes.removeAll()
         browseFiles = await ADB.listFiles(serial, path: browsePath)
+        // Fill folder sizes lazily so the list appears immediately.
+        let folders = browseFiles.filter { $0.isDirectory }
+        Task { [weak self, serial] in
+            for folder in folders {
+                if Task.isCancelled { return }
+                if let size = await ADB.directorySize(serial, path: folder.path) {
+                    await MainActor.run { self?.folderSizes[folder.path] = size }
+                }
+            }
+        }
+    }
+
+    // MARK: - File multi-select & bulk actions
+
+    func toggleSelection(_ file: ADB.RemoteFile) {
+        if selectedFiles.contains(file.path) { selectedFiles.remove(file.path) }
+        else { selectedFiles.insert(file.path) }
+    }
+
+    var hasSelection: Bool { !selectedFiles.isEmpty }
+
+    func clearSelection() { selectedFiles.removeAll() }
+
+    private var selectedRemoteFiles: [ADB.RemoteFile] {
+        browseFiles.filter { selectedFiles.contains($0.path) }
+    }
+
+    /// Copy all selected items to a chosen Mac folder.
+    func downloadSelected(toLocalDir dir: String) async {
+        let items = selectedRemoteFiles
+        clearSelection()
+        for item in items { await downloadFromPhone(item, toLocalDir: dir) }
+    }
+
+    /// Delete all selected items from the phone.
+    func deleteSelected() async {
+        let items = selectedRemoteFiles
+        clearSelection()
+        for item in items {
+            guard let serial = selectedSerial else { break }
+            _ = await ADB.delete(serial, path: item.path)
+        }
+        status = "Deleted \(items.count) item(s)"
+        await loadFiles()
     }
 
     func openFolder(_ file: ADB.RemoteFile) async {
@@ -597,55 +729,76 @@ final class AppModel {
         await loadFiles(path: parent.isEmpty ? "/" : parent + "/")
     }
 
-    /// Copy a file/folder from the phone to a chosen Mac folder (with progress).
+    /// Copy a file/folder from the phone to a chosen Mac folder (cancellable, with progress).
     func downloadFromPhone(_ file: ADB.RemoteFile, toLocalDir localDir: String) async {
         guard let serial = selectedSerial else { return }
-        let total = file.sizeBytes
-        let id = addTransfer(file.name, .toMac, totalBytes: total)
-
-        // Poll the growing local file to show a real bar (only for plain files).
-        let localFile = (localDir as NSString).appendingPathComponent(file.name)
-        var poller: Task<Void, Never>?
-        if let total, total > 0, !file.isDirectory {
-            poller = pollProgress(id: id, total: total) { [localFile] in
-                let attrs = try? FileManager.default.attributesOfItem(atPath: localFile)
-                return (attrs?[.size] as? NSNumber)?.int64Value
+        // Folders report no size in the listing; fetch it so the bar is real.
+        var total = file.sizeBytes
+        if file.isDirectory {
+            if let cached = folderSizes[file.path] {
+                total = cached
+            } else {
+                total = await ADB.directorySize(serial, path: file.path)
             }
         }
 
-        let result = await ADB.pull(serial, remotePath: file.path, localPath: localDir)
+        // Poll the growing local destination (a file, or a dir for folders).
+        let localDest = URL(fileURLWithPath: (localDir as NSString).appendingPathComponent(file.name))
+        
+        // Delete local destination before pulling so progress starts at 0 bytes
+        try? FileManager.default.removeItem(at: localDest)
+
+        let id = addTransfer(file.name, .toMac, totalBytes: total)
+
+        var poller: Task<Void, Never>?
+        if let total, total > 0 {
+            poller = pollProgress(id: id, total: total) { [localDest, file] in
+                localBytes(at: localDest, isDirectory: file.isDirectory)
+            }
+        }
+
+        let result = await ADB.pullCancellable(serial, remotePath: file.path, localPath: localDir) { [weak self] proc in
+            Task { @MainActor in self?.controls[id] = TransferControl(process: proc, remotePathToCleanup: nil) }
+        }
         poller?.cancel()
         finishTransfer(id, failed: !result.succeeded)
-        status = result.succeeded ? "Copied \(file.name) to Mac"
-            : "Copy failed: \(result.stderr.trimmingCharacters(in: .whitespacesAndNewlines))"
+        if result.succeeded { status = "Copied \(file.name) to Mac" }
     }
 
-    /// Copy one or more Mac files into the directory currently shown (with progress).
+    /// Copy one or more Mac files into the directory currently shown (cancellable, with progress).
     func uploadToCurrentFolder(localPaths: [String]) async {
         guard let serial = selectedSerial else { return }
         for localPath in localPaths {
             let name = (localPath as NSString).lastPathComponent
-            let total = localSize(localPath)
+            let isDir = (try? FileManager.default.contentsOfDirectory(atPath: localPath)) != nil
+            let total = localBytes(at: URL(fileURLWithPath: localPath), isDirectory: isDir)
+
+            let base = browsePath.hasSuffix("/") ? browsePath : browsePath + "/"
+            let remoteDest = base + name
+
+            // Delete remote destination before pushing so progress starts at 0 bytes
+            _ = await ADB.delete(serial, path: remoteDest)
+
             let id = addTransfer(name, .toPhone, totalBytes: total)
 
-            // Poll the growing file on the phone to show a real progress bar.
-            let base = browsePath.hasSuffix("/") ? browsePath : browsePath + "/"
-            let remoteFile = base + name
+            // Poll the growing destination on the phone (file size, or du for dirs).
             var poller: Task<Void, Never>?
             if let total, total > 0 {
-                poller = pollProgress(id: id, total: total) { [serial, remoteFile] in
-                    await ADB.fileSize(serial, path: remoteFile)
+                poller = pollProgress(id: id, total: total) { [serial, remoteDest, isDir] in
+                    isDir ? await ADB.directorySize(serial, path: remoteDest)
+                          : await ADB.fileSize(serial, path: remoteDest)
                 }
             }
 
-            let result = await ADB.push(serial, localPath: localPath, remotePath: browsePath)
+            let result = await ADB.pushCancellable(serial, localPath: localPath, remotePath: browsePath) { [weak self] proc in
+                Task { @MainActor in self?.controls[id] = TransferControl(process: proc, remotePathToCleanup: remoteDest) }
+            }
             poller?.cancel()
             finishTransfer(id, failed: !result.succeeded)
-            if !result.succeeded {
+            if !result.succeeded && !(transfers.first(where: { $0.id == id })?.cancelled ?? false) {
                 status = "Copy failed: \(result.stderr.trimmingCharacters(in: .whitespacesAndNewlines))"
             }
         }
-        status = "Copied to phone"
         await loadFiles()
     }
 
@@ -707,4 +860,22 @@ final class AppModel {
         await ADB.keyEvent(serial, keycode: 26)
         status = "POWER"
     }
+}
+
+/// Current byte size of a local path on the Mac — a single file's size, or the
+/// recursive total for a directory (used for progress on `.app` bundles etc).
+/// Free function so it's safe to call from `@Sendable` polling closures.
+func localBytes(at url: URL, isDirectory: Bool) -> Int64? {
+    let fm = FileManager.default
+    if !isDirectory {
+        let attrs = try? fm.attributesOfItem(atPath: url.path)
+        return (attrs?[.size] as? NSNumber)?.int64Value
+    }
+    guard let en = fm.enumerator(at: url, includingPropertiesForKeys: [.fileSizeKey]) else { return nil }
+    var total: Int64 = 0
+    for case let f as URL in en {
+        let size = (try? f.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+        total += Int64(size)
+    }
+    return total
 }

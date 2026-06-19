@@ -48,11 +48,25 @@ final class Scrcpy {
         return launched != nil
     }
 
+    /// Starts a headless mirror session purely for background clipboard synchronization.
+    @discardableResult
+    func startHeadless(serial: String, onExit: (@Sendable () -> Void)? = nil) -> Bool {
+        stop()
+        let args = ["-s", serial, "--no-video", "--no-audio", "--no-window"]
+        let launched = Shell.launch(ToolLocator.scrcpy, args)
+        launched?.terminationHandler = { _ in onExit?() }
+        process = launched
+        return launched != nil
+    }
+
     /// Terminates the running mirror session, if any.
     func stop() {
-        guard let process, process.isRunning else { return }
-        process.terminate()
-        self.process = nil
+        if let process {
+            if process.isRunning {
+                process.terminate()
+            }
+            self.process = nil
+        }
     }
 
     deinit { stop() }

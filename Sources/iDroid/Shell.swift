@@ -61,6 +61,45 @@ enum Shell {
         }
     }
 
+    /// Like `run`, but hands the live `Process` to `onStart` so the caller can
+    /// terminate it (e.g. to cancel a file transfer). Resolves when it exits.
+    static func runCancellable(_ launchPath: String, _ arguments: [String],
+                               onStart: @escaping @Sendable (Process) -> Void) async -> ProcessResult {
+        await withCheckedContinuation { continuation in
+            let process = Process()
+            if launchPath.contains("/") {
+                process.executableURL = URL(fileURLWithPath: launchPath)
+                process.arguments = arguments
+            } else {
+                process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+                process.arguments = [launchPath] + arguments
+            }
+            var env = ProcessInfo.processInfo.environment
+            env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + (env["PATH"] ?? "/usr/bin:/bin")
+            process.environment = env
+
+            let outPipe = Pipe(); let errPipe = Pipe()
+            process.standardOutput = outPipe
+            process.standardError = errPipe
+            process.terminationHandler = { proc in
+                let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+                let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                continuation.resume(returning: ProcessResult(
+                    exitCode: proc.terminationStatus,
+                    stdout: String(decoding: outData, as: UTF8.self),
+                    stderr: String(decoding: errData, as: UTF8.self)))
+            }
+            do {
+                try process.run()
+                onStart(process)
+            } catch {
+                continuation.resume(returning: ProcessResult(
+                    exitCode: -1, stdout: "",
+                    stderr: "Failed to launch \(launchPath): \(error.localizedDescription)"))
+            }
+        }
+    }
+
     /// Launches a long-running process (e.g. scrcpy) and returns the handle
     /// immediately so the caller can terminate it later. Output is inherited.
     @discardableResult
