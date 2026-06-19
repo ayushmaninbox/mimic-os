@@ -61,8 +61,11 @@ final class AppModel {
     // This flag just reflects that scrcpy handles it; there's no background
     // poller to run.
 
-    /// Clipboard is synced by scrcpy in the background or during mirroring.
-    var clipboardSyncEnabled: Bool = true {
+    /// Background clipboard sync via a headless scrcpy session. OFF by default:
+    /// on Android 16 the repeated headless sessions destabilize the (already
+    /// fragile) wireless connection. Clipboard still syncs reliably during real
+    /// mirroring, which is the recommended path.
+    var clipboardSyncEnabled: Bool = false {
         didSet {
             updateBackgroundClipboardSync()
         }
@@ -271,7 +274,6 @@ final class AppModel {
 
     /// Disconnect AND forget: remove from the remembered list and clear its name.
     func forget(_ device: Device) async {
-        DeviceStore.disconnect(device.serial)
         if device.isWireless {
             _ = await ADB.disconnect(hostPort: device.serial)
         }
@@ -564,22 +566,27 @@ final class AppModel {
             return
         }
 
-        // The daemon needs a moment to restart in TCP/IP mode before it accepts
-        // a network connection.
-        try? await Task.sleep(for: .seconds(1))
-
+        // `adb tcpip` restarts the phone's daemon, so it's unreachable for a few
+        // seconds. Retry the connect until it actually comes back as "device".
         let hostPort = "\(ip):5555"
-        hotspotPhase = .working("Connecting to \(hostPort)…")
-        let connect = await ADB.connect(hostPort: hostPort)
-        await refreshDevices()
+        hotspotPhase = .working("Connecting to \(hostPort)… (the phone is switching to wireless)")
+        let connected = await ADB.connectVerified(hostPort: hostPort)
 
-        if devices.contains(where: { $0.serial == hostPort && $0.state.isUsable }) {
-            hotspotPhase = .connected(hostPort)
-            status = "Wireless over hotspot — you can unplug the USB cable now."
-        } else {
-            let detail = (connect.stdout + " " + connect.stderr).trimmingCharacters(in: .whitespacesAndNewlines)
-            hotspotPhase = .failed("Connected command ran but device isn't ready: \(detail)")
+        guard connected else {
+            hotspotPhase = .failed("The phone didn't come back on Wi-Fi. Make sure the Mac is joined to the phone's hotspot, then try again.")
+            return
         }
+
+        // Success. Disconnect the USB transport so scrcpy/adb don't see the same
+        // phone twice (the dual-transport race caused the EOF/disconnect errors).
+        // The phone keeps its wireless connection over the hotspot.
+        DeviceStore.remember(hostPort)
+        DeviceStore.connect(hostPort)
+        await refreshDevices()
+        await select(hostPort)
+
+        hotspotPhase = .connected(hostPort)
+        status = "Wireless over hotspot — you can unplug the USB cable now."
     }
 
     func resetHotspotPhase() { hotspotPhase = .idle }

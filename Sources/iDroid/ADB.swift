@@ -81,6 +81,28 @@ enum ADB {
         await Shell.run(ToolLocator.adb, ["connect", hostPort])
     }
 
+    /// Connects with retries and verifies the device actually reaches "device"
+    /// state. After `adb tcpip` the phone's daemon restarts and is briefly
+    /// unreachable, so a single connect attempt usually fails — we poll until it
+    /// comes back (up to ~`attempts` tries) and confirm via `adb devices`.
+    static func connectVerified(hostPort: String, attempts: Int = 12) async -> Bool {
+        for attempt in 0..<attempts {
+            let result = await Shell.run(ToolLocator.adb, ["connect", hostPort])
+            let out = result.stdout.lowercased()
+            // "connected to" or "already connected" both mean the socket is up.
+            if out.contains("connected to") || out.contains("already connected") {
+                // Confirm it's actually usable (not "offline"/"unauthorized").
+                let devices = await listDevices()
+                if devices.contains(where: { $0.serial == hostPort && $0.state.isUsable }) {
+                    return true
+                }
+            }
+            // Daemon still restarting — wait and retry. Back off slightly.
+            try? await Task.sleep(for: .milliseconds(attempt < 4 ? 700 : 1200))
+        }
+        return false
+    }
+
     static func disconnect(hostPort: String) async -> ProcessResult {
         await Shell.run(ToolLocator.adb, ["disconnect", hostPort])
     }

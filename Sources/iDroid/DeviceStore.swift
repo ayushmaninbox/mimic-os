@@ -67,5 +67,8 @@ struct DeviceStore {
     static func forget(_ serial: String) {
         defaults.set(knownSerials().filter { $0 != serial }, forKey: knownKey)
         setCustomName(nil, for: serial)
+        var disconnected = Set(defaults.stringArray(forKey: disconnectedKey) ?? [])
+        disconnected.remove(serial)
+        defaults.set(Array(disconnected), forKey: disconnectedKey)
     }
 }

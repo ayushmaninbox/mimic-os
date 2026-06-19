@@ -179,7 +179,7 @@ private struct HotspotGuideView: View {
                 .font(.caption).foregroundStyle(.secondary)
 
             GuideStep(number: 1, text: "Turn on the phone's **hotspot** and join it from this Mac (Wi-Fi menu → the phone's network).")
-            GuideStep(number: 2, text: "Enable **USB debugging** once (Developer options), then plug the phone into this Mac.")
+            GuideStep(number: 2, text: "Enable **USB debugging** once (Developer options), then plug the phone in. On the “Allow USB debugging?” prompt, **check “Always allow from this computer”** and tap **Allow** — this stops it disconnecting later.")
             GuideStep(number: 3, text: "Press the button below. When it says connected, you can **unplug the cable** and keep using the phone wirelessly over the hotspot.")
 
             Divider()
@@ -208,10 +208,25 @@ private struct HotspotGuideView: View {
             Spacer()
         }
         .onAppear { model.resetHotspotPhase() }
+        // Auto-close the sheet shortly after a successful connection and drop
+        // the user straight onto the main app page for that device.
+        .onChange(of: isConnected) { _, nowConnected in
+            if nowConnected {
+                Task {
+                    try? await Task.sleep(for: .seconds(1.2))
+                    model.showAddDevice = false
+                }
+            }
+        }
     }
 
     private var isRunning: Bool {
         if case .working = model.hotspotPhase { return true }
+        return false
+    }
+
+    private var isConnected: Bool {
+        if case .connected = model.hotspotPhase { return true }
         return false
     }
 
