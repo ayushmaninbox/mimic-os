@@ -10,6 +10,7 @@ struct iDroidApp: App {
                 .environment(model)
                 .frame(minWidth: 720, minHeight: 480)
                 .task { await model.onAppear() }
+                .onDisappear { model.onDisappear() }
         }
         .windowResizability(.contentMinSize)
     }

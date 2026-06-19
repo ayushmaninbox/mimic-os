@@ -85,6 +85,39 @@ enum ADB {
         await Shell.run(ToolLocator.adb, ["disconnect", hostPort])
     }
 
+    /// One service line from `adb mdns services`.
+    struct MDNSService {
+        let instanceName: String   // e.g. "adb-XXXX-YYYY" or our QR service name
+        let serviceType: String    // "_adb-tls-pairing._tcp." / "_adb-tls-connect._tcp."
+        let hostPort: String       // "192.168.1.5:37123"
+
+        var isPairing: Bool { serviceType.contains("pairing") }
+        var isConnect: Bool { serviceType.contains("connect") }
+    }
+
+    /// Parses `adb mdns services`. adb's own discovery daemon is the most
+    /// reliable source for ADB services — and it's the same daemon that will
+    /// perform the pairing handshake, so what it sees here is what `adb pair`
+    /// can actually reach.
+    ///
+    /// Output rows look like:
+    ///   adb-39031FDH-vWms8w  _adb-tls-pairing._tcp.  192.168.1.5:37123
+    static func mdnsServices() async -> [MDNSService] {
+        let result = await Shell.run(ToolLocator.adb, ["mdns", "services"])
+        guard result.succeeded else { return [] }
+
+        return result.stdout
+            .split(separator: "\n")
+            .dropFirst() // "List of discovered mdns services"
+            .compactMap { line in
+                let cols = line.split(whereSeparator: { $0 == " " || $0 == "\t" })
+                    .map(String.init)
+                    .filter { !$0.isEmpty }
+                guard cols.count >= 3 else { return nil }
+                return MDNSService(instanceName: cols[0], serviceType: cols[1], hostPort: cols[2])
+            }
+    }
+
     // MARK: - Files
 
     /// Copies a local file onto the device (default: Downloads).

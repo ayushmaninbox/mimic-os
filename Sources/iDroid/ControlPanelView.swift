@@ -20,8 +20,6 @@ struct ControlPanelView: View {
                     Divider()
                     FilesSection()
                     Divider()
-                    WirelessSection()
-                    Divider()
                     NotificationsSection()
                 }
                 .padding(20)
@@ -102,33 +100,6 @@ private struct FilesSection: View {
         panel.canChooseDirectories = false
         if let types { panel.allowedContentTypes = types }
         return panel.runModal() == .OK ? panel.url : nil
-    }
-}
-
-// MARK: - Wireless
-
-private struct WirelessSection: View {
-    @Environment(AppModel.self) private var model
-    @State private var pairHostPort = ""
-    @State private var pairCode = ""
-    @State private var connectHostPort = ""
-
-    var body: some View {
-        SectionCard(title: "Wireless (same Wi-Fi)", systemImage: "wifi") {
-            Text("On the phone: Developer options → Wireless debugging → Pair device with code.")
-                .font(.caption).foregroundStyle(.secondary)
-            HStack {
-                TextField("192.168.1.5:37000", text: $pairHostPort).textFieldStyle(.roundedBorder)
-                TextField("Code", text: $pairCode).textFieldStyle(.roundedBorder).frame(width: 90)
-                Button("Pair") { Task { await model.pairWireless(hostPort: pairHostPort, code: pairCode) } }
-                    .disabled(pairHostPort.isEmpty || pairCode.isEmpty)
-            }
-            HStack {
-                TextField("Connect: 192.168.1.5:5555", text: $connectHostPort).textFieldStyle(.roundedBorder)
-                Button("Connect") { Task { await model.connectWireless(hostPort: connectHostPort) } }
-                    .disabled(connectHostPort.isEmpty)
-            }
-        }
     }
 }
 
