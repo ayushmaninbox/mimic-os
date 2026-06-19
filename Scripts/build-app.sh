@@ -109,9 +109,9 @@ else
 fi
 
 bold "6/6  Ad-hoc signing (so it launches; not notarized)"
-# Ad-hoc sign every binary so Gatekeeper allows it after the right-click->Open.
-find "$TOOLS" -type f -perm +111 -exec codesign --force --sign - {} \; 2>/dev/null || true
-codesign --force --deep --sign - "$APP" 2>/dev/null || true
+# Ad-hoc sign every binary and library so Gatekeeper allows it.
+find "$TOOLS" -type f \( -name "*.dylib" -o -perm +111 \) -exec codesign --force --sign - {} \;
+codesign --force --deep --sign - "$APP"
 
 echo
 bold "Done: $APP"

@@ -71,6 +71,7 @@ enum ToolLocator {
         env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + (env["PATH"] ?? "/usr/bin:/bin")
         if let server = bundledServerPath { env["SCRCPY_SERVER_PATH"] = server }
         if isAvailable("adb") { env["ADB"] = adb }   // scrcpy uses $ADB if set
+        env["SDL_MAC_BACKGROUND_APP"] = "1"          // Prevents duplicate scrcpy icon in Dock
         return env
     }
 }
