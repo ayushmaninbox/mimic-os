@@ -1,0 +1,16 @@
+# Swift / SwiftPM
+.build/
+.swiftpm/
+Package.resolved
+*.xcodeproj
+*.xcworkspace
+
+# macOS
+.DS_Store
+
+# Bundled tooling (downloaded by Scripts/fetch-tools.sh, not committed)
+Resources/tools/
+
+# Build output
+dist/
+*.dmg
