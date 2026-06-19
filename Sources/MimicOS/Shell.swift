@@ -29,10 +29,7 @@ enum Shell {
                 process.arguments = [launchPath] + arguments
             }
 
-            var env = ProcessInfo.processInfo.environment
-            let extraPath = "/opt/homebrew/bin:/usr/local/bin"
-            env["PATH"] = extraPath + ":" + (env["PATH"] ?? "/usr/bin:/bin")
-            process.environment = env
+            process.environment = ToolLocator.toolEnvironment()
 
             let outPipe = Pipe()
             let errPipe = Pipe()
@@ -74,9 +71,7 @@ enum Shell {
                 process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
                 process.arguments = [launchPath] + arguments
             }
-            var env = ProcessInfo.processInfo.environment
-            env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + (env["PATH"] ?? "/usr/bin:/bin")
-            process.environment = env
+            process.environment = ToolLocator.toolEnvironment()
 
             let outPipe = Pipe(); let errPipe = Pipe()
             process.standardOutput = outPipe
@@ -113,9 +108,7 @@ enum Shell {
             process.arguments = [launchPath] + arguments
         }
 
-        var env = ProcessInfo.processInfo.environment
-        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + (env["PATH"] ?? "/usr/bin:/bin")
-        process.environment = env
+        process.environment = ToolLocator.toolEnvironment()
 
         do {
             try process.run()

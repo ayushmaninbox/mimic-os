@@ -21,7 +21,7 @@ final class Scrcpy {
         /// Simulate a physical HID keyboard so Mac-style text editing works:
         /// ⌘A/⌘C/⌘V/⌘X, ⇧+Enter for a newline, Enter to submit, ⌥/⇧+arrows for
         /// word/selection movement. Default `sdk` injection lacks these.
-        var useHIDKeyboard: Bool = true
+        var useHIDKeyboard: Bool = false
         /// Where the phone's audio should play while mirroring.
         var audio: AudioRoute = .mac
 
@@ -65,20 +65,73 @@ final class Scrcpy {
     static var isInstalled: Bool { ToolLocator.isAvailable("scrcpy") }
 
     private var process: Process?
+    var lastError: String = ""
 
     /// True while a mirror session is running.
     var isRunning: Bool { process?.isRunning ?? false }
 
     /// Starts a mirror session for the given device serial. `onExit` fires when
-    /// scrcpy terminates for any reason (including the user closing its window).
+    /// scrcpy terminates for any reason, passing the exit status and collected stderr.
     @discardableResult
-    func start(serial: String, options: Options = Options(), onExit: (@Sendable () -> Void)? = nil) -> Bool {
+    func start(serial: String, options: Options = Options(), onExit: (@Sendable (Int32, String) -> Void)? = nil) -> Bool {
         stop() // never run two sessions for the same controller
+        lastError = ""
         let args = ["-s", serial] + options.asArguments()
-        let launched = Shell.launch(ToolLocator.scrcpy, args)
-        launched?.terminationHandler = { _ in onExit?() }
-        process = launched
-        return launched != nil
+        
+        let process = Process()
+        let launchPath = ToolLocator.scrcpy
+        if launchPath.contains("/") {
+            process.executableURL = URL(fileURLWithPath: launchPath)
+            process.arguments = args
+        } else {
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            process.arguments = [launchPath] + args
+        }
+        process.environment = ToolLocator.toolEnvironment()
+        
+        let errPipe = Pipe()
+        process.standardError = errPipe
+        
+        final class SafeErrorLines: @unchecked Sendable {
+            private let queue = DispatchQueue(label: "com.ayushman.mimicos.scrcpy.errors")
+            private var lines: [String] = []
+            func append(_ line: String) {
+                queue.async {
+                    if self.lines.count > 30 { self.lines.removeFirst() }
+                    self.lines.append(line)
+                }
+            }
+            func getJoined() -> String {
+                queue.sync { self.lines.joined(separator: "\n") }
+            }
+        }
+        
+        let safeLines = SafeErrorLines()
+        let fileHandle = errPipe.fileHandleForReading
+        Task.detached {
+            do {
+                for try await line in fileHandle.bytes.lines {
+                    safeLines.append(line)
+                    print("[scrcpy-stderr] \(line)")
+                }
+            } catch {
+                print("[scrcpy-stderr] Error reading: \(error)")
+            }
+        }
+        
+        process.terminationHandler = { proc in
+            let errText = safeLines.getJoined()
+            onExit?(proc.terminationStatus, errText)
+        }
+        
+        do {
+            try process.run()
+            self.process = process
+            return true
+        } catch {
+            lastError = error.localizedDescription
+            return false
+        }
     }
 
     /// Starts a headless mirror session purely for background clipboard synchronization.
@@ -97,6 +150,7 @@ final class Scrcpy {
         if let process {
             if process.isRunning {
                 process.terminate()
+                process.waitUntilExit()
             }
             self.process = nil
         }

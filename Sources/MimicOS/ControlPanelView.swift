@@ -112,12 +112,13 @@ private struct SettingsTab: View {
                 SectionCard(title: "Mirror options", systemImage: "rectangle.on.rectangle") {
                     Toggle("Turn phone screen off while mirroring", isOn: $model.turnScreenOff)
                     Toggle("Keep device awake", isOn: $model.stayAwake)
+                    Toggle("Simulate physical keyboard (UHID)", isOn: $model.useHIDKeyboard)
                     Picker("Phone audio plays on", selection: $model.audioRoute) {
                         ForEach(Scrcpy.AudioRoute.allCases) { route in
                             Text(route.label).tag(route)
                         }
                     }
-                    Text("Applies next time you start mirroring. “Phone / its connected device” keeps audio on the phone — its own speaker, Bluetooth, or wired output.")
+                    Text("Applies next time you start mirroring. “Phone / its connected device” keeps audio on the phone — its own speaker, Bluetooth, or wired output. Note: UHID keyboard simulation requires USB connection and may fail/hang on wireless or hotspot connections.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Divider()
@@ -196,6 +197,10 @@ private struct FilesTab: View {
             VStack(spacing: 0) {
                 toolbar
                 Divider()
+                if !model.fileSearchText.isEmpty {
+                    scopeBar
+                    Divider()
+                }
                 if model.hasSelection { selectionBar; Divider() }
                 if model.fileViewMode == .list {
                     columnHeader
@@ -304,6 +309,47 @@ private struct FilesTab: View {
                 Task { await model.makeFolder(named: newFolderName); newFolderName = "" }
             }
         }
+        .onChange(of: model.fileSearchText) { _, newValue in
+            if newValue.isEmpty {
+                model.isDeepSearching = false
+                Task {
+                    await model.loadFiles()
+                }
+            }
+        }
+    }
+
+    private var scopeBar: some View {
+        HStack(spacing: 8) {
+            Text("Search:").font(.caption).foregroundStyle(.secondary)
+            Picker("", selection: Bindable(model).fileSearchScope) {
+                Text("Current Folder").tag(AppModel.FileSearchScope.current)
+                Text("Entire Phone").tag(AppModel.FileSearchScope.entireDevice)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(width: 220)
+            .onChange(of: model.fileSearchScope) { _, _ in
+                Task {
+                    await model.performSearch()
+                }
+            }
+            
+            Spacer()
+            
+            if model.isDeepSearching {
+                Text("Press Enter in search box to refresh deep search")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("Press Enter to search recursively")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 4)
+        .background(.quaternary.opacity(0.15))
     }
 
     private var toolbar: some View {
@@ -319,6 +365,36 @@ private struct FilesTab: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
 
             if model.isBrowsing { ProgressView().controlSize(.small) }
+
+            // Search Bar
+            HStack(spacing: 4) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundColor(.secondary)
+                    .font(.footnote)
+                TextField("Search…", text: Bindable(model).fileSearchText)
+                    .textFieldStyle(.plain)
+                    .frame(width: 140)
+                    .onSubmit {
+                        Task { await model.performSearch() }
+                    }
+                if !model.fileSearchText.isEmpty {
+                    Button {
+                        model.fileSearchText = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .background(Color(.controlBackgroundColor))
+            .cornerRadius(4)
+            .overlay(
+                RoundedRectangle(cornerRadius: 4)
+                    .stroke(Color.secondary.opacity(0.2), lineWidth: 0.5)
+            )
 
             // Select All / None Toggle
             Button {
@@ -581,11 +657,12 @@ private struct FileGridTile: View {
         }
         .onDrag {
             // If this row is part of a multi-selection, drag ALL selected files
-            // (bundled into one folder); otherwise drag just this file.
+            // (bundled into one folder); otherwise drag just this file/folder.
             let multi = model.selectedFiles.count > 1 && model.selectedFiles.contains(file.path)
             let provider = NSItemProvider()
             provider.suggestedName = multi ? "MimicOS Files" : file.name
-            provider.registerFileRepresentation(forTypeIdentifier: UTType.data.identifier,
+            let typeId = (multi || file.isDirectory) ? UTType.directory.identifier : UTType.data.identifier
+            provider.registerFileRepresentation(forTypeIdentifier: typeId,
                                                  fileOptions: [], visibility: .all) { completion in
                 Task {
                     let url = multi ? await model.stageSelectedForDragOut()
@@ -680,12 +757,17 @@ private struct FileRow: View {
             else { Task { await model.previewFile(file) } }
         }
         .onDrag {
+            // If this item is part of a multi-selection, drag ALL selected files
+            // (bundled into one folder); otherwise drag just this file/folder.
+            let multi = model.selectedFiles.count > 1 && model.selectedFiles.contains(file.path)
             let provider = NSItemProvider()
-            provider.suggestedName = file.name
-            provider.registerFileRepresentation(forTypeIdentifier: UTType.data.identifier,
+            provider.suggestedName = multi ? "MimicOS Files" : file.name
+            let typeId = (multi || file.isDirectory) ? UTType.directory.identifier : UTType.data.identifier
+            provider.registerFileRepresentation(forTypeIdentifier: typeId,
                                                  fileOptions: [], visibility: .all) { completion in
                 Task {
-                    let url = await model.stageForDragOut(file)
+                    let url = multi ? await model.stageSelectedForDragOut()
+                                    : await model.stageForDragOut(file)
                     completion(url, true, nil)
                 }
                 return nil
@@ -842,31 +924,55 @@ private struct BreadcrumbBar: View {
     @Environment(AppModel.self) private var model
     
     var body: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 4) {
-                let segments = parsePathSegments(model.browsePath)
-                ForEach(segments) { segment in
-                    if segment.path != segments.first?.path {
-                        Image(systemName: "chevron.right")
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
+        ScrollViewReader { proxy in
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 4) {
+                    let segments = parsePathSegments(model.browsePath)
+                    ForEach(segments) { segment in
+                        if segment.path != segments.first?.path {
+                            Image(systemName: "chevron.right")
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                        }
+                        
+                        Button {
+                            Task { await model.loadFiles(path: segment.path) }
+                        } label: {
+                            Text(segment.name)
+                                .font(.subheadline)
+                                .foregroundStyle(segment.path == model.browsePath ? Color.primary : Color.accentColor)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 3)
+                                .background(segment.path == model.browsePath ? AnyShapeStyle(.quaternary.opacity(0.3)) : AnyShapeStyle(.clear))
+                                .clipShape(RoundedRectangle(cornerRadius: 4))
+                                .fixedSize(horizontal: true, vertical: false)
+                        }
+                        .buttonStyle(.plain)
+                        .id(segment.path)
                     }
                     
-                    Button {
-                        Task { await model.loadFiles(path: segment.path) }
-                    } label: {
-                        Text(segment.name)
-                            .font(.subheadline)
-                            .foregroundStyle(segment.path == model.browsePath ? Color.primary : Color.accentColor)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 3)
-                            .background(segment.path == model.browsePath ? AnyShapeStyle(.quaternary.opacity(0.3)) : AnyShapeStyle(.clear))
-                            .clipShape(RoundedRectangle(cornerRadius: 4))
+                    // Extra spacer at the end to act as the scroll target,
+                    // guaranteeing that the last path item is fully visible.
+                    Color.clear
+                        .frame(width: 8, height: 1)
+                        .id("end")
+                }
+                .padding(.vertical, 2)
+            }
+            .onChange(of: model.browsePath) { _, _ in
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 50_000_000)
+                    withAnimation {
+                        proxy.scrollTo("end", anchor: .trailing)
                     }
-                    .buttonStyle(.plain)
                 }
             }
-            .padding(.vertical, 2)
+            .onAppear {
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 50_000_000)
+                    proxy.scrollTo("end", anchor: .trailing)
+                }
+            }
         }
     }
     

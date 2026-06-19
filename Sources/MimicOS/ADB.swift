@@ -329,6 +329,50 @@ enum ADB {
         await Shell.run(ToolLocator.adb, ["-s", serial, "shell", "mkdir", "-p", shellQuote(path)])
     }
 
+    /// Searches for files recursively under a path on the phone.
+    static func searchFiles(_ serial: String, underPath path: String, query: String) async -> [RemoteFile] {
+        let escapedQuery = "*\(query)*"
+        let args = ["-s", serial, "shell", "find", shellQuote(path), "-iname", shellQuote(escapedQuery), "-maxdepth", "5", "-exec", "ls", "-ld", "{}", "+"]
+        let result = await Shell.run(ToolLocator.adb, args)
+        
+        var files: [RemoteFile] = []
+        let lines = result.stdout.split(separator: "\n")
+        
+        // If find -exec ls -ld failed or returned nothing, let's try a simple find without ls as fallback
+        if lines.isEmpty {
+            let fallbackArgs = ["-s", serial, "shell", "find", shellQuote(path), "-iname", shellQuote(escapedQuery), "-maxdepth", "5"]
+            let fallbackResult = await Shell.run(ToolLocator.adb, fallbackArgs)
+            for rawLine in fallbackResult.stdout.split(separator: "\n") {
+                let fullPath = String(rawLine).trimmingCharacters(in: .whitespacesAndNewlines)
+                if fullPath.isEmpty { continue }
+                let name = (fullPath as NSString).lastPathComponent
+                files.append(RemoteFile(name: name, isDirectory: false, sizeBytes: nil, modified: nil, path: fullPath))
+            }
+            return files
+        }
+        
+        for raw in lines {
+            let line = String(raw)
+            if line.hasPrefix("total ") { continue }
+            let cols = line.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+            guard cols.count >= 8, let perms = cols.first else { continue }
+            let isDir = perms.hasPrefix("d")
+            let size = isDir ? nil : Int64(cols[4])
+            let modified = "\(cols[5]) \(cols[6])"
+            let nameStart = line.range(of: cols[7])
+            var fullPath = nameStart.map { String(line[$0.lowerBound...]) } ?? cols.last ?? ""
+            fullPath = fullPath.trimmingCharacters(in: .whitespaces)
+            if fullPath.hasSuffix("/") { fullPath.removeLast() }
+            if fullPath.isEmpty { continue }
+            
+            let name = (fullPath as NSString).lastPathComponent
+            if name == "." || name == ".." { continue }
+            files.append(RemoteFile(name: name, isDirectory: isDir, sizeBytes: size,
+                                    modified: modified, path: fullPath))
+        }
+        return files
+    }
+
     /// Minimal shell quoting for a remote path.
     private static func shellQuote(_ path: String) -> String {
         "'" + path.replacingOccurrences(of: "'", with: "'\\''") + "'"

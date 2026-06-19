@@ -51,6 +51,7 @@ final class AppModel {
 
     var turnScreenOff: Bool = false
     var stayAwake: Bool = true
+    var useHIDKeyboard: Bool = false
     /// Where the phone's audio plays while mirroring.
     var audioRoute: Scrcpy.AudioRoute = .mac
 
@@ -361,14 +362,20 @@ final class AppModel {
             var options = Scrcpy.Options()
             options.turnScreenOff = turnScreenOff
             options.stayAwake = stayAwake
+            options.useHIDKeyboard = useHIDKeyboard
             options.audio = audioRoute
             // Clear our observable state when scrcpy exits on its own (e.g. the
             // user closes the mirror window) so the button flips back to Start.
-            let ok = scrcpy.start(serial: serial, options: options) { [weak self] in
+            let ok = scrcpy.start(serial: serial, options: options) { [weak self] status, errText in
                 Task { @MainActor in
                     if self?.mirroringSerial == serial {
                         self?.mirroringSerial = nil
-                        self?.status = "Mirror stopped"
+                        if status != 0 && !errText.isEmpty {
+                            let cleanErr = errText.split(separator: "\n").last.map(String.init) ?? errText
+                            self?.status = "Mirror failed: \(cleanErr.trimmingCharacters(in: .whitespacesAndNewlines))"
+                        } else {
+                            self?.status = "Mirror stopped"
+                        }
                         self?.updateBackgroundClipboardSync()
                     }
                 }
@@ -681,11 +688,20 @@ final class AppModel {
         case grid
     }
 
+    enum FileSearchScope: String {
+        case current = "Current Folder"
+        case entireDevice = "Entire Phone"
+    }
+
     var fileViewMode: FileViewMode = .list
     var sortKey: FileSortKey? = nil
     var sortOrder: FileSortOrder = .ascending
     var sizeWidth: Double = 120.0
     var dateWidth: Double = 160.0
+
+    var fileSearchText: String = ""
+    var fileSearchScope: FileSearchScope = .current
+    var isDeepSearching: Bool = false
 
     /// Current directory shown in the in-app file browser.
     var browsePath: String = "/sdcard/"
@@ -809,7 +825,16 @@ final class AppModel {
 
     func loadFiles(path: String? = nil) async {
         guard let serial = selectedSerial else { return }
-        if let path { browsePath = path }
+        if let path { 
+            browsePath = path 
+            fileSearchText = ""
+            isDeepSearching = false
+        }
+        
+        if isDeepSearching {
+            await performSearch()
+            return
+        }
         
         activePreviewURL = nil
         activePreviewFilePath = nil
@@ -830,6 +855,25 @@ final class AppModel {
                 }
             }
         }
+    }
+
+    func performSearch() async {
+        guard let serial = selectedSerial else { return }
+        let query = fileSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return }
+        
+        activePreviewURL = nil
+        activePreviewFilePath = nil
+        lastClickedFilePath = nil
+
+        isBrowsing = true
+        isDeepSearching = true
+        defer { isBrowsing = false }
+        selectedFiles.removeAll()
+        folderSizes.removeAll()
+        
+        let searchRoot = (fileSearchScope == .current) ? browsePath : "/sdcard/"
+        browseFiles = await ADB.searchFiles(serial, underPath: searchRoot, query: query)
     }
 
     // MARK: - File multi-select & bulk actions
@@ -1083,8 +1127,16 @@ final class AppModel {
     }
 
     var sortedFiles: [ADB.RemoteFile] {
+        let baseFiles: [ADB.RemoteFile]
+        let query = fileSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !isDeepSearching && !query.isEmpty {
+            baseFiles = browseFiles.filter { $0.name.localizedCaseInsensitiveContains(query) }
+        } else {
+            baseFiles = browseFiles
+        }
+
         if sortKey == nil {
-            return browseFiles.sorted {
+            return baseFiles.sorted {
                 if $0.isDirectory != $1.isDirectory {
                     return $0.isDirectory && !$1.isDirectory
                 }
@@ -1092,7 +1144,7 @@ final class AppModel {
             }
         }
         
-        return browseFiles.sorted { f1, f2 in
+        return baseFiles.sorted { f1, f2 in
             if f1.isDirectory != f2.isDirectory {
                 return f1.isDirectory && !f2.isDirectory
             }

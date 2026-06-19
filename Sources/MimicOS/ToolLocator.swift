@@ -51,4 +51,26 @@ enum ToolLocator {
 
     static var adb: String { path(for: "adb") }
     static var scrcpy: String { path(for: "scrcpy") }
+
+    /// Path to a bundled `scrcpy-server`, if present next to the binaries.
+    static var bundledServerPath: String? {
+        for dir in searchDirectories {
+            let candidate = dir.appendingPathComponent("scrcpy-server")
+            if FileManager.default.fileExists(atPath: candidate.path) {
+                return candidate.path
+            }
+        }
+        return nil
+    }
+
+    /// Environment to launch the tools with: extends PATH and, when we ship a
+    /// bundled scrcpy-server, points scrcpy at it (and at the bundled adb) so
+    /// the app works on machines with no Homebrew install.
+    static func toolEnvironment() -> [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + (env["PATH"] ?? "/usr/bin:/bin")
+        if let server = bundledServerPath { env["SCRCPY_SERVER_PATH"] = server }
+        if isAvailable("adb") { env["ADB"] = adb }   // scrcpy uses $ADB if set
+        return env
+    }
 }
