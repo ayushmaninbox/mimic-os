@@ -281,11 +281,21 @@ private struct AutomationSection: View {
     var body: some View {
         SectionCard(title: "Quick Controls", systemImage: "hand.tap") {
             HStack {
-                Button("Home") { Task { await model.pressHome() } }
                 Button("Back") { Task { await model.pressBack() } }
+                Button("Home") { Task { await model.pressHome() } }
+                Button("Recents") { Task { await model.pressRecents() } }
                 Button("Power") { Task { await model.togglePower() } }
             }
-            Text("Power toggles the screen — handy for the screen-off workflow.")
+            HStack {
+                Button(model.flashlightOn ? "Flashlight Off" : "Flashlight") {
+                    Task { await model.toggleFlashlight() }
+                }
+                Button(model.isFinding ? "Stop Ringing" : "Find Device") {
+                    Task { await model.toggleFindDevice() }
+                }
+                Button("Rotate") { Task { await model.rotateScreen() } }
+            }
+            Text("Power toggles the screen. Find Device rings the phone loudly so you can locate it. The same controls float beside the phone screen while mirroring.")
                 .font(.caption).foregroundStyle(.secondary)
         }
     }

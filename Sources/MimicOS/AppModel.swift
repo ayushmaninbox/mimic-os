@@ -151,6 +151,22 @@ final class AppModel {
         // Bonjour browser not used anymore
     }
 
+    /// Tear down everything that outlives the UI: the scrcpy mirror window, the
+    /// headless clipboard session, the floating remote, and any in-flight
+    /// recording. Called from the app delegate on quit so no orphan windows or
+    /// child processes are left behind.
+    func shutdown() {
+        if isRecording, let proc = recordProcess, proc.isRunning {
+            proc.terminate()
+        }
+        pinner.stop()
+        floatingRemote.hide()
+        mirroringSerial = nil
+        mirrorWindowTitle = nil
+        scrcpy.stop()
+        headlessScrcpy.stop()
+    }
+
     // MARK: - Background device monitor (powers auto-reconnect)
 
     @ObservationIgnored private var monitorTask: Task<Void, Never>?
@@ -1558,6 +1574,46 @@ final class AppModel {
         guard let serial = selectedSerial else { return }
         await ADB.keyEvent(serial, keycode: 4)
         status = "BACK"
+    }
+
+    /// Opens the recent-apps / "all tabs" overview (KEYCODE_APP_SWITCH).
+    func pressRecents() async {
+        guard let serial = selectedSerial else { return }
+        await ADB.keyEvent(serial, keycode: 187)
+        status = "Recent apps"
+    }
+
+    /// In-app torch state so the button can reflect on/off.
+    private(set) var flashlightOn = false
+
+    /// Toggle the phone's flashlight/torch.
+    func toggleFlashlight() async {
+        guard let serial = selectedSerial, selectedDevice?.state.isUsable == true else {
+            status = "Select a connected device first"
+            return
+        }
+        flashlightOn = await ADB.toggleFlashlight(serial)
+        status = flashlightOn ? "Flashlight on" : "Flashlight off"
+    }
+
+    /// Whether the "find device" ringtone is currently playing.
+    private(set) var isFinding = false
+
+    /// Play a loud ringtone on the phone to find it; tap again to stop.
+    func toggleFindDevice() async {
+        guard let serial = selectedSerial, selectedDevice?.state.isUsable == true else {
+            status = "Select a connected device first"
+            return
+        }
+        if isFinding {
+            await ADB.stopFindRingtone(serial)
+            isFinding = false
+            status = "Stopped ringing"
+        } else {
+            isFinding = true
+            status = "Ringing the phone…"
+            await ADB.playFindRingtone(serial)
+        }
     }
 
     func togglePower() async {

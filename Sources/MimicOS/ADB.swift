@@ -549,5 +549,69 @@ enum ADB {
             ["-s", serial, "shell", "settings", "put", "system", "user_rotation", "\(next)"])
     }
 
+    // MARK: - Flashlight (torch)
+
+    /// In-memory torch state per device — Android has no app-free "read torch
+    /// state" command, so we remember what we last set.
+    private static let torchState = TorchState()
+    final class TorchState: @unchecked Sendable {
+        private let queue = DispatchQueue(label: "com.ayushman.mimicos.torch")
+        private var on: Set<String> = []
+        func isOn(_ serial: String) -> Bool { queue.sync { on.contains(serial) } }
+        func set(_ serial: String, _ value: Bool) {
+            queue.sync { if value { on.insert(serial) } else { on.remove(serial) } }
+        }
+    }
+
+    /// Toggles the camera flash/torch. There is no single standard adb torch
+    /// command, so we drive CameraManager via `cmd` where available and fall
+    /// back to a `service call` on older builds. Returns the new on/off state.
+    @discardableResult
+    static func toggleFlashlight(_ serial: String) async -> Bool {
+        let turnOn = !torchState.isOn(serial)
+        let value = turnOn ? "true" : "false"
+
+        // Android 13+ exposes a torch toggle via `cmd`. Try it first.
+        let cmdResult = await Shell.run(ToolLocator.adb,
+            ["-s", serial, "shell", "cmd", "flashlight", "set", value])
+        let cmdOK = cmdResult.succeeded
+            && !cmdResult.stderr.lowercased().contains("unknown")
+            && !cmdResult.stdout.lowercased().contains("unknown")
+
+        if !cmdOK {
+            // Fallback: many builds wire the quick-settings torch tile to a
+            // settings flag the system observes.
+            _ = await Shell.run(ToolLocator.adb,
+                ["-s", serial, "shell", "settings", "put", "secure", "flashlight_enabled", turnOn ? "1" : "0"])
+        }
+        torchState.set(serial, turnOn)
+        return turnOn
+    }
+
+    // MARK: - Find device (loud ringtone)
+
+    /// Plays the phone's ringtone at full ring volume so a misplaced phone can be
+    /// located — the app-free "find my device" trick. Raises the ring stream to
+    /// max, then launches the default ringtone through the media player.
+    static func playFindRingtone(_ serial: String) async {
+        // Max out the ring volume (stream 2 = STREAM_RING).
+        _ = await Shell.run(ToolLocator.adb,
+            ["-s", serial, "shell", "media", "volume", "--stream", "2", "--set", "25"])
+        // Also raise alarm volume (stream 4) as a fallback path.
+        _ = await Shell.run(ToolLocator.adb,
+            ["-s", serial, "shell", "media", "volume", "--stream", "4", "--set", "25"])
+        // Play the default ringtone via an intent (works without an installed app).
+        _ = await Shell.run(ToolLocator.adb, [
+            "-s", serial, "shell", "am", "start", "-a", "android.intent.action.VIEW",
+            "-d", "content://settings/system/ringtone", "-t", "audio/*"
+        ])
+    }
+
+    /// Stops any media playback started for "find device".
+    static func stopFindRingtone(_ serial: String) async {
+        // Send a media-stop keyevent (86 = KEYCODE_MEDIA_STOP).
+        _ = await Shell.run(ToolLocator.adb, ["-s", serial, "shell", "input", "keyevent", "86"])
+    }
+
 }
 

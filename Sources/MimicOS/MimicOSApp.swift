@@ -48,6 +48,12 @@ private struct MenuBarContent: View {
                 Button(model.isMirroring ? "Stop Mirroring" : "Start Mirroring") {
                     model.toggleMirror()
                 }
+                Button(model.isFinding ? "Stop Ringing" : "Find Device (Ring)") {
+                    Task { await model.toggleFindDevice() }
+                }
+                Button(model.flashlightOn ? "Flashlight Off" : "Flashlight On") {
+                    Task { await model.toggleFlashlight() }
+                }
                 Divider()
             } else {
                 Text("No device connected")
@@ -79,6 +85,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
+    }
+
+    /// On quit, stop scrcpy and tear down floating windows so nothing is left
+    /// running (the mirror window is a separate process that would otherwise
+    /// linger after the app exits).
+    func applicationWillTerminate(_ notification: Notification) {
+        MainActor.assumeIsolated { model?.shutdown() }
     }
 
     /// Don't quit when the last window closes — drop to the menu bar instead

@@ -54,8 +54,10 @@ final class FloatingRemoteController {
             self.panel = panel
         }
 
-        applySticky(sticky)
-        panel?.orderFrontRegardless()
+        // The remote always joins all spaces so it's present on whatever desktop
+        // the phone window is currently on — it then shows/hides itself based on
+        // whether the phone window is visible on the active space.
+        panel?.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         startFollowing()
     }
 
@@ -67,21 +69,9 @@ final class FloatingRemoteController {
         trackingTitle = nil
     }
 
-    /// Match the phone window's all-spaces behaviour so the remote rides along.
-    func setSticky(_ sticky: Bool) {
-        applySticky(sticky)
-    }
-
-    private func applySticky(_ sticky: Bool) {
-        guard let panel else { return }
-        if sticky {
-            panel.collectionBehavior.insert(.canJoinAllSpaces)
-            panel.collectionBehavior.insert(.stationary)
-        } else {
-            panel.collectionBehavior.remove(.canJoinAllSpaces)
-            panel.collectionBehavior.remove(.stationary)
-        }
-    }
+    /// Pin state is handled by the phone window itself; the remote always rides
+    /// all spaces, so there's nothing to toggle here. Kept for call-site symmetry.
+    func setSticky(_ sticky: Bool) {}
 
     /// Let the user nudge the remote; once dragged it keeps a manual offset
     /// relative to the auto-docked anchor (so it still follows the phone window).
@@ -111,7 +101,16 @@ final class FloatingRemoteController {
     }
 
     private func reposition() {
-        guard let panel, let phoneFrame = model?.scrcpyWindowFrameForRemote() else { return }
+        guard let panel else { return }
+
+        // The phone window is only AX-visible when it's on the current space. If
+        // we can't find it, it's on another desktop — hide the remote so it never
+        // strands itself on the wrong space; it reappears when the phone does.
+        guard let phoneFrame = model?.scrcpyWindowFrameForRemote() else {
+            if panel.isVisible { panel.orderOut(nil) }
+            return
+        }
+        if !panel.isVisible { panel.orderFrontRegardless() }
 
         // phoneFrame is in AX/top-left coordinates. Convert to AppKit (bottom-left
         // origin) using the primary screen height.
@@ -119,7 +118,9 @@ final class FloatingRemoteController {
         let screenHeight = screen.frame.height
         let phoneAppKitY = screenHeight - phoneFrame.origin.y - phoneFrame.height
 
-        let height = min(max(phoneFrame.height, 180), 360)
+        // Match the phone window's height (clamped to a sane range) so the full
+        // button column is reachable; the strip scrolls if the window is short.
+        let height = min(max(phoneFrame.height, 240), 620)
         // Auto-dock anchor: just off the phone window's right edge, vertically
         // centered. The strip then follows the window from this anchor.
         let dockedX = phoneFrame.origin.x + phoneFrame.width + 6
@@ -145,33 +146,62 @@ private struct RemoteStrip: View {
             // remote freely.
             DragHandle(onDrag: onDrag)
 
-            RemoteButton(systemName: "power", help: "Power") {
-                Task { await model.togglePower() }
-            }
-            RemoteButton(systemName: "speaker.wave.2.fill", help: "Volume up") {
-                Task { await model.volumeUp() }
-            }
-            RemoteButton(systemName: "speaker.wave.1.fill", help: "Volume down") {
-                Task { await model.volumeDown() }
-            }
-            RemoteButton(systemName: "rotate.right", help: "Rotate") {
-                Task { await model.rotateScreen() }
-            }
+            ScrollView(.vertical, showsIndicators: false) {
+                VStack(spacing: 6) {
+                    // Navigation
+                    RemoteButton(systemName: "chevron.left", help: "Back") {
+                        Task { await model.pressBack() }
+                    }
+                    RemoteButton(systemName: "house.fill", help: "Home") {
+                        Task { await model.pressHome() }
+                    }
+                    RemoteButton(systemName: "square.on.square", help: "Recent apps") {
+                        Task { await model.pressRecents() }
+                    }
 
-            Divider().frame(width: 28)
+                    Divider().frame(width: 28)
 
-            RemoteButton(systemName: model.settings.pinPhoneWindow ? "pin.fill" : "pin",
-                         help: "Pin to all desktops",
-                         tint: model.settings.pinPhoneWindow ? .accentColor : nil) {
-                model.togglePinPhoneWindow()
-            }
-            RemoteButton(systemName: "camera.fill", help: "Screenshot") {
-                Task { await model.captureScreenshot() }
-            }
-            RemoteButton(systemName: model.isRecording ? "stop.circle.fill" : "record.circle",
-                         help: model.isRecording ? "Stop recording" : "Record",
-                         tint: model.isRecording ? .red : nil) {
-                Task { await model.toggleScreenRecording() }
+                    // Hardware
+                    RemoteButton(systemName: "power", help: "Power") {
+                        Task { await model.togglePower() }
+                    }
+                    RemoteButton(systemName: "speaker.wave.2.fill", help: "Volume up") {
+                        Task { await model.volumeUp() }
+                    }
+                    RemoteButton(systemName: "speaker.wave.1.fill", help: "Volume down") {
+                        Task { await model.volumeDown() }
+                    }
+                    RemoteButton(systemName: "rotate.right", help: "Rotate") {
+                        Task { await model.rotateScreen() }
+                    }
+                    RemoteButton(systemName: model.flashlightOn ? "flashlight.on.fill" : "flashlight.off.fill",
+                                 help: "Flashlight",
+                                 tint: model.flashlightOn ? .yellow : nil) {
+                        Task { await model.toggleFlashlight() }
+                    }
+                    RemoteButton(systemName: model.isFinding ? "bell.fill" : "bell.badge",
+                                 help: model.isFinding ? "Stop ringing" : "Find device (ring)",
+                                 tint: model.isFinding ? .orange : nil) {
+                        Task { await model.toggleFindDevice() }
+                    }
+
+                    Divider().frame(width: 28)
+
+                    // Window & capture
+                    RemoteButton(systemName: model.settings.pinPhoneWindow ? "pin.fill" : "pin",
+                                 help: "Pin to all desktops",
+                                 tint: model.settings.pinPhoneWindow ? .accentColor : nil) {
+                        model.togglePinPhoneWindow()
+                    }
+                    RemoteButton(systemName: "camera.fill", help: "Screenshot") {
+                        Task { await model.captureScreenshot() }
+                    }
+                    RemoteButton(systemName: model.isRecording ? "stop.circle.fill" : "record.circle",
+                                 help: model.isRecording ? "Stop recording" : "Record",
+                                 tint: model.isRecording ? .red : nil) {
+                        Task { await model.toggleScreenRecording() }
+                    }
+                }
             }
         }
         .padding(.vertical, 8)

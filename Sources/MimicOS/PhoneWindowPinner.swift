@@ -31,6 +31,10 @@ final class PhoneWindowPinner {
         return AXIsProcessTrustedWithOptions(options)
     }
 
+    /// Smallest size (points) the phone window is allowed to shrink to. Enforced
+    /// every tick so the mirror never becomes a tiny sliver.
+    var minimumSize = CGSize(width: 280, height: 480)
+
     /// Begin watching the scrcpy window identified by `title`. When `sticky` is
     /// true the window is tagged onto all spaces; either way we keep tracking its
     /// frame so it can be saved.
@@ -66,25 +70,41 @@ final class PhoneWindowPinner {
     private func startWatcher() {
         watcher?.cancel()
         watcher = Task { [weak self] in
-            var taggedWindowID: CGWindowID?
             while !Task.isCancelled {
-                self?.tick(taggedWindowID: &taggedWindowID)
-                try? await Task.sleep(for: .milliseconds(700))
+                self?.tick()
+                try? await Task.sleep(for: .milliseconds(500))
             }
         }
     }
 
-    /// One watcher pass: track the window's frame, and (re)apply the sticky tag
-    /// whenever a new window id shows up (scrcpy can recreate its window).
-    private func tick(taggedWindowID: inout CGWindowID?) {
+    /// One watcher pass: track the window's frame, enforce the minimum size, and
+    /// keep the sticky/all-spaces tag applied (re-applied every pass because the
+    /// CGS membership can be reset when the window is moved between spaces).
+    private func tick() {
         guard let element = scrcpyWindowElement() else { return }
-        lastKnownFrame = currentFrame(of: element) ?? lastKnownFrame
+        if var frame = currentFrame(of: element) {
+            // Enforce the minimum size (grow back up if the user shrank too far).
+            if frame.size.width < minimumSize.width || frame.size.height < minimumSize.height {
+                let clamped = CGSize(width: max(frame.size.width, minimumSize.width),
+                                     height: max(frame.size.height, minimumSize.height))
+                setSize(clamped, for: element)
+                frame.size = clamped
+            }
+            lastKnownFrame = frame
+        }
 
-        guard isPinned else { return }
-        let wid = windowID(of: element)
-        if let wid, wid != taggedWindowID {
-            setAllSpaces(true, for: element)
-            taggedWindowID = wid
+        guard isPinned, let wid = windowID(of: element) else { return }
+        // Re-assert all-spaces membership; cheap and self-healing after a move.
+        setAllSpaces(true, for: element)
+        lastTaggedWindowID = wid
+    }
+
+    private var lastTaggedWindowID: CGWindowID?
+
+    private func setSize(_ size: CGSize, for element: AXUIElement) {
+        var s = size
+        if let axValue = AXValueCreate(.cgSize, &s) {
+            AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, axValue)
         }
     }
 
