@@ -11,6 +11,8 @@ final class AppSettings {
     private static let captureFolderPathKey = "MimicOS.captureFolderPath"
     private static let autoReconnectKey = "MimicOS.autoReconnect"
     private static let runInBackgroundKey = "MimicOS.runInBackground"
+    private static let alwaysOnTopKey = "MimicOS.alwaysOnTop"
+    private static let phoneDestFolderKey = "MimicOS.phoneDestFolder"
 
     private var defaults: UserDefaults { .standard }
 
@@ -49,6 +51,16 @@ final class AppSettings {
         didSet { defaults.set(showSidebar, forKey: "MimicOS.showSidebar") }
     }
 
+    /// Keep the phone window always on top of other apps.
+    var alwaysOnTop: Bool {
+        didSet { defaults.set(alwaysOnTop, forKey: Self.alwaysOnTopKey) }
+    }
+
+    /// Destination folder on the phone for dropped files.
+    var phoneDestFolder: String {
+        didSet { defaults.set(phoneDestFolder, forKey: Self.phoneDestFolderKey) }
+    }
+
     private static let phoneWindowFrameKey = "MimicOS.phoneWindowFrame"
 
     /// Persist the scrcpy mirror window's last frame (top-left origin, points)
@@ -77,6 +89,8 @@ final class AppSettings {
         runInBackground = store.object(forKey: Self.runInBackgroundKey) as? Bool ?? true
         launchAtLogin = store.object(forKey: "MimicOS.launchAtLogin") as? Bool ?? true
         showSidebar = store.object(forKey: "MimicOS.showSidebar") as? Bool ?? false
+        alwaysOnTop = store.object(forKey: Self.alwaysOnTopKey) as? Bool ?? false
+        phoneDestFolder = store.string(forKey: Self.phoneDestFolderKey) ?? "/sdcard/Download/MimicOS"
 
         // Resolve the saved capture folder, falling back to ~/Pictures/MimicOS.
         let fallback = FileManager.default

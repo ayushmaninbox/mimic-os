@@ -30,10 +30,13 @@ final class Scrcpy {
         /// Restore the window's last position/size (top-left origin, points).
         /// Maps to `--window-x/--window-y/--window-width/--window-height`.
         var windowFrame: CGRect? = nil
+        /// Keep the scrcpy window always on top. Maps to `--always-on-top`.
+        var alwaysOnTop: Bool = true
 
         func asArguments() -> [String] {
             var args: [String] = []
             if turnScreenOff { args.append("--turn-screen-off") }
+            if alwaysOnTop { args.append("--always-on-top") }
             if stayAwake { args.append("--stay-awake") }
             if let maxSize { args.append(contentsOf: ["--max-size", "\(maxSize)"]) }
             if let bitRateMbps { args.append(contentsOf: ["--video-bit-rate", "\(bitRateMbps)M"]) }

@@ -54,6 +54,8 @@ A complete, two-way file browser built into the app. Browse your phone's storage
 - **Sortable columns** — Sort by name, size, or date with resizable column headers
 - **Multi-select** — Click, ⌘-click, ⇧-click for range selection. Bulk download or delete
 - **Drag & Drop** — Drag files OUT of the app to Finder, or INTO the app from Finder
+- **Quick Drop Menu Bar Portal** — Drag files from Finder onto the menu bar icon. A glassmorphic drop portal drops down, automatically opens/focuses the main window, and copies the files to the phone with live progress
+- **Customizable Transfer Path** — Customize the destination folder on the phone for menu bar drops (defaults to `Downloads/MimicOS`), fully configurable via the Settings tab
 - **Quick Look preview** — Press Space to preview any file (images, videos, documents) using macOS Quick Look
 - **Copy/Paste** — ⌘C copies phone files to Mac clipboard, ⌘V pastes Mac files to phone
 - **APK installer** — Drop an `.apk` file and it gets installed on the phone automatically
@@ -84,7 +86,7 @@ MimicOS lives in the **menu bar** and keeps running quietly in the background wh
 If your phone's wireless connection drops (Wi-Fi or hotspot) and later comes back, MimicOS **reconnects it automatically**. The first time a device drops, it asks whether to enable this — you stay in control.
 
 ### 🎛 Floating Control Sidebar
-While mirroring, a slim **floating sidebar docks to the side of the phone window** and follows it as you move it — auto-flipping between the left and right edge depending on available room, and sharing the window's z-order so it comes forward with the mirror. It carries the hardware controls (back, home, recents, power, volume ±, rotate) plus screenshot and screen-record buttons. **Off by default**, toggle it from Settings or the menu bar.
+While mirroring, a slim **floating sidebar docks to the side of the phone window** and follows it as you move it — auto-flipping between the left and right edge depending on available room, and sharing the window's z-order so it comes forward with the mirror. It carries the hardware controls (back, home, recents, power, volume ±, rotate, screenshot, screen-record) plus **Files** and **Settings** navigation buttons to instantly focus the main window and open that corresponding section for the active device. **Off by default**, toggle it from Settings or the menu bar.
 
 > The sidebar follows scrcpy's window via the macOS **Accessibility API**, so the first time you use it MimicOS asks for Accessibility access (**System Settings → Privacy & Security → Accessibility**).
 

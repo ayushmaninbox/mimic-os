@@ -27,6 +27,7 @@ final class AppModel {
         }
     }
     var selectedTab: Tab = .control
+    var openMainWindowAction: (() -> Void)?
 
     var devices: [Device] = []
     var rawDevices: [Device] = []
@@ -444,6 +445,16 @@ final class AppModel {
         await refreshRingerAndDNDStatus()
     }
 
+    func openSection(_ tab: Tab) {
+        selectedTab = tab
+        if let serial = mirroringSerial {
+            Task {
+                await select(serial)
+            }
+        }
+        openMainWindowAction?()
+    }
+
     // MARK: - Phone screenshot -> Mac clipboard
 
     private var screenshotWatchTask: Task<Void, Never>?
@@ -521,6 +532,7 @@ final class AppModel {
         options.useHIDKeyboard = useHIDKeyboard
         options.audio = audioRoute
         options.windowTitle = title
+        options.alwaysOnTop = settings.alwaysOnTop
         // Reopen where the user last left the phone window (current frame on a
         // live restart, otherwise the persisted one).
         options.windowFrame = (restarting ? windowTracker.currentFrame : nil) ?? settings.phoneWindowFrame
@@ -609,6 +621,9 @@ final class AppModel {
 
         windowTracker.onAppear = { [weak self] frame in
             guard let self else { return }
+            if let pid = self.scrcpy.processPID, let app = NSRunningApplication(processIdentifier: pid) {
+                app.activate(options: [])
+            }
             if self.settings.showSidebar {
                 self.floatingRemote.show(model: self)
                 self.floatingRemote.update(for: frame, phoneWindowID: self.windowTracker.windowID)
@@ -1188,6 +1203,28 @@ final class AppModel {
             }
         }
         await loadFiles()
+    }
+
+    func transferFilesFromDragDrop(_ filePaths: [String]) async {
+        // If no device is selected, try to pick the first connected/usable one
+        if selectedSerial == nil {
+            if let firstUsable = devices.first(where: { $0.state.isUsable }) {
+                await select(firstUsable.serial)
+            }
+        }
+        
+        guard let serial = selectedSerial else { return }
+        
+        // Ensure the destination folder exists on the phone
+        let dest = settings.phoneDestFolder
+        _ = await ADB.makeDirectory(serial, path: dest)
+        
+        // Open/select the files tab and navigate there
+        selectedTab = .files
+        browsePath = dest
+        
+        // Upload the files
+        await uploadToCurrentFolder(localPaths: filePaths)
     }
 
     /// Delete a file/folder on the phone.

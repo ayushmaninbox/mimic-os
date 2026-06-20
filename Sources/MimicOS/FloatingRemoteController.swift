@@ -253,6 +253,15 @@ private struct RemoteStrip: View {
 
                     Divider().frame(width: 28)
 
+                    RemoteButton(systemName: "folder.fill", help: "Files") {
+                        model.openSection(.files)
+                    }
+                    RemoteButton(systemName: "gearshape.fill", help: "Settings") {
+                        model.openSection(.settings)
+                    }
+
+                    Divider().frame(width: 28)
+
                     RemoteButton(
                         systemName: model.isSilent ? "bell.slash.fill" : "bell",
                         help: model.isSilent ? "Turn silent off" : "Silent mode",

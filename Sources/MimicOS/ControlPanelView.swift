@@ -185,6 +185,17 @@ private struct SettingsTab: View {
                 Divider()
                 CaptureFolderSection()
                 Divider()
+                SectionCard(title: "Phone transfer destination", systemImage: "folder.badge.gearshape") {
+                    HStack(spacing: 10) {
+                        Image(systemName: "iphone.gen3")
+                            .foregroundStyle(.secondary)
+                        TextField("Phone path", text: $settings.phoneDestFolder)
+                            .textFieldStyle(.roundedBorder)
+                    }
+                    Text("Files dropped onto the menu bar icon are copied to this folder on your phone.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Divider()
                 SectionCard(title: "Connection", systemImage: "antenna.radiowaves.left.and.right") {
                     Toggle("Auto-reconnect wireless devices when they return",
                            isOn: $settings.autoReconnect)
@@ -199,7 +210,12 @@ private struct SettingsTab: View {
                             get: { model.settings.showSidebar },
                             set: { model.setSidebarVisible($0) }))
                         .font(.body)
-                    Text("The sidebar is a floating control strip that sticks to the side of the phone screen (auto-flips left/right based on room) and follows it as you move it. It needs Accessibility access (you'll be prompted). The window's last size & position are remembered for next time.")
+                    Toggle("Keep the phone window always on top",
+                           isOn: Binding(
+                            get: { model.settings.alwaysOnTop },
+                            set: { model.settings.alwaysOnTop = $0; model.applyMirrorSettingsLive() }))
+                        .font(.body)
+                    Text("The sidebar is a floating control strip that sticks to the side of the phone screen (auto-flips left/right based on room) and follows it as you move it. It needs Accessibility access (you'll be prompted). The window's last size & position are remembered for next time. Enabling 'Always on Top' keeps the mirrored window above other apps.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Divider()
