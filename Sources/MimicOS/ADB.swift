@@ -479,17 +479,43 @@ enum ADB {
         }
     }
 
+    /// The phone's display size as "WxH", used to pick a safe recording size.
+    private static func displaySize(_ serial: String) async -> (w: Int, h: Int)? {
+        let result = await Shell.run(ToolLocator.adb, ["-s", serial, "shell", "wm", "size"])
+        // Prefer "Override size:" if present, else "Physical size:".
+        let lines = result.stdout.split(separator: "\n").map(String.init)
+        let line = lines.last(where: { $0.contains("size:") }) ?? ""
+        guard let dims = line.split(separator: ":").last?.trimmingCharacters(in: .whitespaces),
+              case let parts = dims.split(separator: "x"), parts.count == 2,
+              let w = Int(parts[0]), let h = Int(parts[1]) else { return nil }
+        return (w, h)
+    }
+
     /// Starts `screenrecord` on the phone, writing to a temp path on the phone.
-    /// Returns the live adb `Process` so the caller can keep a handle on the
-    /// session. To STOP cleanly, call `stopScreenRecord` (which signals the
-    /// on-device process) — NOT by killing this adb process, which would leave
-    /// the MP4 unfinalized and unplayable.
+    /// Returns the live adb `Process`. To STOP cleanly, call `stopScreenRecord`
+    /// (which SIGINTs the on-device process) — killing this adb process would
+    /// leave the MP4 unfinalized.
     ///
-    /// `screenrecord` caps at ~3 minutes per Android's limit; we set --time-limit
-    /// to the max so it ends cleanly even if the user forgets to stop it.
+    /// Some devices (e.g. Android 16 on certain hardware) reject the default
+    /// encoder config with "Encoder failed (err=-38)". We cap the size to a safe
+    /// height (scaling to keep aspect) and set a moderate bitrate, which the
+    /// hardware encoder reliably accepts. `--time-limit 180` is Android's max.
     static func startScreenRecord(_ serial: String, remotePath: String,
-                                  onStart: @escaping @Sendable (Process) -> Void) -> Bool {
-        let args = ["-s", serial, "shell", "screenrecord", "--time-limit", "180", remotePath]
+                                  onStart: @escaping @Sendable (Process) -> Void) async -> Bool {
+        var args = ["-s", serial, "shell", "screenrecord", "--time-limit", "180", "--bit-rate", "8000000"]
+        if let size = await displaySize(serial) {
+            // Scale the long edge down to ~1280 so the encoder accepts it, keeping
+            // the device's aspect ratio (avoids the err=-38 rejection).
+            let longEdge = max(size.w, size.h)
+            if longEdge > 1280 {
+                let scale = 1280.0 / Double(longEdge)
+                // Round to even numbers — H.264 requires even dimensions.
+                let w = (Int(Double(size.w) * scale) / 2) * 2
+                let h = (Int(Double(size.h) * scale) / 2) * 2
+                args.append(contentsOf: ["--size", "\(w)x\(h)"])
+            }
+        }
+        args.append(remotePath)
         let proc = Shell.launch(ToolLocator.adb, args)
         if let proc { onStart(proc) }
         return proc != nil
@@ -547,70 +573,6 @@ enum ADB {
         let next = (current + 1) % 4
         _ = await Shell.run(ToolLocator.adb,
             ["-s", serial, "shell", "settings", "put", "system", "user_rotation", "\(next)"])
-    }
-
-    // MARK: - Flashlight (torch)
-
-    /// In-memory torch state per device — Android has no app-free "read torch
-    /// state" command, so we remember what we last set.
-    private static let torchState = TorchState()
-    final class TorchState: @unchecked Sendable {
-        private let queue = DispatchQueue(label: "com.ayushman.mimicos.torch")
-        private var on: Set<String> = []
-        func isOn(_ serial: String) -> Bool { queue.sync { on.contains(serial) } }
-        func set(_ serial: String, _ value: Bool) {
-            queue.sync { if value { on.insert(serial) } else { on.remove(serial) } }
-        }
-    }
-
-    /// Toggles the camera flash/torch. There is no single standard adb torch
-    /// command, so we drive CameraManager via `cmd` where available and fall
-    /// back to a `service call` on older builds. Returns the new on/off state.
-    @discardableResult
-    static func toggleFlashlight(_ serial: String) async -> Bool {
-        let turnOn = !torchState.isOn(serial)
-        let value = turnOn ? "true" : "false"
-
-        // Android 13+ exposes a torch toggle via `cmd`. Try it first.
-        let cmdResult = await Shell.run(ToolLocator.adb,
-            ["-s", serial, "shell", "cmd", "flashlight", "set", value])
-        let cmdOK = cmdResult.succeeded
-            && !cmdResult.stderr.lowercased().contains("unknown")
-            && !cmdResult.stdout.lowercased().contains("unknown")
-
-        if !cmdOK {
-            // Fallback: many builds wire the quick-settings torch tile to a
-            // settings flag the system observes.
-            _ = await Shell.run(ToolLocator.adb,
-                ["-s", serial, "shell", "settings", "put", "secure", "flashlight_enabled", turnOn ? "1" : "0"])
-        }
-        torchState.set(serial, turnOn)
-        return turnOn
-    }
-
-    // MARK: - Find device (loud ringtone)
-
-    /// Plays the phone's ringtone at full ring volume so a misplaced phone can be
-    /// located — the app-free "find my device" trick. Raises the ring stream to
-    /// max, then launches the default ringtone through the media player.
-    static func playFindRingtone(_ serial: String) async {
-        // Max out the ring volume (stream 2 = STREAM_RING).
-        _ = await Shell.run(ToolLocator.adb,
-            ["-s", serial, "shell", "media", "volume", "--stream", "2", "--set", "25"])
-        // Also raise alarm volume (stream 4) as a fallback path.
-        _ = await Shell.run(ToolLocator.adb,
-            ["-s", serial, "shell", "media", "volume", "--stream", "4", "--set", "25"])
-        // Play the default ringtone via an intent (works without an installed app).
-        _ = await Shell.run(ToolLocator.adb, [
-            "-s", serial, "shell", "am", "start", "-a", "android.intent.action.VIEW",
-            "-d", "content://settings/system/ringtone", "-t", "audio/*"
-        ])
-    }
-
-    /// Stops any media playback started for "find device".
-    static func stopFindRingtone(_ serial: String) async {
-        // Send a media-stop keyevent (86 = KEYCODE_MEDIA_STOP).
-        _ = await Shell.run(ToolLocator.adb, ["-s", serial, "shell", "input", "keyevent", "86"])
     }
 
 }

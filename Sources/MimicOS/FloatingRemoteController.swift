@@ -2,33 +2,48 @@ import Foundation
 import AppKit
 import SwiftUI
 
-/// A small always-on-top "remote control" window that attaches itself to the
-/// edge of scrcpy's mirror window and follows it around — including across
-/// Mission Control desktops when pinning is on. Hosts a SwiftUI control strip
-/// (power / volume / rotate / pin / screenshot / record).
-///
-/// scrcpy's window belongs to another process, so we can't dock a real toolbar
-/// onto it; instead this panel polls the scrcpy window's frame (via the same AX
-/// path the pinner uses) and repositions itself flush against its right edge.
+/// A small always-on-top "remote control" strip that stays docked to the side of
+/// scrcpy's mirror window and follows it perfectly smoothly — driven by live
+/// `AXObserver` callbacks (no polling), so there's no lag. It auto-picks the side
+/// (right, or left when there's no room on the right) and can't be dragged.
 @MainActor
 final class FloatingRemoteController {
     private var panel: NSPanel?
-    private var follower: Task<Void, Never>?
     private weak var model: AppModel?
-    private var trackingTitle: String?
-    /// User offset (in screen points) from the auto-docked anchor, if they've
-    /// dragged the remote. .zero / nil means docked flush to the phone window.
-    private var manualOffset: CGSize?
-
-    /// Width of the control strip in points.
     private let stripWidth: CGFloat = 56
+    private let gap: CGFloat = 6
+    private var enabled = true
 
-    /// Show the remote and start following the scrcpy window titled `title`.
-    func show(model: AppModel, trackingTitle title: String, sticky: Bool) {
+    /// Position the strip flush to the phone window for the given frame, which is
+    /// supplied live by the window tracker. `frame` is top-left-origin screen
+    /// coordinates (AX convention).
+    func update(for frame: CGRect) {
+        guard enabled, let panel else { return }
+        if !panel.isVisible { panel.orderFrontRegardless() }
+
+        // Convert the AX (top-left) frame to AppKit (bottom-left) coordinates,
+        // choosing the screen the phone window is actually on.
+        let screen = screenContaining(axFrame: frame) ?? NSScreen.main ?? NSScreen.screens.first
+        guard let screen else { return }
+        let screenTop = (NSScreen.screens.first?.frame.height ?? screen.frame.maxY)
+        let phoneAppKitY = screenTop - frame.origin.y - frame.height
+
+        let height = min(max(frame.height, 240), 700)
+        let y = phoneAppKitY + (frame.height - height) / 2
+
+        // Auto side: prefer the right edge; flip to the left if the strip would
+        // run off the screen on the right.
+        let rightX = frame.origin.x + frame.width + gap
+        let fitsRight = rightX + stripWidth <= screen.frame.maxX
+        let x = fitsRight ? rightX : (frame.origin.x - gap - stripWidth)
+
+        panel.setFrame(NSRect(x: x, y: y, width: stripWidth, height: height), display: true)
+    }
+
+    /// Show the remote and start hosting the controls for `model`.
+    func show(model: AppModel) {
         self.model = model
-        self.trackingTitle = title
-        self.manualOffset = nil
-
+        guard enabled else { return }
         if panel == nil {
             let panel = NSPanel(
                 contentRect: NSRect(x: 0, y: 0, width: stripWidth, height: 320),
@@ -38,99 +53,44 @@ final class FloatingRemoteController {
             panel.level = .floating
             panel.titleVisibility = .hidden
             panel.titlebarAppearsTransparent = true
-            panel.isMovableByWindowBackground = false   // we handle dragging in-view
+            panel.isMovable = false
+            panel.isMovableByWindowBackground = false
             panel.backgroundColor = .clear
             panel.isOpaque = false
             panel.hasShadow = true
             panel.hidesOnDeactivate = false
-            // The remote should not steal key focus from scrcpy.
             panel.becomesKeyOnlyIfNeeded = true
-
-            let content = RemoteStrip(
-                model: model,
-                onDrag: { [weak self] delta in self?.dragBy(delta) }
-            )
-            panel.contentView = NSHostingView(rootView: content)
+            // Always on every space so it accompanies the phone window across desktops.
+            panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            panel.contentView = NSHostingView(rootView: RemoteStrip(model: model))
             self.panel = panel
         }
-
-        // The remote always joins all spaces so it's present on whatever desktop
-        // the phone window is currently on — it then shows/hides itself based on
-        // whether the phone window is visible on the active space.
-        panel?.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        startFollowing()
+        panel?.orderFrontRegardless()
     }
 
-    /// Hide and stop following.
+    /// Hide the strip (e.g. when the phone window moves to another space).
+    func hideTemporarily() {
+        if panel?.isVisible == true { panel?.orderOut(nil) }
+    }
+
+    /// Fully tear down.
     func hide() {
-        follower?.cancel()
-        follower = nil
         panel?.orderOut(nil)
-        trackingTitle = nil
     }
 
-    /// Pin state is handled by the phone window itself; the remote always rides
-    /// all spaces, so there's nothing to toggle here. Kept for call-site symmetry.
-    func setSticky(_ sticky: Bool) {}
-
-    /// Let the user nudge the remote; once dragged it keeps a manual offset
-    /// relative to the auto-docked anchor (so it still follows the phone window).
-    private func dragBy(_ delta: CGSize) {
-        guard let panel else { return }
-        var frame = panel.frame
-        frame.origin.x += delta.width
-        frame.origin.y -= delta.height   // AppKit y grows upward; drag delta is screen-down
-        panel.setFrameOrigin(frame.origin)
-        // Record the offset from the current docked anchor.
-        var off = manualOffset ?? .zero
-        off.width += delta.width
-        off.height -= delta.height
-        manualOffset = off
+    /// Turn the remote on/off (the user's visibility setting).
+    func setEnabled(_ on: Bool) {
+        enabled = on
+        if !on { panel?.orderOut(nil) }
+        else if let model { show(model: model) }
     }
 
-    /// Polls scrcpy's window frame and keeps the strip docked to its right edge
-    /// (unless the user dragged it elsewhere).
-    private func startFollowing() {
-        follower?.cancel()
-        follower = Task { [weak self] in
-            while !Task.isCancelled {
-                self?.reposition()
-                try? await Task.sleep(for: .milliseconds(250))
-            }
-        }
-    }
-
-    private func reposition() {
-        guard let panel else { return }
-
-        // The phone window is only AX-visible when it's on the current space. If
-        // we can't find it, it's on another desktop — hide the remote so it never
-        // strands itself on the wrong space; it reappears when the phone does.
-        guard let phoneFrame = model?.scrcpyWindowFrameForRemote() else {
-            if panel.isVisible { panel.orderOut(nil) }
-            return
-        }
-        if !panel.isVisible { panel.orderFrontRegardless() }
-
-        // phoneFrame is in AX/top-left coordinates. Convert to AppKit (bottom-left
-        // origin) using the primary screen height.
-        guard let screen = NSScreen.screens.first else { return }
-        let screenHeight = screen.frame.height
-        let phoneAppKitY = screenHeight - phoneFrame.origin.y - phoneFrame.height
-
-        // Match the phone window's height (clamped to a sane range) so the full
-        // button column is reachable; the strip scrolls if the window is short.
-        let height = min(max(phoneFrame.height, 240), 620)
-        // Auto-dock anchor: just off the phone window's right edge, vertically
-        // centered. The strip then follows the window from this anchor.
-        let dockedX = phoneFrame.origin.x + phoneFrame.width + 6
-        let dockedY = phoneAppKitY + (phoneFrame.height - height) / 2
-
-        let offset = manualOffset ?? .zero
-        panel.setFrame(NSRect(x: dockedX + offset.width,
-                              y: dockedY + offset.height,
-                              width: stripWidth, height: height),
-                       display: true)
+    private func screenContaining(axFrame frame: CGRect) -> NSScreen? {
+        // Use the window's center, converted to AppKit coordinates, to find its
+        // screen so multi-monitor docking lands on the right display.
+        let screenTop = NSScreen.screens.first?.frame.height ?? 0
+        let centerAppKit = CGPoint(x: frame.midX, y: screenTop - frame.midY)
+        return NSScreen.screens.first { $0.frame.contains(centerAppKit) }
     }
 }
 
@@ -138,18 +98,12 @@ final class FloatingRemoteController {
 
 private struct RemoteStrip: View {
     let model: AppModel
-    let onDrag: (CGSize) -> Void
 
     var body: some View {
         VStack(spacing: 6) {
-            // Drag handle — shows a move cursor and lets the user reposition the
-            // remote freely.
-            DragHandle(onDrag: onDrag)
-
             ScrollView(.vertical, showsIndicators: false) {
                 VStack(spacing: 6) {
-                    // Navigation
-                    RemoteButton(systemName: "chevron.left", help: "Back") {
+                    RemoteButton(systemName: "arrowtriangle.left.fill", help: "Back") {
                         Task { await model.pressBack() }
                     }
                     RemoteButton(systemName: "house.fill", help: "Home") {
@@ -161,7 +115,6 @@ private struct RemoteStrip: View {
 
                     Divider().frame(width: 28)
 
-                    // Hardware
                     RemoteButton(systemName: "power", help: "Power") {
                         Task { await model.togglePower() }
                     }
@@ -174,20 +127,9 @@ private struct RemoteStrip: View {
                     RemoteButton(systemName: "rotate.right", help: "Rotate") {
                         Task { await model.rotateScreen() }
                     }
-                    RemoteButton(systemName: model.flashlightOn ? "flashlight.on.fill" : "flashlight.off.fill",
-                                 help: "Flashlight",
-                                 tint: model.flashlightOn ? .yellow : nil) {
-                        Task { await model.toggleFlashlight() }
-                    }
-                    RemoteButton(systemName: model.isFinding ? "bell.fill" : "bell.badge",
-                                 help: model.isFinding ? "Stop ringing" : "Find device (ring)",
-                                 tint: model.isFinding ? .orange : nil) {
-                        Task { await model.toggleFindDevice() }
-                    }
 
                     Divider().frame(width: 28)
 
-                    // Window & capture
                     RemoteButton(systemName: model.settings.pinPhoneWindow ? "pin.fill" : "pin",
                                  help: "Pin to all desktops",
                                  tint: model.settings.pinPhoneWindow ? .accentColor : nil) {
@@ -202,43 +144,13 @@ private struct RemoteStrip: View {
                         Task { await model.toggleScreenRecording() }
                     }
                 }
+                .padding(.vertical, 8)
             }
         }
-        .padding(.vertical, 8)
         .padding(.horizontal, 8)
         .frame(width: 56)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
         .overlay(RoundedRectangle(cornerRadius: 16).stroke(.white.opacity(0.18), lineWidth: 1))
-    }
-}
-
-private struct DragHandle: View {
-    let onDrag: (CGSize) -> Void
-    @State private var last: CGSize = .zero
-    @State private var hovering = false
-
-    var body: some View {
-        Image(systemName: "line.3.horizontal")
-            .font(.system(size: 12, weight: .bold))
-            .foregroundStyle(.secondary)
-            .frame(width: 40, height: 20)
-            .background(RoundedRectangle(cornerRadius: 6)
-                .fill(hovering ? AnyShapeStyle(.quaternary.opacity(0.5)) : AnyShapeStyle(.clear)))
-            .onHover { inside in
-                hovering = inside
-                if inside { NSCursor.openHand.push() } else { NSCursor.pop() }
-            }
-            .gesture(
-                DragGesture(minimumDistance: 0)
-                    .onChanged { value in
-                        let delta = CGSize(width: value.translation.width - last.width,
-                                           height: value.translation.height - last.height)
-                        last = value.translation
-                        onDrag(delta)
-                    }
-                    .onEnded { _ in last = .zero }
-            )
-            .help("Drag to move the remote")
     }
 }
 

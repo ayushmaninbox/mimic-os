@@ -51,6 +51,12 @@ final class AppSettings {
         didSet { defaults.set(launchAtLogin, forKey: "MimicOS.launchAtLogin") }
     }
 
+    /// Show the floating control sidebar docked to the phone screen while
+    /// mirroring.
+    var showSidebar: Bool {
+        didSet { defaults.set(showSidebar, forKey: "MimicOS.showSidebar") }
+    }
+
     private static let phoneWindowFrameKey = "MimicOS.phoneWindowFrame"
 
     /// Persist the scrcpy mirror window's last frame (top-left origin, points)
@@ -79,6 +85,7 @@ final class AppSettings {
         pinPhoneWindow = store.bool(forKey: Self.pinPhoneWindowKey)
         runInBackground = store.object(forKey: Self.runInBackgroundKey) as? Bool ?? true
         launchAtLogin = store.object(forKey: "MimicOS.launchAtLogin") as? Bool ?? true
+        showSidebar = store.object(forKey: "MimicOS.showSidebar") as? Bool ?? true
 
         // Resolve the saved capture folder, falling back to ~/Pictures/MimicOS.
         let fallback = FileManager.default

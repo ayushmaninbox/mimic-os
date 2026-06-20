@@ -77,9 +77,13 @@ final class AppModel {
     /// Global preferences (capture folder, auto-reconnect, pin, background).
     let settings = AppSettings()
 
+    /// Shared, event-driven tracker for scrcpy's window (drives both the pinner
+    /// and the floating remote off live AXObserver callbacks — no polling).
+    @ObservationIgnored private let windowTracker = ScrcpyWindowTracker()
+
     /// Controls pinning of scrcpy's mirror window (sticky / all spaces) and
-    /// tracks its frame for persistence.
-    private let pinner = PhoneWindowPinner()
+    /// enforces its minimum size.
+    @ObservationIgnored private lazy var pinner = PhoneWindowPinner(tracker: windowTracker)
 
     /// The attached floating remote-control window shown beside the phone screen.
     @ObservationIgnored let floatingRemote = FloatingRemoteController()
@@ -160,6 +164,7 @@ final class AppModel {
             proc.terminate()
         }
         pinner.stop()
+        windowTracker.stop()
         floatingRemote.hide()
         mirroringSerial = nil
         mirrorWindowTitle = nil
@@ -496,64 +501,92 @@ final class AppModel {
         if isMirroring {
             stopMirror()
         } else {
-            // Stop background clipboard sync before starting full mirror
-            headlessScrcpy.stop()
-            headlessSerial = nil
-
-            let title = "MimicOS — \(selectedDevice?.displayName ?? serial)"
-            mirrorWindowTitle = title
-
-            var options = Scrcpy.Options()
-            options.turnScreenOff = turnScreenOff
-            options.stayAwake = stayAwake
-            options.useHIDKeyboard = useHIDKeyboard
-            options.audio = audioRoute
-            options.alwaysOnTop = settings.pinPhoneWindow
-            options.windowTitle = title
-            // Reopen where the user last left the phone window.
-            options.windowFrame = settings.phoneWindowFrame
-            // Clear our observable state when scrcpy exits on its own (e.g. the
-            // user closes the mirror window) so the button flips back to Start.
-            let ok = scrcpy.start(serial: serial, options: options) { [weak self] status, errText in
-                Task { @MainActor in
-                    guard let self, self.mirroringSerial == serial else { return }
-                    self.persistPhoneWindowFrame()
-                    self.mirroringSerial = nil
-                    self.pinner.stop()
-                    self.floatingRemote.hide()
-                    self.mirrorWindowTitle = nil
-                    if status != 0 && !errText.isEmpty {
-                        let cleanErr = errText.split(separator: "\n").last.map(String.init) ?? errText
-                        self.status = "Mirror failed: \(cleanErr.trimmingCharacters(in: .whitespacesAndNewlines))"
-                    } else {
-                        self.status = "Mirror stopped"
-                    }
-                    self.updateBackgroundClipboardSync()
-                }
-            }
-            mirroringSerial = ok ? serial : nil
-            status = ok
-                ? (turnScreenOff ? "Mirroring (phone screen off)" : "Mirroring")
-                : "Failed to start scrcpy"
-
-            // Start tracking the window once it appears: capture its frame for
-            // restore, apply the sticky (all-spaces) tag if pinning is on, and
-            // float the attached remote alongside it.
-            if ok {
-                Task { [weak self] in
-                    try? await Task.sleep(for: .seconds(1))
-                    self?.beginWindowTracking(title: title)
-                }
-            }
+            startMirror(serial: serial, restarting: false)
         }
     }
 
-    /// Stop mirroring and tear down the pinner / floating remote, saving the
-    /// window's last frame first.
+    /// (Re)start the scrcpy mirror for `serial`. When `restarting` is true we
+    /// keep the current window frame (so a live settings change reopens in the
+    /// same spot) and don't touch the headless clipboard session.
+    private func startMirror(serial: String, restarting: Bool) {
+        if !restarting {
+            headlessScrcpy.stop()
+            headlessSerial = nil
+        }
+
+        let title = "MimicOS — \(selectedDevice?.displayName ?? serial)"
+        mirrorWindowTitle = title
+
+        var options = Scrcpy.Options()
+        options.turnScreenOff = turnScreenOff
+        options.stayAwake = stayAwake
+        options.useHIDKeyboard = useHIDKeyboard
+        options.audio = audioRoute
+        options.alwaysOnTop = settings.pinPhoneWindow
+        options.windowTitle = title
+        // Reopen where the user last left the phone window (current frame on a
+        // live restart, otherwise the persisted one).
+        options.windowFrame = (restarting ? windowTracker.currentFrame : nil) ?? settings.phoneWindowFrame
+
+        // Each start gets a unique token. An exit handler only tears the session
+        // down if it's still the current one — so an intentional restart (which
+        // bumps the token before the old process's async handler runs) won't kill
+        // the fresh session. Race-free, unlike a plain "is restarting" flag.
+        mirrorGeneration &+= 1
+        let token = mirrorGeneration
+
+        let ok = scrcpy.start(serial: serial, options: options) { [weak self] status, errText in
+            Task { @MainActor in
+                guard let self, self.mirrorGeneration == token,
+                      self.mirroringSerial == serial else { return }
+                self.persistPhoneWindowFrame()
+                self.mirroringSerial = nil
+                self.pinner.stop()
+                self.windowTracker.stop()
+                self.floatingRemote.hide()
+                self.mirrorWindowTitle = nil
+                if status != 0 && !errText.isEmpty {
+                    let cleanErr = errText.split(separator: "\n").last.map(String.init) ?? errText
+                    self.status = "Mirror failed: \(cleanErr.trimmingCharacters(in: .whitespacesAndNewlines))"
+                } else {
+                    self.status = "Mirror stopped"
+                }
+                self.updateBackgroundClipboardSync()
+            }
+        }
+        mirroringSerial = ok ? serial : nil
+        status = ok
+            ? (turnScreenOff ? "Mirroring (phone screen off)" : "Mirroring")
+            : "Failed to start scrcpy"
+
+        if ok { beginWindowTracking(title: title) }
+    }
+
+    /// Bumped on every scrcpy (re)start; old exit handlers compare against it.
+    @ObservationIgnored private var mirrorGeneration = 0
+
+    /// Apply mirror-affecting settings (screen-off, awake, UHID, audio) to the
+    /// live session by restarting scrcpy in place. No-op when not mirroring.
+    func applyMirrorSettingsLive() {
+        guard isMirroring, let serial = mirroringSerial else { return }
+        // Capture the current frame so the new window reopens in the same place.
+        if let frame = windowTracker.currentFrame { settings.phoneWindowFrame = frame }
+        windowTracker.stop()
+        pinner.stop()
+        // startMirror bumps the generation token, so the old process's exit
+        // handler is ignored when it fires.
+        scrcpy.stop()
+        startMirror(serial: serial, restarting: true)
+        status = "Updated mirror settings"
+    }
+
+    /// Stop mirroring and tear down tracking / pinner / floating remote, saving
+    /// the window's last frame first.
     private func stopMirror() {
         persistPhoneWindowFrame()
         mirroringSerial = nil
         pinner.stop()
+        windowTracker.stop()
         floatingRemote.hide()
         mirrorWindowTitle = nil
         scrcpy.stop()
@@ -561,28 +594,39 @@ final class AppModel {
         updateBackgroundClipboardSync()
     }
 
-    /// Begin AX tracking of the scrcpy window: capture frame on every tick,
-    /// apply the sticky tag per the pin setting, and show the floating remote.
+    /// Hook the shared window tracker so move/resize events drive the pinner and
+    /// the floating remote with zero polling lag.
     private func beginWindowTracking(title: String) {
-        guard isMirroring else { return }
-        if settings.pinPhoneWindow {
+        if settings.pinPhoneWindow || settings.showSidebar {
             if !PhoneWindowPinner.ensureAccessibilityPermission(prompt: true) {
-                status = "Grant MimicOS Accessibility access (System Settings ▸ Privacy) to pin the phone window across desktops."
+                status = "Grant MimicOS Accessibility access (System Settings ▸ Privacy) so the sidebar can follow and pin the phone window."
             }
         }
-        pinner.startTracking(windowTitle: title, sticky: settings.pinPhoneWindow)
-        floatingRemote.show(model: self, trackingTitle: title, sticky: settings.pinPhoneWindow)
-    }
 
-    /// The scrcpy window's current AX frame (top-left origin), for the floating
-    /// remote to dock against. nil if the window can't be found.
-    func scrcpyWindowFrameForRemote() -> CGRect? {
-        pinner.currentScrcpyFrame()
+        windowTracker.onAppear = { [weak self] frame in
+            guard let self else { return }
+            self.pinner.handleWindowAppeared(frame)
+            if self.settings.showSidebar {
+                self.floatingRemote.show(model: self)
+                self.floatingRemote.update(for: frame)
+            }
+        }
+        windowTracker.onFrameChange = { [weak self] frame in
+            guard let self else { return }
+            self.pinner.handleFrameChange(frame)
+            if self.settings.showSidebar { self.floatingRemote.update(for: frame) }
+        }
+        windowTracker.onDisappear = { [weak self] in
+            self?.floatingRemote.hideTemporarily()
+        }
+
+        pinner.startTracking(sticky: settings.pinPhoneWindow)
+        windowTracker.start(windowTitle: title)
     }
 
     /// Save the scrcpy window's current frame so the next session restores it.
     private func persistPhoneWindowFrame() {
-        if let frame = pinner.currentScrcpyFrame() ?? pinner.lastKnownFrame {
+        if let frame = windowTracker.currentFrame ?? pinner.lastKnownFrame {
             settings.phoneWindowFrame = frame
         }
     }
@@ -599,11 +643,20 @@ final class AppModel {
             }
         }
         pinner.setSticky(sticky)
-        floatingRemote.setSticky(sticky)
         if isMirroring {
             status = sticky ? "Phone window pinned to all desktops" : "Phone window unpinned"
         } else {
             status = sticky ? "Phone window will show on all desktops when you mirror" : "Phone window unpinned"
+        }
+    }
+
+    /// Toggle the floating sidebar's visibility (live, persisted).
+    func setSidebarVisible(_ visible: Bool) {
+        settings.showSidebar = visible
+        floatingRemote.setEnabled(visible)
+        if visible, isMirroring, let frame = windowTracker.currentFrame {
+            floatingRemote.show(model: self)
+            floatingRemote.update(for: frame)
         }
     }
 
@@ -1583,39 +1636,6 @@ final class AppModel {
         status = "Recent apps"
     }
 
-    /// In-app torch state so the button can reflect on/off.
-    private(set) var flashlightOn = false
-
-    /// Toggle the phone's flashlight/torch.
-    func toggleFlashlight() async {
-        guard let serial = selectedSerial, selectedDevice?.state.isUsable == true else {
-            status = "Select a connected device first"
-            return
-        }
-        flashlightOn = await ADB.toggleFlashlight(serial)
-        status = flashlightOn ? "Flashlight on" : "Flashlight off"
-    }
-
-    /// Whether the "find device" ringtone is currently playing.
-    private(set) var isFinding = false
-
-    /// Play a loud ringtone on the phone to find it; tap again to stop.
-    func toggleFindDevice() async {
-        guard let serial = selectedSerial, selectedDevice?.state.isUsable == true else {
-            status = "Select a connected device first"
-            return
-        }
-        if isFinding {
-            await ADB.stopFindRingtone(serial)
-            isFinding = false
-            status = "Stopped ringing"
-        } else {
-            isFinding = true
-            status = "Ringing the phone…"
-            await ADB.playFindRingtone(serial)
-        }
-    }
-
     func togglePower() async {
         guard let serial = selectedSerial else { return }
         await ADB.keyEvent(serial, keycode: 26)
@@ -1696,7 +1716,7 @@ final class AppModel {
         recordRemotePath = remotePath
         recordSerial = serial
 
-        let started = ADB.startScreenRecord(serial, remotePath: remotePath) { [weak self] proc in
+        let started = await ADB.startScreenRecord(serial, remotePath: remotePath) { [weak self] proc in
             Task { @MainActor in self?.recordProcess = proc }
         }
         if started {

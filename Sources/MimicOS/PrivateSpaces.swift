@@ -34,20 +34,61 @@ enum PrivateSpaces {
     }
 
     /// Add or remove a window from **every** space so it shows on all desktops.
-    static func setWindowOnAllSpaces(_ windowID: CGWindowID, enabled: Bool) {
+    /// Returns true if the call path was available and ran.
+    @discardableResult
+    static func setWindowOnAllSpaces(_ windowID: CGWindowID, enabled: Bool) -> Bool {
         guard let mainConnection,
-              let copySpaces = copyManagedDisplaySpaces else { return }
+              let copySpaces = copyManagedDisplaySpaces,
+              windowID != 0 else { return false }
         let cid = mainConnection()
         let spaceIDs = allSpaceIDs(cid: cid, copySpaces: copySpaces)
-        guard !spaceIDs.isEmpty else { return }
+        guard !spaceIDs.isEmpty else { return false }
 
         let windows = [NSNumber(value: windowID)] as CFArray
         let spaces = spaceIDs.map { NSNumber(value: $0) } as CFArray
         if enabled {
-            addWindowsToSpaces?(cid, windows, spaces)
+            guard let addWindowsToSpaces else { return false }
+            addWindowsToSpaces(cid, windows, spaces)
         } else {
-            removeWindowsFromSpaces?(cid, windows, spaces)
+            guard let removeWindowsFromSpaces else { return false }
+            removeWindowsFromSpaces(cid, windows, spaces)
         }
+        return true
+    }
+
+    /// Find scrcpy's mirror window via the public CGWindowList (no Accessibility
+    /// permission required), matched by owner name and window title. Returns its
+    /// CGWindowID and on-screen bounds. This is the reliable path for pinning,
+    /// which only needs the window number — not AX.
+    static func findScrcpyWindow(titleContains title: String) -> (id: CGWindowID, bounds: CGRect)? {
+        let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+        guard let list = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
+            return nil
+        }
+        // Prefer an exact title/owner match; fall back to any window owned by scrcpy.
+        var fallback: (CGWindowID, CGRect)?
+        for info in list {
+            let owner = (info[kCGWindowOwnerName as String] as? String ?? "").lowercased()
+            guard owner.contains("scrcpy") else { continue }
+            guard let num = info[kCGWindowNumber as String] as? CGWindowID else { continue }
+            let bounds = boundsRect(info[kCGWindowBounds as String]) ?? .zero
+            let name = info[kCGWindowName as String] as? String ?? ""
+            if name == title || name.contains(title) {
+                return (num, bounds)
+            }
+            if fallback == nil, bounds.width > 100 {
+                fallback = (num, bounds)
+            }
+        }
+        if let fb = fallback { return (fb.0, fb.1) }
+        return nil
+    }
+
+    private static func boundsRect(_ value: Any?) -> CGRect? {
+        guard let dict = value as? [String: CGFloat],
+              let x = dict["X"], let y = dict["Y"],
+              let w = dict["Width"], let h = dict["Height"] else { return nil }
+        return CGRect(x: x, y: y, width: w, height: h)
     }
 
     /// Collect every space ID across all displays from the CGS managed-spaces

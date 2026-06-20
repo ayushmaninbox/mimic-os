@@ -48,12 +48,6 @@ private struct MenuBarContent: View {
                 Button(model.isMirroring ? "Stop Mirroring" : "Start Mirroring") {
                     model.toggleMirror()
                 }
-                Button(model.isFinding ? "Stop Ringing" : "Find Device (Ring)") {
-                    Task { await model.toggleFindDevice() }
-                }
-                Button(model.flashlightOn ? "Flashlight Off" : "Flashlight On") {
-                    Task { await model.toggleFlashlight() }
-                }
                 Divider()
             } else {
                 Text("No device connected")

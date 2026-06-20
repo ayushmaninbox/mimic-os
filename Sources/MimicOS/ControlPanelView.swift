@@ -149,15 +149,23 @@ private struct SettingsTab: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 SectionCard(title: "Mirror options", systemImage: "rectangle.on.rectangle") {
-                    Toggle("Turn phone screen off while mirroring", isOn: $model.turnScreenOff)
-                    Toggle("Keep device awake", isOn: $model.stayAwake)
-                    Toggle("Simulate physical keyboard (UHID)", isOn: $model.useHIDKeyboard)
-                    Picker("Phone audio plays on", selection: $model.audioRoute) {
+                    Toggle("Turn phone screen off while mirroring", isOn: Binding(
+                        get: { model.turnScreenOff },
+                        set: { model.turnScreenOff = $0; model.applyMirrorSettingsLive() }))
+                    Toggle("Keep device awake", isOn: Binding(
+                        get: { model.stayAwake },
+                        set: { model.stayAwake = $0; model.applyMirrorSettingsLive() }))
+                    Toggle("Simulate physical keyboard (UHID)", isOn: Binding(
+                        get: { model.useHIDKeyboard },
+                        set: { model.useHIDKeyboard = $0; model.applyMirrorSettingsLive() }))
+                    Picker("Phone audio plays on", selection: Binding(
+                        get: { model.audioRoute },
+                        set: { model.audioRoute = $0; model.applyMirrorSettingsLive() })) {
                         ForEach(Scrcpy.AudioRoute.allCases) { route in
                             Text(route.label).tag(route)
                         }
                     }
-                    Text("Applies next time you start mirroring. “Phone / its connected device” keeps audio on the phone — its own speaker, Bluetooth, or wired output. Note: UHID keyboard simulation requires USB connection and may fail/hang on wireless or hotspot connections.")
+                    Text("Changes apply immediately — if you're mirroring, the session restarts in place (same window position). “Phone / its connected device” keeps audio on the phone’s own speaker, Bluetooth, or wired output. Note: UHID keyboard simulation requires USB and may fail on wireless/hotspot connections.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Divider()
@@ -191,7 +199,12 @@ private struct SettingsTab: View {
                             get: { model.settings.pinPhoneWindow },
                             set: { _ in model.togglePinPhoneWindow() }))
                         .font(.body)
-                    Text("Keeps scrcpy's phone window visible on every Mission Control desktop as you switch spaces — it stays freely movable and resizable, and its last size & position are remembered for next time. Requires Accessibility access (you'll be prompted). Same as the pin button on the floating remote.")
+                    Toggle("Show the control sidebar docked to the phone screen",
+                           isOn: Binding(
+                            get: { model.settings.showSidebar },
+                            set: { model.setSidebarVisible($0) }))
+                        .font(.body)
+                    Text("The pin keeps the phone window visible on every Mission Control desktop as you switch spaces — it stays movable and resizable, and its last size & position are remembered. The sidebar is a floating control strip that sticks to the side of the phone screen (auto-flips left/right based on room) and follows it. Both need Accessibility access (you'll be prompted).")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Divider()
@@ -280,24 +293,52 @@ private struct AutomationSection: View {
 
     var body: some View {
         SectionCard(title: "Quick Controls", systemImage: "hand.tap") {
-            HStack {
-                Button("Back") { Task { await model.pressBack() } }
-                Button("Home") { Task { await model.pressHome() } }
-                Button("Recents") { Task { await model.pressRecents() } }
-                Button("Power") { Task { await model.togglePower() } }
-            }
-            HStack {
-                Button(model.flashlightOn ? "Flashlight Off" : "Flashlight") {
-                    Task { await model.toggleFlashlight() }
+            HStack(spacing: 10) {
+                QuickControlButton(systemName: "arrowtriangle.left.fill", help: "Back") {
+                    Task { await model.pressBack() }
                 }
-                Button(model.isFinding ? "Stop Ringing" : "Find Device") {
-                    Task { await model.toggleFindDevice() }
+                QuickControlButton(systemName: "house.fill", help: "Home") {
+                    Task { await model.pressHome() }
                 }
-                Button("Rotate") { Task { await model.rotateScreen() } }
+                QuickControlButton(systemName: "square.on.square", help: "Recent apps") {
+                    Task { await model.pressRecents() }
+                }
+                QuickControlButton(systemName: "speaker.wave.2.fill", help: "Volume up") {
+                    Task { await model.volumeUp() }
+                }
+                QuickControlButton(systemName: "speaker.wave.1.fill", help: "Volume down") {
+                    Task { await model.volumeDown() }
+                }
+                QuickControlButton(systemName: "rotate.right", help: "Rotate") {
+                    Task { await model.rotateScreen() }
+                }
+                QuickControlButton(systemName: "power", help: "Power (toggle screen)") {
+                    Task { await model.togglePower() }
+                }
             }
-            Text("Power toggles the screen. Find Device rings the phone loudly so you can locate it. The same controls float beside the phone screen while mirroring.")
+            Text("Hover a button for its name. Power toggles the screen. The same controls float beside the phone screen while mirroring.")
                 .font(.caption).foregroundStyle(.secondary)
         }
+    }
+}
+
+private struct QuickControlButton: View {
+    let systemName: String
+    let help: String
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.system(size: 16, weight: .medium))
+                .frame(width: 40, height: 34)
+                .background(RoundedRectangle(cornerRadius: 8)
+                    .fill(hovering ? AnyShapeStyle(.quaternary.opacity(0.6)) : AnyShapeStyle(.quaternary.opacity(0.25))))
+        }
+        .buttonStyle(.plain)
+        .help(help)
+        .onHover { hovering = $0 }
     }
 }
 
