@@ -76,7 +76,7 @@ final class AppSettings {
         autoReconnectAsked = store.bool(forKey: "MimicOS.autoReconnectAsked")
         runInBackground = store.object(forKey: Self.runInBackgroundKey) as? Bool ?? true
         launchAtLogin = store.object(forKey: "MimicOS.launchAtLogin") as? Bool ?? true
-        showSidebar = store.object(forKey: "MimicOS.showSidebar") as? Bool ?? true
+        showSidebar = store.object(forKey: "MimicOS.showSidebar") as? Bool ?? false
 
         // Resolve the saved capture folder, falling back to ~/Pictures/MimicOS.
         let fallback = FileManager.default

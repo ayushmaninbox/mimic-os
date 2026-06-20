@@ -2,6 +2,20 @@ import Foundation
 import AppKit
 import SwiftUI
 
+func writeRemoteDebugLog(_ message: String) {
+    let logURL = URL(fileURLWithPath: "/Users/ayushmaninbox/Documents/GitHub/iDroid/scratch/tracker_debug.log")
+    let line = "[\(Date())] [Remote] \(message)\n"
+    if let data = line.data(using: .utf8) {
+        if let fileHandle = try? FileHandle(forWritingTo: logURL) {
+            fileHandle.seekToEndOfFile()
+            fileHandle.write(data)
+            fileHandle.closeFile()
+        } else {
+            try? data.write(to: logURL)
+        }
+    }
+}
+
 /// A small always-on-top "remote control" strip that stays docked to the side of
 /// scrcpy's mirror window and follows it perfectly smoothly — driven by live
 /// `AXObserver` callbacks (no polling), so there's no lag. It auto-picks the side
@@ -21,17 +35,25 @@ final class FloatingRemoteController {
     /// same z-layer as the phone window (just above it), instead of floating over
     /// every app.
     func update(for frame: CGRect, phoneWindowID: CGWindowID?) {
+        writeRemoteDebugLog("update() called with frame=\(frame), phoneWindowID=\(phoneWindowID ?? 0), enabled=\(enabled), panel=\(panel != nil ? "present" : "nil")")
         guard enabled, let panel else { return }
 
-        if let wid = phoneWindowID, !isWindowOnActiveSpace(wid) {
-            panel.orderOut(nil)
-            return
+        if !panel.isVisible {
+            let active = phoneWindowID.map { isWindowOnActiveSpace($0) } ?? false
+            writeRemoteDebugLog("update(): panel is not visible, isWindowOnActiveSpace=\(active)")
+            if phoneWindowID != nil, !active {
+                writeRemoteDebugLog("update(): window not on active space, skipping position update & show")
+                return
+            }
         }
 
         // Convert the AX (top-left) frame to AppKit (bottom-left) coordinates,
         // choosing the screen the phone window is actually on.
         let screen = screenContaining(axFrame: frame) ?? NSScreen.main ?? NSScreen.screens.first
-        guard let screen else { return }
+        guard let screen else { 
+            writeRemoteDebugLog("update(): no screen found containing frame")
+            return 
+        }
         let screenTop = (NSScreen.screens.first?.frame.height ?? screen.frame.maxY)
         let phoneAppKitY = screenTop - frame.origin.y - frame.height
 
@@ -44,22 +66,27 @@ final class FloatingRemoteController {
         let fitsRight = rightX + stripWidth <= screen.frame.maxX
         let x = fitsRight ? rightX : (frame.origin.x - gap - stripWidth)
 
+        writeRemoteDebugLog("update(): setting panel frame to x=\(x), y=\(y), width=\(stripWidth), height=\(height)")
         panel.setFrame(NSRect(x: x, y: y, width: stripWidth, height: height), display: false)
 
         // Keep the strip directly above the phone window in the stacking order, so
         // it rises and sinks WITH the phone window instead of floating over other
         // apps. If we don't know the window number yet, just make it visible.
         if let wid = phoneWindowID {
+            writeRemoteDebugLog("update(): ordering panel above relativeTo window \(wid)")
             panel.order(.above, relativeTo: Int(wid))
         } else if !panel.isVisible {
+            writeRemoteDebugLog("update(): windowID is nil, ordering panel Front")
             panel.orderFront(nil)
         }
+        writeRemoteDebugLog("update(): panel isVisible = \(panel.isVisible)")
     }
 
     /// Re-order the strip just above the phone window — called when scrcpy is
     /// brought to the front (clicked / opened from Mission Control) so the
     /// sidebar comes forward with it instead of staying buried.
     func raiseWithPhoneWindow(_ phoneWindowID: CGWindowID?) {
+        writeRemoteDebugLog("raiseWithPhoneWindow() called with phoneWindowID=\(phoneWindowID ?? 0), enabled=\(enabled), panel=\(panel != nil ? "present" : "nil")")
         guard enabled, let panel else { return }
         if let wid = phoneWindowID {
             panel.order(.above, relativeTo: Int(wid))
@@ -70,9 +97,11 @@ final class FloatingRemoteController {
 
     /// Show the remote and start hosting the controls for `model`.
     func show(model: AppModel) {
+        writeRemoteDebugLog("show() called, enabled=\(enabled), panel=\(panel != nil ? "present" : "nil")")
         self.model = model
         guard enabled else { return }
         if panel == nil {
+            writeRemoteDebugLog("show(): creating new panel")
             let panel = NSPanel(
                 contentRect: NSRect(x: 0, y: 0, width: stripWidth, height: 320),
                 styleMask: [.nonactivatingPanel, .fullSizeContentView, .borderless],
@@ -107,16 +136,20 @@ final class FloatingRemoteController {
                 }
         }
 
+        writeRemoteDebugLog("show(): ordering panel Front")
         panel?.orderFront(nil)
+        writeRemoteDebugLog("show(): panel isVisible = \(panel?.isVisible ?? false)")
     }
 
     /// Hide the strip (e.g. when the phone window moves to another space).
     func hideTemporarily() {
+        writeRemoteDebugLog("hideTemporarily() called, panel isVisible = \(panel?.isVisible ?? false)")
         if panel?.isVisible == true { panel?.orderOut(nil) }
     }
 
     /// Fully tear down.
     func hide() {
+        writeRemoteDebugLog("hide() called")
         panel?.orderOut(nil)
         if let obs = spaceObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(obs)
@@ -126,6 +159,7 @@ final class FloatingRemoteController {
 
     /// Turn the remote on/off (the user's visibility setting).
     func setEnabled(_ on: Bool) {
+        writeRemoteDebugLog("setEnabled() called with \(on)")
         enabled = on
         if !on { panel?.orderOut(nil) }
         else if let model { show(model: model) }
@@ -140,16 +174,21 @@ final class FloatingRemoteController {
     }
 
     private func handleSpaceChange() {
+        writeRemoteDebugLog("handleSpaceChange() called")
         guard enabled, let panel, let model else { return }
         if model.isMirroring, let wid = model.windowTracker.windowID {
-            if isWindowOnActiveSpace(wid) {
+            let active = isWindowOnActiveSpace(wid)
+            writeRemoteDebugLog("handleSpaceChange(): wid=\(wid), isWindowOnActiveSpace=\(active)")
+            if active {
                 if let frame = model.windowTracker.currentFrame {
                     update(for: frame, phoneWindowID: wid)
                 }
             } else {
+                writeRemoteDebugLog("handleSpaceChange(): hiding panel because window is off-space")
                 panel.orderOut(nil)
             }
         } else {
+            writeRemoteDebugLog("handleSpaceChange(): hiding panel because not mirroring or windowID is nil")
             panel.orderOut(nil)
         }
     }
@@ -217,21 +256,24 @@ private struct RemoteStrip: View {
                     RemoteButton(
                         systemName: model.isSilent ? "bell.slash.fill" : "bell",
                         help: model.isSilent ? "Turn silent off" : "Silent mode",
-                        tint: model.isSilent ? .orange : nil
+                        tint: .orange,
+                        isActive: model.isSilent
                     ) {
                         Task { await model.toggleSilent() }
                     }
                     RemoteButton(
-                        systemName: model.isVibrate ? "bell.and.waves.left.and.right.fill" : "bell.and.waves.left.and.right",
+                        systemName: model.isVibrate ? "iphone.radiowaves.left.and.right" : "iphone",
                         help: model.isVibrate ? "Turn vibrate off" : "Vibrate mode",
-                        tint: model.isVibrate ? .blue : nil
+                        tint: .blue,
+                        isActive: model.isVibrate
                     ) {
                         Task { await model.toggleVibrate() }
                     }
                     RemoteButton(
                         systemName: model.isDND ? "moon.fill" : "moon",
                         help: model.isDND ? "Turn DND off" : "Do Not Disturb",
-                        tint: model.isDND ? .purple : nil
+                        tint: .purple,
+                        isActive: model.isDND
                     ) {
                         Task { await model.toggleDND() }
                     }
@@ -253,6 +295,7 @@ private struct RemoteButton: View {
     let systemName: String
     let help: String
     var tint: Color? = nil
+    var isActive: Bool = false
     let action: () -> Void
     @State private var hovering = false
 
@@ -260,10 +303,12 @@ private struct RemoteButton: View {
         Button(action: action) {
             Image(systemName: systemName)
                 .font(.system(size: 16, weight: .medium))
-                .foregroundStyle(tint.map(AnyShapeStyle.init) ?? AnyShapeStyle(.primary))
+                .foregroundStyle(isActive ? AnyShapeStyle(Color.white) : (tint.map(AnyShapeStyle.init) ?? AnyShapeStyle(.primary)))
                 .frame(width: 38, height: 32)
                 .background(RoundedRectangle(cornerRadius: 8)
-                    .fill(hovering ? AnyShapeStyle(.quaternary.opacity(0.6)) : AnyShapeStyle(.clear)))
+                    .fill(isActive
+                          ? AnyShapeStyle((tint ?? .accentColor).opacity(hovering ? 0.9 : 0.85))
+                          : (hovering ? AnyShapeStyle(.quaternary.opacity(0.6)) : AnyShapeStyle(.clear))))
         }
         .buttonStyle(.plain)
         .help(help)

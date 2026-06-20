@@ -128,6 +128,11 @@ final class AppModel {
         startBackgroundMonitor()
         // Match the OS login-item state to the saved preference.
         LoginItem.sync(desired: settings.launchAtLogin)
+        
+        // Reset and prompt for accessibility if sidebar is enabled but not trusted
+        if settings.showSidebar {
+            await ensureAccessibilityFreshAndPrompt()
+        }
     }
 
     /// Set launch-at-login and reflect the actual OS result back into settings
@@ -556,9 +561,6 @@ final class AppModel {
     /// Bumped on every scrcpy (re)start; old exit handlers compare against it.
     @ObservationIgnored private var mirrorGeneration = 0
 
-    /// Tracks if we've already prompted the user for accessibility access during this session.
-    @ObservationIgnored private var hasPromptedAccessibility = false
-
     /// Apply mirror-affecting settings (screen-off, awake, UHID, audio) to the
     /// live session by restarting scrcpy in place. No-op when not mirroring.
     func applyMirrorSettingsLive() {
@@ -586,17 +588,22 @@ final class AppModel {
         updateBackgroundClipboardSync()
     }
 
+    func ensureAccessibilityFreshAndPrompt() async {
+        if !AXIsProcessTrusted() {
+            // Permission is missing or signature hash has changed. Reset tcc Accessibility cache for com.ayushman.mimicos.
+            _ = await Shell.run("/usr/bin/tccutil", ["reset", "Accessibility", "com.ayushman.mimicos"])
+            // Prompt user with System settings modal
+            _ = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
+            status = "Grant MimicOS Accessibility access (System Settings ▸ Privacy) so the sidebar can follow the phone window."
+        }
+    }
+
     /// Hook the shared window tracker so move/resize events drive the floating
     /// remote with zero polling lag (and enforce the window's minimum size).
     private func beginWindowTracking(title: String, pid: pid_t?) {
-        if settings.showSidebar, !AXIsProcessTrusted() {
-            // The sidebar follows scrcpy's window via the Accessibility API.
-            if !hasPromptedAccessibility {
-                hasPromptedAccessibility = true
-                _ = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
-                status = "Grant MimicOS Accessibility access (System Settings ▸ Privacy) so the sidebar can follow the phone window."
-            } else {
-                status = "Accessibility access required. If you just granted it in Settings, please relaunch MimicOS."
+        if settings.showSidebar {
+            Task {
+                await ensureAccessibilityFreshAndPrompt()
             }
         }
 
@@ -635,6 +642,11 @@ final class AppModel {
     func setSidebarVisible(_ visible: Bool) {
         settings.showSidebar = visible
         floatingRemote.setEnabled(visible)
+        if visible {
+            Task {
+                await ensureAccessibilityFreshAndPrompt()
+            }
+        }
         if visible, isMirroring, let frame = windowTracker.currentFrame {
             floatingRemote.show(model: self)
             floatingRemote.update(for: frame, phoneWindowID: windowTracker.windowID)

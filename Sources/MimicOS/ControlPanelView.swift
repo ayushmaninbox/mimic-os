@@ -316,21 +316,24 @@ private struct AutomationSection: View {
                 QuickControlButton(
                     systemName: model.isSilent ? "bell.slash.fill" : "bell",
                     help: model.isSilent ? "Turn silent off" : "Silent mode",
-                    tint: model.isSilent ? .orange : nil
+                    tint: .orange,
+                    isActive: model.isSilent
                 ) {
                     Task { await model.toggleSilent() }
                 }
                 QuickControlButton(
-                    systemName: model.isVibrate ? "bell.and.waves.left.and.right.fill" : "bell.and.waves.left.and.right",
+                    systemName: model.isVibrate ? "iphone.radiowaves.left.and.right" : "iphone",
                     help: model.isVibrate ? "Turn vibrate off" : "Vibrate mode",
-                    tint: model.isVibrate ? .blue : nil
+                    tint: .blue,
+                    isActive: model.isVibrate
                 ) {
                     Task { await model.toggleVibrate() }
                 }
                 QuickControlButton(
                     systemName: model.isDND ? "moon.fill" : "moon",
                     help: model.isDND ? "Turn DND off" : "Do Not Disturb",
-                    tint: model.isDND ? .purple : nil
+                    tint: .purple,
+                    isActive: model.isDND
                 ) {
                     Task { await model.toggleDND() }
                 }
@@ -348,6 +351,7 @@ private struct QuickControlButton: View {
     let systemName: String
     let help: String
     var tint: Color? = nil
+    var isActive: Bool = false
     let action: () -> Void
     @State private var hovering = false
 
@@ -355,10 +359,12 @@ private struct QuickControlButton: View {
         Button(action: action) {
             Image(systemName: systemName)
                 .font(.system(size: 16, weight: .medium))
-                .foregroundStyle(tint.map(AnyShapeStyle.init) ?? AnyShapeStyle(.primary))
+                .foregroundStyle(isActive ? AnyShapeStyle(Color.white) : (tint.map(AnyShapeStyle.init) ?? AnyShapeStyle(.primary)))
                 .frame(width: 40, height: 34)
                 .background(RoundedRectangle(cornerRadius: 8)
-                    .fill(hovering ? AnyShapeStyle(.quaternary.opacity(0.6)) : AnyShapeStyle(.quaternary.opacity(0.25))))
+                    .fill(isActive
+                          ? AnyShapeStyle((tint ?? .accentColor).opacity(hovering ? 0.9 : 0.85))
+                          : (hovering ? AnyShapeStyle(.quaternary.opacity(0.6)) : AnyShapeStyle(.quaternary.opacity(0.25)))))
         }
         .buttonStyle(.plain)
         .help(help)

@@ -84,21 +84,24 @@ MimicOS lives in the **menu bar** and keeps running quietly in the background wh
 If your phone's wireless connection drops (Wi-Fi or hotspot) and later comes back, MimicOS **reconnects it automatically**. The first time a device drops, it asks whether to enable this — you stay in control.
 
 ### 🎛 Floating Control Sidebar
-While mirroring, a slim **floating sidebar docks to the side of the phone window** and follows it as you move it — auto-flipping between the left and right edge depending on available room, and sharing the window's z-order so it comes forward with the mirror. It carries the hardware controls (back, home, recents, power, volume ±, rotate) plus screenshot and screen-record buttons. Toggle it from Settings or the menu bar.
+While mirroring, a slim **floating sidebar docks to the side of the phone window** and follows it as you move it — auto-flipping between the left and right edge depending on available room, and sharing the window's z-order so it comes forward with the mirror. It carries the hardware controls (back, home, recents, power, volume ±, rotate) plus screenshot and screen-record buttons. **Off by default**, toggle it from Settings or the menu bar.
 
 > The sidebar follows scrcpy's window via the macOS **Accessibility API**, so the first time you use it MimicOS asks for Accessibility access (**System Settings → Privacy & Security → Accessibility**).
 
 ### 🤖 Quick Controls & Automation
-Hardware button shortcuts without touching your phone:
+Hardware button shortcuts without touching your phone (now with modern, Apple Control Center-inspired active background styling for stateful toggles):
 
 | Button | Action |
 |--------|--------|
 | **Back** | Navigate back (keycode 4) |
 | **Home** | Android home screen (keycode 3) |
 | **Recents** | Recent-apps overview (keycode 187) |
-| **Volume ± ** | Raise/lower volume (keycodes 24/25) |
+| **Volume ±** | Raise/lower volume (keycodes 24/25) |
 | **Rotate** | Rotate the display 90° |
 | **Power** | Toggle screen on/off (keycode 26) |
+| **Silent** | Toggle silent/ringer mode (live-synced, turns orange when active) |
+| **Vibrate** | Toggle vibration mode with a phone vibration icon (live-synced, turns blue when active) |
+| **DND** | Toggle Do Not Disturb (zen mode) state (live-synced, turns purple when active) |
 
 Plus programmable automation via ADB:
 - **Tap** at coordinates — `ADB.tap(serial, x, y)`

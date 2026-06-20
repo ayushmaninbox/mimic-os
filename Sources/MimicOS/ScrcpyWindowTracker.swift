@@ -2,6 +2,20 @@ import Foundation
 import AppKit
 import ApplicationServices
 
+func writeTrackerDebugLog(_ message: String) {
+    let logURL = URL(fileURLWithPath: "/Users/ayushmaninbox/Documents/GitHub/iDroid/scratch/tracker_debug.log")
+    let line = "[\(Date())] [Tracker] \(message)\n"
+    if let data = line.data(using: .utf8) {
+        if let fileHandle = try? FileHandle(forWritingTo: logURL) {
+            fileHandle.seekToEndOfFile()
+            fileHandle.write(data)
+            fileHandle.closeFile()
+        } else {
+            try? data.write(to: logURL)
+        }
+    }
+}
+
 
 /// Tracks scrcpy's mirror window and reports its frame the instant it moves or
 /// resizes — **event-driven** via `AXObserver`, not polling — so anything docked
@@ -39,6 +53,7 @@ final class ScrcpyWindowTracker {
     private var activationObserver: NSObjectProtocol?
 
     func start(windowTitle title: String, scrcpyPID: pid_t? = nil) {
+        writeTrackerDebugLog("start() called with title='\(title)', pid=\(scrcpyPID ?? -1), trusted=\(AXIsProcessTrusted())")
         windowTitle = title
         self.scrcpyPID = scrcpyPID
         acquireWindow()
@@ -70,6 +85,7 @@ final class ScrcpyWindowTracker {
     }
 
     func stop() {
+        writeTrackerDebugLog("stop() called")
         reacquireTimer?.invalidate()
         reacquireTimer = nil
         if let activationObserver {
@@ -97,34 +113,47 @@ final class ScrcpyWindowTracker {
     private func acquireIfNeeded() {
         // Still valid? Cheap check: can we still read its position?
         if let axWindow, frame(of: axWindow) != nil { return }
+        writeTrackerDebugLog("acquireIfNeeded(): window lost or not acquired yet, attempting re-acquire")
         teardownObserver()
         axWindow = nil
         acquireWindow()
     }
 
     private func acquireWindow() {
-        guard let title = windowTitle else { return }
+        guard let title = windowTitle else { 
+            writeTrackerDebugLog("acquireWindow(): windowTitle is nil")
+            return 
+        }
+        writeTrackerDebugLog("acquireWindow(): seeking window matching title='\(title)'")
 
         // 1. If we have a specific target PID, try that directly.
         if let targetPID = scrcpyPID {
+            writeTrackerDebugLog("acquireWindow(): attempting target PID \(targetPID)")
             let appElement = AXUIElementCreateApplication(targetPID)
             var value: CFTypeRef?
             let axRes = AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &value)
+            writeTrackerDebugLog("acquireWindow(): target PID AX result = \(axRes.rawValue)")
             if axRes == .success, let windows = value as? [AXUIElement] {
+                writeTrackerDebugLog("acquireWindow(): target PID \(targetPID) has \(windows.count) windows")
                 if !windows.isEmpty {
                     if let exact = windows.first(where: { w in
                         if let t = string(w, kAXTitleAttribute) { 
+                            writeTrackerDebugLog("acquireWindow(): window title candidate = '\(t)'")
                             return t == title || t.contains(title) 
                         }
                         return false
                     }) {
+                        writeTrackerDebugLog("acquireWindow(): found exact title match for target PID \(targetPID)")
                         bind(pid: targetPID, app: appElement, window: exact)
                         return
                     }
+                    writeTrackerDebugLog("acquireWindow(): falling back to first window for target PID \(targetPID)")
                     // Fallback: Bind to the first window of the target process if it has no exact title match.
                     bind(pid: targetPID, app: appElement, window: windows[0])
                     return
                 }
+            } else {
+                writeTrackerDebugLog("acquireWindow(): AXUIElementCopyAttributeValue failed or windows cast failed for PID \(targetPID)")
             }
         }
 
@@ -133,10 +162,12 @@ final class ScrcpyWindowTracker {
         // helpers). Only one actually owns the mirror window, so scan ALL of them
         // and match on the window title — picking the first matching process by
         // PID alone grabs the wrong (window-less) one.
+        writeTrackerDebugLog("acquireWindow(): falling back to runningApplications scan")
         let apps = NSWorkspace.shared.runningApplications.filter {
             ($0.executableURL?.lastPathComponent == "scrcpy")
                 || ($0.localizedName?.lowercased().contains("scrcpy") ?? false)
         }
+        writeTrackerDebugLog("acquireWindow(): found \(apps.count) matching applications in runningApplications")
 
         var anyWindow: (pid: pid_t, app: AXUIElement, window: AXUIElement)?
         for app in apps {
@@ -144,15 +175,19 @@ final class ScrcpyWindowTracker {
             var value: CFTypeRef?
             guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &value) == .success,
                   let windows = value as? [AXUIElement], !windows.isEmpty else { 
+                writeTrackerDebugLog("acquireWindow(): app PID \(app.processIdentifier) has no windows or AX failed")
                 continue 
             }
 
+            writeTrackerDebugLog("acquireWindow(): app PID \(app.processIdentifier) has \(windows.count) windows")
             if let exact = windows.first(where: { w in
                 if let t = string(w, kAXTitleAttribute) { 
+                    writeTrackerDebugLog("acquireWindow(): scan candidate title = '\(t)'")
                     return t == title || t.contains(title) 
                 }
                 return false
             }) {
+                writeTrackerDebugLog("acquireWindow(): found match in scan for PID \(app.processIdentifier)")
                 bind(pid: app.processIdentifier, app: appElement, window: exact)
                 return
             }
@@ -164,20 +199,28 @@ final class ScrcpyWindowTracker {
         // No title match (scrcpy may report an empty AX title on some builds) —
         // fall back to the single scrcpy window we did find.
         if let any = anyWindow {
+            writeTrackerDebugLog("acquireWindow(): binding to any window found (PID \(any.pid))")
             bind(pid: any.pid, app: any.app, window: any.window)
+        } else {
+            writeTrackerDebugLog("acquireWindow(): finished scan, found no windows")
         }
     }
 
     private func bind(pid: pid_t, app: AXUIElement, window: AXUIElement) {
+        writeTrackerDebugLog("bind() called for PID \(pid)")
         axApp = app
         axWindow = window
         windowID = Self.windowID(of: window)
+        writeTrackerDebugLog("bind(): resolved windowID = \(windowID ?? 0)")
         installObserver(pid: pid, window: window)
         if let raw = frame(of: window) {
             let frame = enforceMinimumSize(raw)
+            writeTrackerDebugLog("bind(): resolved frame = \(frame), invoking onAppear")
             currentFrame = frame
             onAppear?(frame)
             onFrameChange?(frame)
+        } else {
+            writeTrackerDebugLog("bind(): frame(of:) returned nil")
         }
     }
 
