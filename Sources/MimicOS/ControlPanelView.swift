@@ -24,26 +24,22 @@ struct ControlPanelView: View {
                 }
             } else {
                 @Bindable var model = model
-                HStack(spacing: 0) {
-                    VStack(spacing: 0) {
-                        DeviceDetailHeader(device: device) {
-                            renameRequest = RenameRequest(serial: device.serial,
-                                                          initialName: device.customName ?? device.displayName)
-                        }
-                        Divider()
-                        TabNavBar(selection: $model.selectedTab)
-                        Divider()
-                        Group {
-                            switch model.selectedTab {
-                            case .control:        ControlTab()
-                            case .files:          FilesTab()
-                            case .settings:       SettingsTab()
-                            }
-                        }
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                VStack(spacing: 0) {
+                    DeviceDetailHeader(device: device) {
+                        renameRequest = RenameRequest(serial: device.serial,
+                                                      initialName: device.customName ?? device.displayName)
                     }
                     Divider()
-                    DeviceControlRail()
+                    TabNavBar(selection: $model.selectedTab)
+                    Divider()
+                    Group {
+                        switch model.selectedTab {
+                        case .control:        ControlTab()
+                        case .files:          FilesTab()
+                        case .settings:       SettingsTab()
+                        }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
                 .quickLookPreview($model.activePreviewURL)
                 .sheet(item: $renameRequest) { request in
@@ -66,102 +62,6 @@ struct ControlPanelView: View {
                                    systemImage: "iphone",
                                    description: Text("Pick a device from the sidebar, or connect one over USB."))
         }
-    }
-}
-
-// MARK: - Right-hand control rail
-//
-// A persistent vertical toolbar of hardware-style buttons that act on the
-// selected device: power, volume, rotate, pin window, screenshot, screen
-// record, plus shortcuts to the Settings and Files tabs.
-
-private struct DeviceControlRail: View {
-    @Environment(AppModel.self) private var model
-
-    var body: some View {
-        VStack(spacing: 4) {
-            RailButton(systemName: "power", help: "Power (toggle screen)") {
-                Task { await model.togglePower() }
-            }
-            RailButton(systemName: "speaker.wave.2.fill", help: "Volume up") {
-                Task { await model.volumeUp() }
-            }
-            RailButton(systemName: "speaker.wave.1.fill", help: "Volume down") {
-                Task { await model.volumeDown() }
-            }
-            RailButton(systemName: "rotate.right", help: "Rotate screen 90°") {
-                Task { await model.rotateScreen() }
-            }
-
-            RailDivider()
-
-            RailButton(systemName: model.settings.pinPhoneWindow ? "pin.fill" : "pin",
-                       help: "Pin phone window (always on top · all spaces)",
-                       isActive: model.settings.pinPhoneWindow) {
-                model.togglePinPhoneWindow()
-            }
-            RailButton(systemName: "camera.fill", help: "Screenshot → capture folder") {
-                Task { await model.captureScreenshot() }
-            }
-            RailButton(systemName: model.isRecording ? "stop.circle.fill" : "record.circle",
-                       help: model.isRecording ? "Stop recording" : "Record screen → capture folder",
-                       isActive: model.isRecording,
-                       activeTint: .red) {
-                Task { await model.toggleScreenRecording() }
-            }
-
-            RailDivider()
-
-            RailButton(systemName: "folder.fill", help: "Open Files tab",
-                       isActive: model.selectedTab == .files) {
-                model.selectedTab = .files
-            }
-            RailButton(systemName: "gearshape.fill", help: "Open Settings tab",
-                       isActive: model.selectedTab == .settings) {
-                model.selectedTab = .settings
-            }
-
-            Spacer()
-        }
-        .padding(.vertical, 10)
-        .padding(.horizontal, 6)
-        .frame(width: 52)
-        .background(.bar)
-    }
-}
-
-private struct RailDivider: View {
-    var body: some View {
-        Divider()
-            .frame(width: 28)
-            .padding(.vertical, 4)
-    }
-}
-
-private struct RailButton: View {
-    let systemName: String
-    let help: String
-    var isActive: Bool = false
-    var activeTint: Color = .accentColor
-    let action: () -> Void
-    @State private var hovering = false
-
-    var body: some View {
-        Button(action: action) {
-            Image(systemName: systemName)
-                .font(.system(size: 15, weight: .medium))
-                .foregroundStyle(isActive ? AnyShapeStyle(activeTint) : AnyShapeStyle(.primary))
-                .frame(width: 38, height: 34)
-                .background(
-                    RoundedRectangle(cornerRadius: 8)
-                        .fill(isActive ? AnyShapeStyle(activeTint.opacity(0.16))
-                                       : (hovering ? AnyShapeStyle(.quaternary.opacity(0.5))
-                                                   : AnyShapeStyle(.clear)))
-                )
-        }
-        .buttonStyle(.plain)
-        .help(help)
-        .onHover { hovering = $0 }
     }
 }
 
@@ -286,12 +186,12 @@ private struct SettingsTab: View {
                 }
                 Divider()
                 SectionCard(title: "Phone window", systemImage: "pin") {
-                    Toggle("Pin the mirror window (always on top, on every space)",
+                    Toggle("Pin the mirror window to every desktop",
                            isOn: Binding(
                             get: { model.settings.pinPhoneWindow },
                             set: { _ in model.togglePinPhoneWindow() }))
                         .font(.body)
-                    Text("Keeps scrcpy's phone window floating above other apps, locked in size and position, and visible on every Mission Control space. Requires Accessibility access (you'll be prompted). Same as the pin button on the right rail.")
+                    Text("Keeps scrcpy's phone window visible on every Mission Control desktop as you switch spaces — it stays freely movable and resizable, and its last size & position are remembered for next time. Requires Accessibility access (you'll be prompted). Same as the pin button on the floating remote.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Divider()
@@ -299,7 +199,12 @@ private struct SettingsTab: View {
                     Toggle("Keep MimicOS running in the menu bar when the window is closed",
                            isOn: $settings.runInBackground)
                         .font(.body)
-                    Text("MimicOS stays in the menu bar so it can keep your device connected and let you capture screenshots/recordings without reopening the window. It idles at near-zero CPU. Turn this off to quit fully when you close the window.")
+                    Toggle("Launch MimicOS at login (relaunch after a restart)",
+                           isOn: Binding(
+                            get: { model.settings.launchAtLogin },
+                            set: { model.setLaunchAtLogin($0) }))
+                        .font(.body)
+                    Text("MimicOS stays in the menu bar so it can keep your device connected and let you capture screenshots/recordings without reopening the window. It idles at near-zero CPU. Launch-at-login brings it back automatically after a reboot.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
@@ -362,7 +267,7 @@ private struct MirrorSection: View {
                       systemImage: model.isMirroring ? "stop.circle" : "play.circle")
             }
             .buttonStyle(.borderedProminent)
-            Text("Options (screen-off, clipboard sync) are in the Settings tab.")
+            Text("A floating remote (power, volume, rotate, pin, screenshot, record) appears attached to the phone window while mirroring. Options (screen-off, clipboard sync, capture folder, pin) live in the Settings tab.")
                 .font(.caption).foregroundStyle(.secondary)
         }
     }

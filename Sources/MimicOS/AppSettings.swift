@@ -46,6 +46,30 @@ final class AppSettings {
         didSet { defaults.set(runInBackground, forKey: Self.runInBackgroundKey) }
     }
 
+    /// Launch MimicOS automatically at login (so it returns after a reboot).
+    var launchAtLogin: Bool {
+        didSet { defaults.set(launchAtLogin, forKey: "MimicOS.launchAtLogin") }
+    }
+
+    private static let phoneWindowFrameKey = "MimicOS.phoneWindowFrame"
+
+    /// Persist the scrcpy mirror window's last frame (top-left origin, points)
+    /// so the next mirror session reopens at the same spot and size.
+    var phoneWindowFrame: CGRect? {
+        get {
+            guard let arr = defaults.array(forKey: Self.phoneWindowFrameKey) as? [Double],
+                  arr.count == 4 else { return nil }
+            return CGRect(x: arr[0], y: arr[1], width: arr[2], height: arr[3])
+        }
+        set {
+            if let f = newValue {
+                defaults.set([f.origin.x, f.origin.y, f.width, f.height], forKey: Self.phoneWindowFrameKey)
+            } else {
+                defaults.removeObject(forKey: Self.phoneWindowFrameKey)
+            }
+        }
+    }
+
     init() {
         // Reference UserDefaults directly here — the `defaults` computed property
         // touches `self`, which isn't allowed until all stored props are set.
@@ -54,6 +78,7 @@ final class AppSettings {
         autoReconnectAsked = store.bool(forKey: "MimicOS.autoReconnectAsked")
         pinPhoneWindow = store.bool(forKey: Self.pinPhoneWindowKey)
         runInBackground = store.object(forKey: Self.runInBackgroundKey) as? Bool ?? true
+        launchAtLogin = store.object(forKey: "MimicOS.launchAtLogin") as? Bool ?? true
 
         // Resolve the saved capture folder, falling back to ~/Pictures/MimicOS.
         let fallback = FileManager.default

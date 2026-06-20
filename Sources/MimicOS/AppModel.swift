@@ -77,8 +77,12 @@ final class AppModel {
     /// Global preferences (capture folder, auto-reconnect, pin, background).
     let settings = AppSettings()
 
-    /// Controls pinning of scrcpy's mirror window (always-on-top / all spaces).
+    /// Controls pinning of scrcpy's mirror window (sticky / all spaces) and
+    /// tracks its frame for persistence.
     private let pinner = PhoneWindowPinner()
+
+    /// The attached floating remote-control window shown beside the phone screen.
+    @ObservationIgnored let floatingRemote = FloatingRemoteController()
 
     private let scrcpy = Scrcpy()
     private let headlessScrcpy = Scrcpy()
@@ -129,6 +133,18 @@ final class AppModel {
         await ADB.startServer()
         await refreshDevices()
         startBackgroundMonitor()
+        // Match the OS login-item state to the saved preference.
+        LoginItem.sync(desired: settings.launchAtLogin)
+    }
+
+    /// Set launch-at-login and reflect the actual OS result back into settings
+    /// (registration can fail when running unsigned / as a bare binary).
+    func setLaunchAtLogin(_ enabled: Bool) {
+        let ok = LoginItem.setEnabled(enabled)
+        settings.launchAtLogin = ok ? enabled : LoginItem.isEnabled
+        if !ok {
+            status = "Couldn't change login item (needs the packaged app)."
+        }
     }
 
     func onDisappear() {
@@ -462,12 +478,7 @@ final class AppModel {
             return
         }
         if isMirroring {
-            mirroringSerial = nil
-            pinner.unpin()
-            mirrorWindowTitle = nil
-            scrcpy.stop()
-            status = "Mirror stopped"
-            updateBackgroundClipboardSync()
+            stopMirror()
         } else {
             // Stop background clipboard sync before starting full mirror
             headlessScrcpy.stop()
@@ -483,22 +494,25 @@ final class AppModel {
             options.audio = audioRoute
             options.alwaysOnTop = settings.pinPhoneWindow
             options.windowTitle = title
+            // Reopen where the user last left the phone window.
+            options.windowFrame = settings.phoneWindowFrame
             // Clear our observable state when scrcpy exits on its own (e.g. the
             // user closes the mirror window) so the button flips back to Start.
             let ok = scrcpy.start(serial: serial, options: options) { [weak self] status, errText in
                 Task { @MainActor in
-                    if self?.mirroringSerial == serial {
-                        self?.mirroringSerial = nil
-                        self?.pinner.unpin()
-                        self?.mirrorWindowTitle = nil
-                        if status != 0 && !errText.isEmpty {
-                            let cleanErr = errText.split(separator: "\n").last.map(String.init) ?? errText
-                            self?.status = "Mirror failed: \(cleanErr.trimmingCharacters(in: .whitespacesAndNewlines))"
-                        } else {
-                            self?.status = "Mirror stopped"
-                        }
-                        self?.updateBackgroundClipboardSync()
+                    guard let self, self.mirroringSerial == serial else { return }
+                    self.persistPhoneWindowFrame()
+                    self.mirroringSerial = nil
+                    self.pinner.stop()
+                    self.floatingRemote.hide()
+                    self.mirrorWindowTitle = nil
+                    if status != 0 && !errText.isEmpty {
+                        let cleanErr = errText.split(separator: "\n").last.map(String.init) ?? errText
+                        self.status = "Mirror failed: \(cleanErr.trimmingCharacters(in: .whitespacesAndNewlines))"
+                    } else {
+                        self.status = "Mirror stopped"
                     }
+                    self.updateBackgroundClipboardSync()
                 }
             }
             mirroringSerial = ok ? serial : nil
@@ -506,38 +520,75 @@ final class AppModel {
                 ? (turnScreenOff ? "Mirroring (phone screen off)" : "Mirroring")
                 : "Failed to start scrcpy"
 
-            // If pinning is on, wait for scrcpy's window to appear, then pin it.
-            if ok && settings.pinPhoneWindow {
+            // Start tracking the window once it appears: capture its frame for
+            // restore, apply the sticky (all-spaces) tag if pinning is on, and
+            // float the attached remote alongside it.
+            if ok {
                 Task { [weak self] in
                     try? await Task.sleep(for: .seconds(1))
-                    self?.applyPinIfEnabled()
+                    self?.beginWindowTracking(title: title)
                 }
             }
         }
     }
 
-    /// Toggle whether the mirrored phone window is pinned (always-on-top + all
-    /// spaces + locked frame). Persists the choice and applies it live if a
-    /// mirror is running. New mirror sessions launch pinned while this is on.
-    func togglePinPhoneWindow() {
-        settings.pinPhoneWindow.toggle()
+    /// Stop mirroring and tear down the pinner / floating remote, saving the
+    /// window's last frame first.
+    private func stopMirror() {
+        persistPhoneWindowFrame()
+        mirroringSerial = nil
+        pinner.stop()
+        floatingRemote.hide()
+        mirrorWindowTitle = nil
+        scrcpy.stop()
+        status = "Mirror stopped"
+        updateBackgroundClipboardSync()
+    }
+
+    /// Begin AX tracking of the scrcpy window: capture frame on every tick,
+    /// apply the sticky tag per the pin setting, and show the floating remote.
+    private func beginWindowTracking(title: String) {
+        guard isMirroring else { return }
         if settings.pinPhoneWindow {
-            applyPinIfEnabled()
-            status = isMirroring ? "Phone window pinned" : "Phone window will be pinned when you mirror"
-        } else {
-            pinner.unpin()
-            status = "Phone window unpinned"
+            if !PhoneWindowPinner.ensureAccessibilityPermission(prompt: true) {
+                status = "Grant MimicOS Accessibility access (System Settings ▸ Privacy) to pin the phone window across desktops."
+            }
+        }
+        pinner.startTracking(windowTitle: title, sticky: settings.pinPhoneWindow)
+        floatingRemote.show(model: self, trackingTitle: title, sticky: settings.pinPhoneWindow)
+    }
+
+    /// The scrcpy window's current AX frame (top-left origin), for the floating
+    /// remote to dock against. nil if the window can't be found.
+    func scrcpyWindowFrameForRemote() -> CGRect? {
+        pinner.currentScrcpyFrame()
+    }
+
+    /// Save the scrcpy window's current frame so the next session restores it.
+    private func persistPhoneWindowFrame() {
+        if let frame = pinner.currentScrcpyFrame() ?? pinner.lastKnownFrame {
+            settings.phoneWindowFrame = frame
         }
     }
 
-    /// Pin the live scrcpy window if pinning is enabled and a mirror is running.
-    private func applyPinIfEnabled() {
-        guard settings.pinPhoneWindow, isMirroring, let title = mirrorWindowTitle else { return }
-        // Surface the Accessibility-permission prompt if it isn't granted yet.
-        if !PhoneWindowPinner.ensureAccessibilityPermission(prompt: true) {
-            status = "Grant MimicOS Accessibility access (System Settings ▸ Privacy) to pin the phone window."
+    /// Toggle whether the mirrored phone window rides across every Mission
+    /// Control desktop (sticky). The window stays freely movable/resizable; only
+    /// its presence on all spaces is what's "pinned". Persisted and applied live.
+    func togglePinPhoneWindow() {
+        settings.pinPhoneWindow.toggle()
+        let sticky = settings.pinPhoneWindow
+        if sticky && isMirroring {
+            if !PhoneWindowPinner.ensureAccessibilityPermission(prompt: true) {
+                status = "Grant MimicOS Accessibility access (System Settings ▸ Privacy) to pin across desktops."
+            }
         }
-        pinner.pin(windowTitle: title)
+        pinner.setSticky(sticky)
+        floatingRemote.setSticky(sticky)
+        if isMirroring {
+            status = sticky ? "Phone window pinned to all desktops" : "Phone window unpinned"
+        } else {
+            status = sticky ? "Phone window will show on all desktops when you mirror" : "Phone window unpinned"
+        }
     }
 
     func updateBackgroundClipboardSync() {
@@ -1610,15 +1661,19 @@ final class AppModel {
             isRecording = false
             return
         }
-        // SIGINT lets screenrecord finalize the MP4 (terminate() sends SIGTERM,
-        // which truncates it); fall back to terminate if interrupt isn't enough.
-        if let proc = recordProcess, proc.isRunning {
-            proc.interrupt()
-        }
         isRecording = false
-        status = "Saving recording…"
+        status = "Finalizing recording…"
+
+        // Stop the ON-DEVICE screenrecord cleanly (SIGINT) so the MP4 is
+        // finalized and playable; only after it exits do we tear down the adb
+        // pipe and pull the file.
+        await ADB.stopScreenRecord(serial)
+        if let proc = recordProcess, proc.isRunning {
+            proc.terminate()
+        }
         recordProcess = nil
 
+        status = "Saving recording…"
         if let url = await ADB.finishScreenRecord(serial, remotePath: remotePath, localFile: dest) {
             status = "Saved \(url.lastPathComponent)"
             NSWorkspace.shared.activateFileViewerSelecting([url])

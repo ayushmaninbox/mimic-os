@@ -480,10 +480,13 @@ enum ADB {
     }
 
     /// Starts `screenrecord` on the phone, writing to a temp path on the phone.
-    /// Returns the live `Process` and the remote path so the caller can stop it
-    /// (terminate the process / send SIGINT) and then pull the finished file.
+    /// Returns the live adb `Process` so the caller can keep a handle on the
+    /// session. To STOP cleanly, call `stopScreenRecord` (which signals the
+    /// on-device process) — NOT by killing this adb process, which would leave
+    /// the MP4 unfinalized and unplayable.
+    ///
     /// `screenrecord` caps at ~3 minutes per Android's limit; we set --time-limit
-    /// to the max so it ends cleanly if not stopped sooner.
+    /// to the max so it ends cleanly even if the user forgets to stop it.
     static func startScreenRecord(_ serial: String, remotePath: String,
                                   onStart: @escaping @Sendable (Process) -> Void) -> Bool {
         let args = ["-s", serial, "shell", "screenrecord", "--time-limit", "180", remotePath]
@@ -492,18 +495,35 @@ enum ADB {
         return proc != nil
     }
 
-    /// After stopping a recording, pulls the .mp4 off the phone into `localFile`
+    /// Cleanly stops an in-progress recording by sending SIGINT to the on-device
+    /// `screenrecord` process. SIGINT is what makes screenrecord flush and write
+    /// the MP4 moov atom; killing the local adb pipe does not. We then wait for
+    /// the device process to actually exit before returning.
+    static func stopScreenRecord(_ serial: String) async {
+        // -INT = SIGINT. `pkill` matches by process name; `-l INT` is the
+        // portable spelling on Android's toybox. Try a couple of spellings.
+        _ = await Shell.run(ToolLocator.adb, ["-s", serial, "shell", "pkill", "-INT", "screenrecord"])
+        _ = await Shell.run(ToolLocator.adb, ["-s", serial, "shell", "pkill", "-l", "INT", "screenrecord"])
+        // Wait until no screenrecord process remains (up to ~4s) so the file is
+        // fully finalized before we pull it.
+        for _ in 0..<20 {
+            let check = await Shell.run(ToolLocator.adb, ["-s", serial, "shell", "pidof", "screenrecord"])
+            if check.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return }
+            try? await Task.sleep(for: .milliseconds(200))
+        }
+    }
+
+    /// After stopping, pulls the finalized .mp4 off the phone into `localFile`
     /// and deletes the temp file on the phone. Returns the saved URL or nil.
     static func finishScreenRecord(_ serial: String, remotePath: String,
                                    localFile: URL) async -> URL? {
-        // screenrecord finalizes the MP4 moov atom only after it gets SIGINT and
-        // exits; give it a beat to flush before we pull.
-        try? await Task.sleep(for: .milliseconds(800))
         let pull = await Shell.run(ToolLocator.adb,
                                    ["-s", serial, "pull", remotePath, localFile.path])
         _ = await delete(serial, path: remotePath)
         guard pull.succeeded,
-              FileManager.default.fileExists(atPath: localFile.path) else { return nil }
+              FileManager.default.fileExists(atPath: localFile.path),
+              (try? FileManager.default.attributesOfItem(atPath: localFile.path)[.size] as? Int ?? 0) ?? 0 > 0
+        else { return nil }
         return localFile
     }
 

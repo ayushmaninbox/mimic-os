@@ -2,27 +2,27 @@ import Foundation
 import AppKit
 import ApplicationServices
 
-/// Pins scrcpy's mirror window so it stays put: always-on-top (set via scrcpy's
-/// own flag), a locked size/position that it's snapped back to if it drifts, and
-/// — where the OS permits — visible on every Mission Control space.
+/// Pins scrcpy's mirror window so it appears on **every** Mission Control space
+/// (sticky), while staying freely movable and resizable. The window's last frame
+/// is reported back so it can be restored next session.
 ///
-/// scrcpy runs in its own process, so we can't use `NSWindow` directly. We drive
-/// its window through the Accessibility API (find by title, read/write the
-/// `AXPosition`/`AXSize` attributes) and, for the "all spaces" behaviour, the
-/// private CoreGraphics window-space API used by window managers.
+/// scrcpy runs in its own process, so we can't use `NSWindow` directly — we drive
+/// its window through the Accessibility API (find by title, read `AXPosition` /
+/// `AXSize`) and tag it sticky via the private CoreGraphics window-space API.
 @MainActor
 final class PhoneWindowPinner {
     /// The window title scrcpy was launched with, so we can find its window.
     private var windowTitle: String?
-    /// The frame we lock the window to, captured the first time we see it.
-    private var lockedFrame: CGRect?
-    /// Re-asserts the locked frame and all-spaces flag periodically.
+    /// Re-finds the window and (re)applies the sticky tag as it appears/moves.
     private var watcher: Task<Void, Never>?
-    /// Whether pinning is currently active.
+    /// Whether sticky/all-spaces pinning is currently active.
     private(set) var isPinned = false
+    /// Last known frame of the scrcpy window (in AX/top-left coords), tracked so
+    /// the caller can persist and restore it. Updated on every watcher tick.
+    private(set) var lastKnownFrame: CGRect?
 
     /// One-time check (and prompt) that we hold the Accessibility permission
-    /// needed to move another app's window. Returns true if granted.
+    /// needed to read/move another app's window. Returns true if granted.
     @discardableResult
     static func ensureAccessibilityPermission(prompt: Bool) -> Bool {
         // The literal value of kAXTrustedCheckOptionPrompt; using it directly
@@ -31,52 +31,60 @@ final class PhoneWindowPinner {
         return AXIsProcessTrustedWithOptions(options)
     }
 
-    /// Begin pinning the scrcpy window identified by `title`.
-    func pin(windowTitle title: String) {
+    /// Begin watching the scrcpy window identified by `title`. When `sticky` is
+    /// true the window is tagged onto all spaces; either way we keep tracking its
+    /// frame so it can be saved.
+    func startTracking(windowTitle title: String, sticky: Bool) {
         windowTitle = title
-        isPinned = true
-        lockedFrame = nil
-        Self.ensureAccessibilityPermission(prompt: true)
+        isPinned = sticky
         startWatcher()
     }
 
-    /// Stop pinning and let the window behave normally again.
-    func unpin() {
-        isPinned = false
+    /// Turn the sticky/all-spaces tag on or off live, without losing tracking.
+    func setSticky(_ sticky: Bool) {
+        isPinned = sticky
+        if let element = scrcpyWindowElement() {
+            setAllSpaces(sticky, for: element)
+        }
+    }
+
+    /// Stop tracking. Returns the final frame so the caller can persist it.
+    @discardableResult
+    func stop() -> CGRect? {
         watcher?.cancel()
         watcher = nil
-        lockedFrame = nil
+        // Best-effort: clear the sticky tag so a future un-pinned window is normal.
         if let element = scrcpyWindowElement() {
-            // Drop it back to the current space only.
+            lastKnownFrame = currentFrame(of: element) ?? lastKnownFrame
             setAllSpaces(false, for: element)
         }
+        windowTitle = nil
+        isPinned = false
+        return lastKnownFrame
     }
 
     private func startWatcher() {
         watcher?.cancel()
         watcher = Task { [weak self] in
+            var taggedWindowID: CGWindowID?
             while !Task.isCancelled {
-                self?.reassert()
-                try? await Task.sleep(for: .milliseconds(600))
+                self?.tick(taggedWindowID: &taggedWindowID)
+                try? await Task.sleep(for: .milliseconds(700))
             }
         }
     }
 
-    /// Find the window, capture its frame the first time, then keep snapping it
-    /// back if something moved/resized it, and keep it on all spaces.
-    private func reassert() {
-        guard isPinned, let element = scrcpyWindowElement() else { return }
+    /// One watcher pass: track the window's frame, and (re)apply the sticky tag
+    /// whenever a new window id shows up (scrcpy can recreate its window).
+    private func tick(taggedWindowID: inout CGWindowID?) {
+        guard let element = scrcpyWindowElement() else { return }
+        lastKnownFrame = currentFrame(of: element) ?? lastKnownFrame
 
-        if lockedFrame == nil {
-            lockedFrame = currentFrame(of: element)
+        guard isPinned else { return }
+        let wid = windowID(of: element)
+        if let wid, wid != taggedWindowID {
             setAllSpaces(true, for: element)
-        }
-        guard let target = lockedFrame else { return }
-
-        if let now = currentFrame(of: element),
-           !framesApproximatelyEqual(now, target) {
-            setPosition(target.origin, for: element)
-            setSize(target.size, for: element)
+            taggedWindowID = wid
         }
     }
 
@@ -106,24 +114,11 @@ final class PhoneWindowPinner {
         return nil
     }
 
+    /// Current frame in AX coordinates (top-left origin, y grows downward).
     private func currentFrame(of element: AXUIElement) -> CGRect? {
         guard let origin = pointAttribute(element, kAXPositionAttribute),
               let size = sizeAttribute(element, kAXSizeAttribute) else { return nil }
         return CGRect(origin: origin, size: size)
-    }
-
-    private func setPosition(_ point: CGPoint, for element: AXUIElement) {
-        var p = point
-        if let axValue = AXValueCreate(.cgPoint, &p) {
-            AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, axValue)
-        }
-    }
-
-    private func setSize(_ size: CGSize, for element: AXUIElement) {
-        var s = size
-        if let axValue = AXValueCreate(.cgSize, &s) {
-            AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, axValue)
-        }
     }
 
     private func stringAttribute(_ element: AXUIElement, _ attr: String) -> String? {
@@ -150,18 +145,7 @@ final class PhoneWindowPinner {
         return size
     }
 
-    private func framesApproximatelyEqual(_ a: CGRect, _ b: CGRect) -> Bool {
-        abs(a.origin.x - b.origin.x) < 2 && abs(a.origin.y - b.origin.y) < 2
-            && abs(a.size.width - b.size.width) < 2 && abs(a.size.height - b.size.height) < 2
-    }
-
     // MARK: - All-spaces via the private CoreGraphics window-space API
-    //
-    // The collection-behaviour bit that makes a window appear on every space is
-    // only exposed for our own NSWindows; for another process we use the private
-    // CGS space API (the same one window managers like yabai use). It's wrapped
-    // in availability/symbol guards so a future macOS that drops it just no-ops
-    // and pinning falls back to always-on-top + frame locking.
 
     private func setAllSpaces(_ enabled: Bool, for element: AXUIElement) {
         guard let windowID = windowID(of: element) else { return }
@@ -175,6 +159,15 @@ final class PhoneWindowPinner {
         // window element to its CGWindowID.
         let result = _AXUIElementGetWindow(element, &wid)
         return result == .success && wid != 0 ? wid : nil
+    }
+
+    /// The scrcpy window's current frame, in **AppKit screen coordinates**
+    /// (bottom-left origin), suitable for persisting and feeding back to scrcpy.
+    /// scrcpy's `--window-x/-y` use top-left origin, so callers that pass these
+    /// back convert as needed; we expose the raw AX (top-left) frame too.
+    func currentScrcpyFrame() -> CGRect? {
+        guard let element = scrcpyWindowElement() else { return nil }
+        return currentFrame(of: element)
     }
 }
 

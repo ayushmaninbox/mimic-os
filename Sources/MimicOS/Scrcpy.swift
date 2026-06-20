@@ -25,12 +25,15 @@ final class Scrcpy {
         /// Where the phone's audio should play while mirroring.
         var audio: AudioRoute = .mac
         /// Keep scrcpy's mirror window above other windows. Maps to
-        /// `--always-on-top`. The "pin across all spaces / lock frame" behaviour
-        /// is layered on top via the Accessibility API in `PhoneWindowPinner`.
+        /// `--always-on-top`. The "show on all spaces" behaviour is layered on
+        /// top via the Accessibility / CGS APIs in `PhoneWindowPinner`.
         var alwaysOnTop: Bool = false
         /// A stable window title so we can find scrcpy's window via the
         /// Accessibility API for pinning. Maps to `--window-title`.
         var windowTitle: String? = nil
+        /// Restore the window's last position/size (top-left origin, points).
+        /// Maps to `--window-x/--window-y/--window-width/--window-height`.
+        var windowFrame: CGRect? = nil
 
         func asArguments() -> [String] {
             var args: [String] = []
@@ -41,6 +44,14 @@ final class Scrcpy {
             if useHIDKeyboard { args.append("--keyboard=uhid") }
             if alwaysOnTop { args.append("--always-on-top") }
             if let windowTitle { args.append(contentsOf: ["--window-title", windowTitle]) }
+            if let f = windowFrame, f.width > 1, f.height > 1 {
+                args.append(contentsOf: [
+                    "--window-x", "\(Int(f.origin.x))",
+                    "--window-y", "\(Int(f.origin.y))",
+                    "--window-width", "\(Int(f.width))",
+                    "--window-height", "\(Int(f.height))",
+                ])
+            }
             args.append(contentsOf: audio.arguments)
             return args
         }
