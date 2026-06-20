@@ -461,5 +461,73 @@ enum ADB {
                                               "-p", package, "-c", "android.intent.category.LAUNCHER", "1"])
     }
 
+    // MARK: - Screen capture & recording
+
+    /// Captures a PNG screenshot of the phone screen straight to a local file on
+    /// the Mac. Uses `exec-out screencap -p` so the image bytes stream over adb
+    /// without ever touching the phone's storage. Returns the saved URL on
+    /// success, or nil. Works whether or not a scrcpy mirror is open.
+    static func screenshot(_ serial: String, to localFile: URL) async -> URL? {
+        let result = await Shell.runData(ToolLocator.adb,
+                                         ["-s", serial, "exec-out", "screencap", "-p"])
+        guard result.exitCode == 0, !result.stdout.isEmpty else { return nil }
+        do {
+            try result.stdout.write(to: localFile)
+            return localFile
+        } catch {
+            return nil
+        }
+    }
+
+    /// Starts `screenrecord` on the phone, writing to a temp path on the phone.
+    /// Returns the live `Process` and the remote path so the caller can stop it
+    /// (terminate the process / send SIGINT) and then pull the finished file.
+    /// `screenrecord` caps at ~3 minutes per Android's limit; we set --time-limit
+    /// to the max so it ends cleanly if not stopped sooner.
+    static func startScreenRecord(_ serial: String, remotePath: String,
+                                  onStart: @escaping @Sendable (Process) -> Void) -> Bool {
+        let args = ["-s", serial, "shell", "screenrecord", "--time-limit", "180", remotePath]
+        let proc = Shell.launch(ToolLocator.adb, args)
+        if let proc { onStart(proc) }
+        return proc != nil
+    }
+
+    /// After stopping a recording, pulls the .mp4 off the phone into `localFile`
+    /// and deletes the temp file on the phone. Returns the saved URL or nil.
+    static func finishScreenRecord(_ serial: String, remotePath: String,
+                                   localFile: URL) async -> URL? {
+        // screenrecord finalizes the MP4 moov atom only after it gets SIGINT and
+        // exits; give it a beat to flush before we pull.
+        try? await Task.sleep(for: .milliseconds(800))
+        let pull = await Shell.run(ToolLocator.adb,
+                                   ["-s", serial, "pull", remotePath, localFile.path])
+        _ = await delete(serial, path: remotePath)
+        guard pull.succeeded,
+              FileManager.default.fileExists(atPath: localFile.path) else { return nil }
+        return localFile
+    }
+
+    // MARK: - Display rotation
+
+    /// Reads the current user rotation (0–3, where each step is 90°). nil if the
+    /// phone doesn't expose it.
+    static func userRotation(_ serial: String) async -> Int? {
+        let result = await Shell.run(ToolLocator.adb,
+            ["-s", serial, "shell", "settings", "get", "system", "user_rotation"])
+        return Int(result.stdout.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    /// Rotates the phone display 90° clockwise. Disables accelerometer-driven
+    /// auto-rotate first (otherwise the phone snaps back), then bumps
+    /// `user_rotation` to the next 90° step.
+    static func rotateDisplay(_ serial: String) async {
+        _ = await Shell.run(ToolLocator.adb,
+            ["-s", serial, "shell", "settings", "put", "system", "accelerometer_rotation", "0"])
+        let current = await userRotation(serial) ?? 0
+        let next = (current + 1) % 4
+        _ = await Shell.run(ToolLocator.adb,
+            ["-s", serial, "shell", "settings", "put", "system", "user_rotation", "\(next)"])
+    }
+
 }
 

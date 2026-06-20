@@ -21,6 +21,8 @@ struct ContentView: View {
         }
         .onAppear {
             #if os(macOS)
+            // The window is showing, so make sure we're a regular foreground app
+            // (the AppDelegate may have dropped us to .accessory in the menu bar).
             NSApp.setActivationPolicy(.regular)
             NSApp.activate(ignoringOtherApps: true)
             #endif

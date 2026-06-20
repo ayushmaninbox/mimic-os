@@ -1,0 +1,105 @@
+import Foundation
+import Observation
+
+/// App-wide preferences persisted on the Mac via `UserDefaults`. Distinct from
+/// `DeviceStore`, which holds per-phone bookkeeping; this is for global toggles
+/// and paths the user sets in the Settings tab.
+@MainActor
+@Observable
+final class AppSettings {
+    private static let captureFolderKey = "MimicOS.captureFolderBookmark"
+    private static let captureFolderPathKey = "MimicOS.captureFolderPath"
+    private static let autoReconnectKey = "MimicOS.autoReconnect"
+    private static let pinPhoneWindowKey = "MimicOS.pinPhoneWindow"
+    private static let runInBackgroundKey = "MimicOS.runInBackground"
+
+    private var defaults: UserDefaults { .standard }
+
+    /// Folder where screenshots and screen recordings are saved. Defaults to
+    /// `~/Pictures/MimicOS` and is created on first use.
+    var captureFolder: URL {
+        didSet { persistCaptureFolder() }
+    }
+
+    /// Auto-reconnect wireless devices when they reappear on the network after a
+    /// drop (e.g. Wi-Fi or hotspot coming back). Asked about on first drop.
+    var autoReconnect: Bool {
+        didSet { defaults.set(autoReconnect, forKey: Self.autoReconnectKey) }
+    }
+
+    /// True if the user has been asked about auto-reconnect at least once, so we
+    /// don't keep prompting.
+    var autoReconnectAsked: Bool {
+        didSet { defaults.set(autoReconnectAsked, forKey: "MimicOS.autoReconnectAsked") }
+    }
+
+    /// Keep the mirrored phone window pinned (always-on-top + all spaces, locked
+    /// frame). Toggled from the sidebar pin button; persisted so it survives
+    /// relaunches and reapplies to new mirror sessions.
+    var pinPhoneWindow: Bool {
+        didSet { defaults.set(pinPhoneWindow, forKey: Self.pinPhoneWindowKey) }
+    }
+
+    /// Keep MimicOS running in the background (menu-bar agent) when the main
+    /// window is closed, instead of quitting.
+    var runInBackground: Bool {
+        didSet { defaults.set(runInBackground, forKey: Self.runInBackgroundKey) }
+    }
+
+    init() {
+        // Reference UserDefaults directly here — the `defaults` computed property
+        // touches `self`, which isn't allowed until all stored props are set.
+        let store = UserDefaults.standard
+        autoReconnect = store.object(forKey: Self.autoReconnectKey) as? Bool ?? true
+        autoReconnectAsked = store.bool(forKey: "MimicOS.autoReconnectAsked")
+        pinPhoneWindow = store.bool(forKey: Self.pinPhoneWindowKey)
+        runInBackground = store.object(forKey: Self.runInBackgroundKey) as? Bool ?? true
+
+        // Resolve the saved capture folder, falling back to ~/Pictures/MimicOS.
+        let fallback = FileManager.default
+            .urls(for: .picturesDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("MimicOS", isDirectory: true)
+            ?? FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("MimicOS", isDirectory: true)
+
+        if let bookmark = store.data(forKey: Self.captureFolderKey) {
+            var stale = false
+            if let url = try? URL(resolvingBookmarkData: bookmark,
+                                  options: [.withSecurityScope],
+                                  relativeTo: nil,
+                                  bookmarkDataIsStale: &stale) {
+                captureFolder = url
+            } else if let path = store.string(forKey: Self.captureFolderPathKey) {
+                captureFolder = URL(fileURLWithPath: path, isDirectory: true)
+            } else {
+                captureFolder = fallback
+            }
+        } else if let path = store.string(forKey: Self.captureFolderPathKey) {
+            captureFolder = URL(fileURLWithPath: path, isDirectory: true)
+        } else {
+            captureFolder = fallback
+        }
+
+        ensureCaptureFolderExists()
+    }
+
+    /// Creates the capture folder if it doesn't exist yet. Returns the folder.
+    @discardableResult
+    func ensureCaptureFolderExists() -> URL {
+        try? FileManager.default.createDirectory(at: captureFolder,
+                                                 withIntermediateDirectories: true)
+        return captureFolder
+    }
+
+    private func persistCaptureFolder() {
+        defaults.set(captureFolder.path, forKey: Self.captureFolderPathKey)
+        // A security-scoped bookmark survives sandboxing/restarts when the user
+        // picks a folder outside the app's default location.
+        if let bookmark = try? captureFolder.bookmarkData(options: [.withSecurityScope],
+                                                          includingResourceValuesForKeys: nil,
+                                                          relativeTo: nil) {
+            defaults.set(bookmark, forKey: Self.captureFolderKey)
+        }
+        ensureCaptureFolderExists()
+    }
+}

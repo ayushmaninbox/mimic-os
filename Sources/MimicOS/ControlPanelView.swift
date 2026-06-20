@@ -24,22 +24,26 @@ struct ControlPanelView: View {
                 }
             } else {
                 @Bindable var model = model
-                VStack(spacing: 0) {
-                    DeviceDetailHeader(device: device) {
-                        renameRequest = RenameRequest(serial: device.serial,
-                                                      initialName: device.customName ?? device.displayName)
-                    }
-                    Divider()
-                    TabNavBar(selection: $model.selectedTab)
-                    Divider()
-                    Group {
-                        switch model.selectedTab {
-                        case .control:        ControlTab()
-                        case .files:          FilesTab()
-                        case .settings:       SettingsTab()
+                HStack(spacing: 0) {
+                    VStack(spacing: 0) {
+                        DeviceDetailHeader(device: device) {
+                            renameRequest = RenameRequest(serial: device.serial,
+                                                          initialName: device.customName ?? device.displayName)
                         }
+                        Divider()
+                        TabNavBar(selection: $model.selectedTab)
+                        Divider()
+                        Group {
+                            switch model.selectedTab {
+                            case .control:        ControlTab()
+                            case .files:          FilesTab()
+                            case .settings:       SettingsTab()
+                            }
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    Divider()
+                    DeviceControlRail()
                 }
                 .quickLookPreview($model.activePreviewURL)
                 .sheet(item: $renameRequest) { request in
@@ -50,12 +54,146 @@ struct ControlPanelView: View {
                         renameRequest = nil
                     }
                 }
+                .overlay(alignment: .top) {
+                    if let name = model.autoReconnectPrompt {
+                        AutoReconnectBanner(deviceName: name)
+                            .padding(.top, 8)
+                    }
+                }
             }
         } else {
             ContentUnavailableView("No device selected",
                                    systemImage: "iphone",
                                    description: Text("Pick a device from the sidebar, or connect one over USB."))
         }
+    }
+}
+
+// MARK: - Right-hand control rail
+//
+// A persistent vertical toolbar of hardware-style buttons that act on the
+// selected device: power, volume, rotate, pin window, screenshot, screen
+// record, plus shortcuts to the Settings and Files tabs.
+
+private struct DeviceControlRail: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        VStack(spacing: 4) {
+            RailButton(systemName: "power", help: "Power (toggle screen)") {
+                Task { await model.togglePower() }
+            }
+            RailButton(systemName: "speaker.wave.2.fill", help: "Volume up") {
+                Task { await model.volumeUp() }
+            }
+            RailButton(systemName: "speaker.wave.1.fill", help: "Volume down") {
+                Task { await model.volumeDown() }
+            }
+            RailButton(systemName: "rotate.right", help: "Rotate screen 90°") {
+                Task { await model.rotateScreen() }
+            }
+
+            RailDivider()
+
+            RailButton(systemName: model.settings.pinPhoneWindow ? "pin.fill" : "pin",
+                       help: "Pin phone window (always on top · all spaces)",
+                       isActive: model.settings.pinPhoneWindow) {
+                model.togglePinPhoneWindow()
+            }
+            RailButton(systemName: "camera.fill", help: "Screenshot → capture folder") {
+                Task { await model.captureScreenshot() }
+            }
+            RailButton(systemName: model.isRecording ? "stop.circle.fill" : "record.circle",
+                       help: model.isRecording ? "Stop recording" : "Record screen → capture folder",
+                       isActive: model.isRecording,
+                       activeTint: .red) {
+                Task { await model.toggleScreenRecording() }
+            }
+
+            RailDivider()
+
+            RailButton(systemName: "folder.fill", help: "Open Files tab",
+                       isActive: model.selectedTab == .files) {
+                model.selectedTab = .files
+            }
+            RailButton(systemName: "gearshape.fill", help: "Open Settings tab",
+                       isActive: model.selectedTab == .settings) {
+                model.selectedTab = .settings
+            }
+
+            Spacer()
+        }
+        .padding(.vertical, 10)
+        .padding(.horizontal, 6)
+        .frame(width: 52)
+        .background(.bar)
+    }
+}
+
+private struct RailDivider: View {
+    var body: some View {
+        Divider()
+            .frame(width: 28)
+            .padding(.vertical, 4)
+    }
+}
+
+private struct RailButton: View {
+    let systemName: String
+    let help: String
+    var isActive: Bool = false
+    var activeTint: Color = .accentColor
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.system(size: 15, weight: .medium))
+                .foregroundStyle(isActive ? AnyShapeStyle(activeTint) : AnyShapeStyle(.primary))
+                .frame(width: 38, height: 34)
+                .background(
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(isActive ? AnyShapeStyle(activeTint.opacity(0.16))
+                                       : (hovering ? AnyShapeStyle(.quaternary.opacity(0.5))
+                                                   : AnyShapeStyle(.clear)))
+                )
+        }
+        .buttonStyle(.plain)
+        .help(help)
+        .onHover { hovering = $0 }
+    }
+}
+
+// MARK: - Auto-reconnect prompt banner
+
+private struct AutoReconnectBanner: View {
+    @Environment(AppModel.self) private var model
+    let deviceName: String
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "wifi.exclamationmark")
+                .foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("\(deviceName) disconnected")
+                    .font(.callout).bold()
+                Text("Automatically reconnect this device when it's back on the network?")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button("Not now") { model.answerAutoReconnectPrompt(enable: false) }
+                .buttonStyle(.bordered)
+            Button("Auto-reconnect") { model.answerAutoReconnectPrompt(enable: true) }
+                .buttonStyle(.borderedProminent)
+        }
+        .padding(12)
+        .background(.regularMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(.quaternary, lineWidth: 1))
+        .shadow(color: .black.opacity(0.15), radius: 8, y: 4)
+        .padding(.horizontal, 16)
+        .frame(maxWidth: 560)
     }
 }
 
@@ -107,6 +245,7 @@ private struct SettingsTab: View {
 
     var body: some View {
         @Bindable var model = model
+        @Bindable var settings = model.settings
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 SectionCard(title: "Mirror options", systemImage: "rectangle.on.rectangle") {
@@ -135,9 +274,76 @@ private struct SettingsTab: View {
                     Text("When you take a screenshot on the phone, MimicOS detects it and places the image on your Mac's clipboard so you can paste it straight into any app.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
+                Divider()
+                CaptureFolderSection()
+                Divider()
+                SectionCard(title: "Connection", systemImage: "antenna.radiowaves.left.and.right") {
+                    Toggle("Auto-reconnect wireless devices when they return",
+                           isOn: $settings.autoReconnect)
+                        .font(.body)
+                    Text("If your Wi-Fi or the phone's hotspot drops and comes back, MimicOS reconnects the device automatically. You'll be asked once the first time a device drops.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Divider()
+                SectionCard(title: "Phone window", systemImage: "pin") {
+                    Toggle("Pin the mirror window (always on top, on every space)",
+                           isOn: Binding(
+                            get: { model.settings.pinPhoneWindow },
+                            set: { _ in model.togglePinPhoneWindow() }))
+                        .font(.body)
+                    Text("Keeps scrcpy's phone window floating above other apps, locked in size and position, and visible on every Mission Control space. Requires Accessibility access (you'll be prompted). Same as the pin button on the right rail.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Divider()
+                SectionCard(title: "Background", systemImage: "menubar.arrow.up.rectangle") {
+                    Toggle("Keep MimicOS running in the menu bar when the window is closed",
+                           isOn: $settings.runInBackground)
+                        .font(.body)
+                    Text("MimicOS stays in the menu bar so it can keep your device connected and let you capture screenshots/recordings without reopening the window. It idles at near-zero CPU. Turn this off to quit fully when you close the window.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             }
             .padding(20)
         }
+    }
+}
+
+// MARK: - Capture folder picker
+
+private struct CaptureFolderSection: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        SectionCard(title: "Capture folder", systemImage: "folder.badge.gearshape") {
+            HStack(spacing: 10) {
+                Image(systemName: "folder")
+                    .foregroundStyle(.secondary)
+                Text(model.settings.captureFolder.path)
+                    .font(.callout)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
+                Spacer()
+                Button("Reveal") {
+                    NSWorkspace.shared.activateFileViewerSelecting(
+                        [model.settings.ensureCaptureFolderExists()])
+                }
+                Button("Change…") { chooseFolder() }
+            }
+            Text("Screenshots and screen recordings taken from the right rail or the menu bar are saved here.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    private func chooseFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Choose"
+        panel.directoryURL = model.settings.captureFolder
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        model.settings.captureFolder = url
     }
 }
 

@@ -74,9 +74,18 @@ final class AppModel {
         }
     }
 
+    /// Global preferences (capture folder, auto-reconnect, pin, background).
+    let settings = AppSettings()
+
+    /// Controls pinning of scrcpy's mirror window (always-on-top / all spaces).
+    private let pinner = PhoneWindowPinner()
+
     private let scrcpy = Scrcpy()
     private let headlessScrcpy = Scrcpy()
     private var headlessSerial: String?
+
+    /// Stable window title handed to scrcpy so the pinner can find its window.
+    private var mirrorWindowTitle: String?
 
     /// Serial of the device currently being mirrored, or nil. This is observable
     /// (unlike `scrcpy.isRunning`), so the UI updates the moment we start/stop.
@@ -119,10 +128,96 @@ final class AppModel {
         }
         await ADB.startServer()
         await refreshDevices()
+        startBackgroundMonitor()
     }
 
     func onDisappear() {
         // Bonjour browser not used anymore
+    }
+
+    // MARK: - Background device monitor (powers auto-reconnect)
+
+    @ObservationIgnored private var monitorTask: Task<Void, Never>?
+
+    /// Serials of wireless devices that were connected and then dropped, so we
+    /// know which ones to auto-reconnect when they come back on the network.
+    @ObservationIgnored private var droppedWirelessSerials: Set<String> = []
+
+    /// Wireless serials that were usable on the previous refresh, used to detect
+    /// the moment one drops off.
+    @ObservationIgnored private var previouslyUsableWirelessSerials: Set<String> = []
+
+    /// True for a wireless `ip:port` serial.
+    private func isWirelessSerial(_ serial: String) -> Bool {
+        serial.contains(":") && serial.split(separator: ":").first.map { $0.contains(".") } == true
+    }
+
+    /// On the very first wireless drop, ask the user whether to enable
+    /// auto-reconnect (only once — the answer is remembered).
+    private func maybePromptAutoReconnect(for serial: String) {
+        guard !settings.autoReconnectAsked else { return }
+        settings.autoReconnectAsked = true
+        autoReconnectPrompt = displayName(for: serial)
+    }
+
+    /// Resolve the auto-reconnect prompt with the user's choice.
+    func answerAutoReconnectPrompt(enable: Bool) {
+        settings.autoReconnect = enable
+        autoReconnectPrompt = nil
+        status = enable ? "Auto-reconnect on" : "Auto-reconnect off"
+    }
+
+    /// Pending request to ask the user whether to enable auto-reconnect. The UI
+    /// observes this and shows a one-time prompt on the first wireless drop.
+    var autoReconnectPrompt: String?
+
+    /// Periodically refreshes the device list at a low cadence so drops and
+    /// returns are noticed even when the window is idle. Lightweight: a single
+    /// `adb devices` every few seconds, scaled back when nothing's connected.
+    private func startBackgroundMonitor() {
+        guard monitorTask == nil else { return }
+        monitorTask = Task { [weak self] in
+            while !Task.isCancelled {
+                // Idle-friendly cadence: 3s when something is connected (so we
+                // catch drops quickly), 6s when nothing is, to stay near-zero CPU.
+                let anyConnected = await MainActor.run {
+                    self?.devices.contains { $0.state.isUsable } ?? false
+                }
+                try? await Task.sleep(for: .seconds(anyConnected ? 3 : 6))
+                guard let self, !Task.isCancelled else { return }
+                await self.monitorTick()
+            }
+        }
+    }
+
+    /// One monitor pass: refresh, then auto-reconnect any wireless device that
+    /// had dropped and is now reachable again (if the setting is on).
+    private func monitorTick() async {
+        guard toolsReady, !isWorking, !isConnecting else { return }
+        await refreshDevices()
+        await attemptAutoReconnects()
+    }
+
+    /// Tracks transitions to offline for wireless devices and tries to bring back
+    /// any that have reappeared. Called from the monitor and after each refresh.
+    private func attemptAutoReconnects() async {
+        guard settings.autoReconnect else { return }
+
+        // Snapshot so we can safely mutate the set inside the loop.
+        for serial in Array(droppedWirelessSerials) {
+            // If this dropped wireless serial is reachable again, reconnect it.
+            let connected = await ADB.connectVerified(hostPort: serial, attempts: 1)
+            if connected {
+                DeviceStore.connect(serial)
+                droppedWirelessSerials.remove(serial)
+                await refreshDevices()
+                status = "Auto-reconnected \(displayName(for: serial))"
+            }
+        }
+    }
+
+    private func displayName(for serial: String) -> String {
+        devices.first { $0.serial == serial }?.displayName ?? serial
     }
 
     // MARK: - Devices
@@ -149,6 +244,23 @@ final class AppModel {
         }
 
         let currentlyPresentSerials = Set(found.map(\.serial))
+
+        // Detect wireless devices that just dropped (were usable last refresh,
+        // now absent or offline and not deliberately disconnected) so the
+        // auto-reconnect monitor can bring them back when they reappear.
+        let usableNow = Set(foundRaw.filter { $0.state.isUsable }.map(\.serial))
+        let manuallyDisconnected = DeviceStore.disconnectedSerials()
+        for serial in previouslyUsableWirelessSerials where !usableNow.contains(serial) {
+            guard !manuallyDisconnected.contains(serial) else { continue }
+            if droppedWirelessSerials.insert(serial).inserted {
+                maybePromptAutoReconnect(for: serial)
+            }
+        }
+        // Remember which wireless serials are usable this pass for next time.
+        previouslyUsableWirelessSerials = Set(
+            foundRaw.filter { $0.state.isUsable && isWirelessSerial($0.serial) }.map(\.serial)
+        )
+
         previousPresentSerials = currentlyPresentSerials
 
         // Enrich with friendly model names + custom names, and remember the
@@ -351,6 +463,8 @@ final class AppModel {
         }
         if isMirroring {
             mirroringSerial = nil
+            pinner.unpin()
+            mirrorWindowTitle = nil
             scrcpy.stop()
             status = "Mirror stopped"
             updateBackgroundClipboardSync()
@@ -359,17 +473,24 @@ final class AppModel {
             headlessScrcpy.stop()
             headlessSerial = nil
 
+            let title = "MimicOS — \(selectedDevice?.displayName ?? serial)"
+            mirrorWindowTitle = title
+
             var options = Scrcpy.Options()
             options.turnScreenOff = turnScreenOff
             options.stayAwake = stayAwake
             options.useHIDKeyboard = useHIDKeyboard
             options.audio = audioRoute
+            options.alwaysOnTop = settings.pinPhoneWindow
+            options.windowTitle = title
             // Clear our observable state when scrcpy exits on its own (e.g. the
             // user closes the mirror window) so the button flips back to Start.
             let ok = scrcpy.start(serial: serial, options: options) { [weak self] status, errText in
                 Task { @MainActor in
                     if self?.mirroringSerial == serial {
                         self?.mirroringSerial = nil
+                        self?.pinner.unpin()
+                        self?.mirrorWindowTitle = nil
                         if status != 0 && !errText.isEmpty {
                             let cleanErr = errText.split(separator: "\n").last.map(String.init) ?? errText
                             self?.status = "Mirror failed: \(cleanErr.trimmingCharacters(in: .whitespacesAndNewlines))"
@@ -384,7 +505,39 @@ final class AppModel {
             status = ok
                 ? (turnScreenOff ? "Mirroring (phone screen off)" : "Mirroring")
                 : "Failed to start scrcpy"
+
+            // If pinning is on, wait for scrcpy's window to appear, then pin it.
+            if ok && settings.pinPhoneWindow {
+                Task { [weak self] in
+                    try? await Task.sleep(for: .seconds(1))
+                    self?.applyPinIfEnabled()
+                }
+            }
         }
+    }
+
+    /// Toggle whether the mirrored phone window is pinned (always-on-top + all
+    /// spaces + locked frame). Persists the choice and applies it live if a
+    /// mirror is running. New mirror sessions launch pinned while this is on.
+    func togglePinPhoneWindow() {
+        settings.pinPhoneWindow.toggle()
+        if settings.pinPhoneWindow {
+            applyPinIfEnabled()
+            status = isMirroring ? "Phone window pinned" : "Phone window will be pinned when you mirror"
+        } else {
+            pinner.unpin()
+            status = "Phone window unpinned"
+        }
+    }
+
+    /// Pin the live scrcpy window if pinning is enabled and a mirror is running.
+    private func applyPinIfEnabled() {
+        guard settings.pinPhoneWindow, isMirroring, let title = mirrorWindowTitle else { return }
+        // Surface the Accessibility-permission prompt if it isn't granted yet.
+        if !PhoneWindowPinner.ensureAccessibilityPermission(prompt: true) {
+            status = "Grant MimicOS Accessibility access (System Settings ▸ Privacy) to pin the phone window."
+        }
+        pinner.pin(windowTitle: title)
     }
 
     func updateBackgroundClipboardSync() {
@@ -1360,6 +1513,127 @@ final class AppModel {
         guard let serial = selectedSerial else { return }
         await ADB.keyEvent(serial, keycode: 26)
         status = "POWER"
+    }
+
+    /// Android keycodes for the hardware volume keys.
+    func volumeUp() async {
+        guard let serial = selectedSerial else { return }
+        await ADB.keyEvent(serial, keycode: 24)   // KEYCODE_VOLUME_UP
+        status = "Volume up"
+    }
+
+    func volumeDown() async {
+        guard let serial = selectedSerial else { return }
+        await ADB.keyEvent(serial, keycode: 25)   // KEYCODE_VOLUME_DOWN
+        status = "Volume down"
+    }
+
+    /// Rotate the phone display 90° clockwise.
+    func rotateScreen() async {
+        guard let serial = selectedSerial else {
+            status = "Select a device first"
+            return
+        }
+        await ADB.rotateDisplay(serial)
+        status = "Rotated screen"
+    }
+
+    // MARK: - Screenshot & screen recording (to the user's capture folder)
+
+    /// Captures a phone screenshot straight into the configured capture folder
+    /// and reveals it in Finder. Works with or without an active mirror.
+    func captureScreenshot() async {
+        guard let serial = selectedSerial,
+              selectedDevice?.state.isUsable == true else {
+            status = "Select a connected device first"
+            return
+        }
+        let folder = settings.ensureCaptureFolderExists()
+        let name = "Screenshot-\(Self.timestamp()).png"
+        let dest = folder.appendingPathComponent(name)
+        status = "Taking screenshot…"
+        if let url = await ADB.screenshot(serial, to: dest) {
+            status = "Saved \(name)"
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        } else {
+            status = "Screenshot failed"
+        }
+    }
+
+    /// True while a phone screen recording is in progress.
+    private(set) var isRecording = false
+    @ObservationIgnored private var recordProcess: Process?
+    @ObservationIgnored private var recordRemotePath: String?
+    @ObservationIgnored private var recordDest: URL?
+    @ObservationIgnored private var recordSerial: String?
+
+    /// Start or stop a screen recording, saved to the capture folder on stop.
+    func toggleScreenRecording() async {
+        if isRecording {
+            await stopScreenRecording()
+        } else {
+            await startScreenRecording()
+        }
+    }
+
+    private func startScreenRecording() async {
+        guard let serial = selectedSerial,
+              selectedDevice?.state.isUsable == true else {
+            status = "Select a connected device first"
+            return
+        }
+        let folder = settings.ensureCaptureFolderExists()
+        let name = "Recording-\(Self.timestamp()).mp4"
+        let remotePath = "/sdcard/MimicOS-rec-\(UUID().uuidString).mp4"
+        recordDest = folder.appendingPathComponent(name)
+        recordRemotePath = remotePath
+        recordSerial = serial
+
+        let started = ADB.startScreenRecord(serial, remotePath: remotePath) { [weak self] proc in
+            Task { @MainActor in self?.recordProcess = proc }
+        }
+        if started {
+            isRecording = true
+            status = "Recording… (tap again to stop · max 3 min)"
+        } else {
+            status = "Couldn't start recording"
+            recordDest = nil
+            recordRemotePath = nil
+            recordSerial = nil
+        }
+    }
+
+    private func stopScreenRecording() async {
+        guard let serial = recordSerial,
+              let remotePath = recordRemotePath,
+              let dest = recordDest else {
+            isRecording = false
+            return
+        }
+        // SIGINT lets screenrecord finalize the MP4 (terminate() sends SIGTERM,
+        // which truncates it); fall back to terminate if interrupt isn't enough.
+        if let proc = recordProcess, proc.isRunning {
+            proc.interrupt()
+        }
+        isRecording = false
+        status = "Saving recording…"
+        recordProcess = nil
+
+        if let url = await ADB.finishScreenRecord(serial, remotePath: remotePath, localFile: dest) {
+            status = "Saved \(url.lastPathComponent)"
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        } else {
+            status = "Recording failed to save"
+        }
+        recordRemotePath = nil
+        recordDest = nil
+        recordSerial = nil
+    }
+
+    private static func timestamp() -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd 'at' HH.mm.ss"
+        return formatter.string(from: Date())
     }
 }
 

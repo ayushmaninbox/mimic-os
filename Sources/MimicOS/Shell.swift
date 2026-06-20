@@ -9,6 +9,16 @@ struct ProcessResult {
     var succeeded: Bool { exitCode == 0 }
 }
 
+/// Like `ProcessResult` but keeps stdout as raw bytes — needed for binary output
+/// such as `screencap -p` PNG data, which UTF-8 decoding would corrupt.
+struct ProcessDataResult {
+    let exitCode: Int32
+    let stdout: Data
+    let stderr: String
+
+    var succeeded: Bool { exitCode == 0 }
+}
+
 /// Thin async wrapper around `Process` for launching CLI tools.
 enum Shell {
     /// Runs an executable to completion and captures its output.
@@ -54,6 +64,53 @@ enum Shell {
                     stdout: "",
                     stderr: "Failed to launch \(launchPath): \(error.localizedDescription)"
                 ))
+            }
+        }
+    }
+
+    /// Like `run`, but keeps stdout as raw `Data` for binary output (e.g. a PNG
+    /// streamed from `screencap -p`). Reads stdout on a background pipe so large
+    /// captures don't deadlock the fixed-size pipe buffer.
+    static func runData(_ launchPath: String, _ arguments: [String]) async -> ProcessDataResult {
+        await withCheckedContinuation { continuation in
+            let process = Process()
+            if launchPath.contains("/") {
+                process.executableURL = URL(fileURLWithPath: launchPath)
+                process.arguments = arguments
+            } else {
+                process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+                process.arguments = [launchPath] + arguments
+            }
+            process.environment = ToolLocator.toolEnvironment()
+
+            let outPipe = Pipe()
+            let errPipe = Pipe()
+            process.standardOutput = outPipe
+            process.standardError = errPipe
+
+            // Drain stdout concurrently to avoid filling the OS pipe buffer on
+            // big images, which would otherwise stall the child process.
+            final class Box: @unchecked Sendable { var data = Data() }
+            let box = Box()
+            let outHandle = outPipe.fileHandleForReading
+            let drain = DispatchQueue(label: "com.ayushman.mimicos.shell.runData")
+            drain.async { box.data = outHandle.readDataToEndOfFile() }
+
+            process.terminationHandler = { proc in
+                let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                drain.sync {}   // ensure the stdout read finished
+                continuation.resume(returning: ProcessDataResult(
+                    exitCode: proc.terminationStatus,
+                    stdout: box.data,
+                    stderr: String(decoding: errData, as: UTF8.self)))
+            }
+
+            do {
+                try process.run()
+            } catch {
+                continuation.resume(returning: ProcessDataResult(
+                    exitCode: -1, stdout: Data(),
+                    stderr: "Failed to launch \(launchPath): \(error.localizedDescription)"))
             }
         }
     }
