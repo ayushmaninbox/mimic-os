@@ -86,7 +86,7 @@ final class AppModel {
     /// Shared, event-driven tracker for scrcpy's window (drives the floating
     /// remote off live AXObserver callbacks — no polling — and enforces the
     /// window's minimum size).
-    @ObservationIgnored private let windowTracker = ScrcpyWindowTracker()
+    @ObservationIgnored let windowTracker = ScrcpyWindowTracker()
 
     /// The attached floating remote-control window shown beside the phone screen.
     @ObservationIgnored let floatingRemote = FloatingRemoteController()

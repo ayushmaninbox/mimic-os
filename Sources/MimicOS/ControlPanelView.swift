@@ -310,9 +310,36 @@ private struct AutomationSection: View {
                 QuickControlButton(systemName: "power", help: "Power (toggle screen)") {
                     Task { await model.togglePower() }
                 }
+
+                Divider().frame(height: 24)
+
+                QuickControlButton(
+                    systemName: model.isSilent ? "bell.slash.fill" : "bell",
+                    help: model.isSilent ? "Turn silent off" : "Silent mode",
+                    tint: model.isSilent ? .orange : nil
+                ) {
+                    Task { await model.toggleSilent() }
+                }
+                QuickControlButton(
+                    systemName: model.isVibrate ? "bell.and.waves.left.and.right.fill" : "bell.and.waves.left.and.right",
+                    help: model.isVibrate ? "Turn vibrate off" : "Vibrate mode",
+                    tint: model.isVibrate ? .blue : nil
+                ) {
+                    Task { await model.toggleVibrate() }
+                }
+                QuickControlButton(
+                    systemName: model.isDND ? "moon.fill" : "moon",
+                    help: model.isDND ? "Turn DND off" : "Do Not Disturb",
+                    tint: model.isDND ? .purple : nil
+                ) {
+                    Task { await model.toggleDND() }
+                }
             }
-            Text("Hover a button for its name. Power toggles the screen. The same controls float beside the phone screen while mirroring.")
+            Text("Hover a button for its name. Power toggles the screen. Silent, Vibrate, and DND states sync live.")
                 .font(.caption).foregroundStyle(.secondary)
+        }
+        .onAppear {
+            Task { await model.refreshRingerAndDNDStatus() }
         }
     }
 }
@@ -320,6 +347,7 @@ private struct AutomationSection: View {
 private struct QuickControlButton: View {
     let systemName: String
     let help: String
+    var tint: Color? = nil
     let action: () -> Void
     @State private var hovering = false
 
@@ -327,6 +355,7 @@ private struct QuickControlButton: View {
         Button(action: action) {
             Image(systemName: systemName)
                 .font(.system(size: 16, weight: .medium))
+                .foregroundStyle(tint.map(AnyShapeStyle.init) ?? AnyShapeStyle(.primary))
                 .frame(width: 40, height: 34)
                 .background(RoundedRectangle(cornerRadius: 8)
                     .fill(hovering ? AnyShapeStyle(.quaternary.opacity(0.6)) : AnyShapeStyle(.quaternary.opacity(0.25))))

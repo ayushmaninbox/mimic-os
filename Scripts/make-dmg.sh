@@ -90,13 +90,13 @@ echo '
        set current view of container window to icon view
        set toolbar visible of container window to false
        set statusbar visible of container window to false
-       set the bounds of container window to {100, 100, 640, 400}
+       set the bounds of container window to {100, 100, 640, 560}
        set viewOptions to the icon view options of container window
        set arrangement of viewOptions to not arranged
        set icon size of viewOptions to 96
        set position of item "'"$APP_NAME.app"'" of container window to {140, 120}
        set position of item "Applications" of container window to {400, 120}
-       set position of item "Readme (If App Does Not Open).txt" of container window to {270, 240}
+       set position of item "Readme (If App Does Not Open).txt" of container window to {270, 260}
        close
        open
        update without registering applications

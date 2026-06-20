@@ -13,6 +13,7 @@ final class FloatingRemoteController {
     private let stripWidth: CGFloat = 56
     private let gap: CGFloat = 0
     private var enabled = true
+    private var spaceObserver: NSObjectProtocol?
 
     /// Position the strip flush to the phone window for the given frame, which is
     /// supplied live by the window tracker. `frame` is top-left-origin screen
@@ -21,6 +22,11 @@ final class FloatingRemoteController {
     /// every app.
     func update(for frame: CGRect, phoneWindowID: CGWindowID?) {
         guard enabled, let panel else { return }
+
+        if let wid = phoneWindowID, !isWindowOnActiveSpace(wid) {
+            panel.orderOut(nil)
+            return
+        }
 
         // Convert the AX (top-left) frame to AppKit (bottom-left) coordinates,
         // choosing the screen the phone window is actually on.
@@ -85,11 +91,22 @@ final class FloatingRemoteController {
             panel.hasShadow = true
             panel.hidesOnDeactivate = false
             panel.becomesKeyOnlyIfNeeded = true
-            // Restricted to the space where the scrcpy window resides.
-            panel.collectionBehavior = [.fullScreenAuxiliary]
+            // Always on every space so it accompanies the phone window across desktops.
+            panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
             panel.contentView = NSHostingView(rootView: RemoteStrip(model: model))
             self.panel = panel
         }
+
+        if spaceObserver == nil {
+            spaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.activeSpaceDidChangeNotification,
+                object: nil, queue: .main) { [weak self] _ in
+                    MainActor.assumeIsolated {
+                        self?.handleSpaceChange()
+                    }
+                }
+        }
+
         panel?.orderFront(nil)
     }
 
@@ -101,6 +118,10 @@ final class FloatingRemoteController {
     /// Fully tear down.
     func hide() {
         panel?.orderOut(nil)
+        if let obs = spaceObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(obs)
+        }
+        spaceObserver = nil
     }
 
     /// Turn the remote on/off (the user's visibility setting).
@@ -116,6 +137,33 @@ final class FloatingRemoteController {
         let screenTop = NSScreen.screens.first?.frame.height ?? 0
         let centerAppKit = CGPoint(x: frame.midX, y: screenTop - frame.midY)
         return NSScreen.screens.first { $0.frame.contains(centerAppKit) }
+    }
+
+    private func handleSpaceChange() {
+        guard enabled, let panel, let model else { return }
+        if model.isMirroring, let wid = model.windowTracker.windowID {
+            if isWindowOnActiveSpace(wid) {
+                if let frame = model.windowTracker.currentFrame {
+                    update(for: frame, phoneWindowID: wid)
+                }
+            } else {
+                panel.orderOut(nil)
+            }
+        } else {
+            panel.orderOut(nil)
+        }
+    }
+
+    private func isWindowOnActiveSpace(_ windowID: CGWindowID) -> Bool {
+        guard let windowList = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [[String: Any]] else {
+            return false
+        }
+        return windowList.contains { info in
+            if let id = info[kCGWindowNumber as String] as? CGWindowID {
+                return id == windowID
+            }
+            return false
+        }
     }
 }
 
