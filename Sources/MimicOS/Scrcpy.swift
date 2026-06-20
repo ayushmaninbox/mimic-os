@@ -107,11 +107,14 @@ final class Scrcpy {
             process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
             process.arguments = [launchPath] + args
         }
-        process.environment = ToolLocator.toolEnvironment()
-        
+        // The visible mirror window MUST be a regular (non-background) app so its
+        // window is visible to the Accessibility API — that's what powers the
+        // pin-across-desktops and the docked sidebar.
+        process.environment = ToolLocator.toolEnvironment(backgroundApp: false)
+
         let errPipe = Pipe()
         process.standardError = errPipe
-        
+
         final class SafeErrorLines: @unchecked Sendable {
             private let queue = DispatchQueue(label: "com.ayushman.mimicos.scrcpy.errors")
             private var lines: [String] = []
@@ -174,6 +177,17 @@ final class Scrcpy {
             }
             self.process = nil
         }
+    }
+
+    /// Hard cleanup: kill every lingering scrcpy process. scrcpy spawns helper
+    /// processes that can outlive the one we launched (the orphans we saw piling
+    /// up), so on quit we sweep them all to leave nothing running.
+    static func killAll() {
+        let kill = Process()
+        kill.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+        kill.arguments = ["-x", "scrcpy"]
+        try? kill.run()
+        kill.waitUntilExit()
     }
 
     deinit { stop() }

@@ -170,6 +170,8 @@ final class AppModel {
         mirrorWindowTitle = nil
         scrcpy.stop()
         headlessScrcpy.stop()
+        // Sweep any orphaned scrcpy processes so nothing lingers after quit.
+        Scrcpy.killAll()
     }
 
     // MARK: - Background device monitor (powers auto-reconnect)

@@ -69,27 +69,46 @@ final class ScrcpyWindowTracker {
 
     private func acquireWindow() {
         guard let title = windowTitle else { return }
-        guard let app = NSWorkspace.shared.runningApplications.first(where: {
+        // scrcpy spawns more than one process (the SDL UI app plus dock-less
+        // helpers). Only one actually owns the mirror window, so scan ALL of them
+        // and match on the window title — picking the first matching process by
+        // PID alone grabs the wrong (window-less) one.
+        let apps = NSWorkspace.shared.runningApplications.filter {
             ($0.executableURL?.lastPathComponent == "scrcpy")
                 || ($0.localizedName?.lowercased().contains("scrcpy") ?? false)
-        }) else { return }
+        }
 
-        let appElement = AXUIElementCreateApplication(app.processIdentifier)
-        var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &value) == .success,
-              let windows = value as? [AXUIElement] else { return }
+        var anyWindow: (pid: pid_t, app: AXUIElement, window: AXUIElement)?
+        for app in apps {
+            let appElement = AXUIElementCreateApplication(app.processIdentifier)
+            var value: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &value) == .success,
+                  let windows = value as? [AXUIElement], !windows.isEmpty else { continue }
 
-        let match = windows.first(where: { w in
-            if let t = string(w, kAXTitleAttribute) { return t == title || t.contains(title) }
-            return false
-        }) ?? (windows.count == 1 ? windows.first : nil)
+            if let exact = windows.first(where: { w in
+                if let t = string(w, kAXTitleAttribute) { return t == title || t.contains(title) }
+                return false
+            }) {
+                bind(pid: app.processIdentifier, app: appElement, window: exact)
+                return
+            }
+            if anyWindow == nil {
+                anyWindow = (app.processIdentifier, appElement, windows[0])
+            }
+        }
 
-        guard let window = match else { return }
-        axApp = appElement
+        // No title match (scrcpy may report an empty AX title on some builds) —
+        // fall back to the single scrcpy window we did find.
+        if let any = anyWindow {
+            bind(pid: any.pid, app: any.app, window: any.window)
+        }
+    }
+
+    private func bind(pid: pid_t, app: AXUIElement, window: AXUIElement) {
+        axApp = app
         axWindow = window
         windowID = Self.windowID(of: window)
-        installObserver(pid: app.processIdentifier, window: window)
-
+        installObserver(pid: pid, window: window)
         if let frame = frame(of: window) {
             currentFrame = frame
             onAppear?(frame)

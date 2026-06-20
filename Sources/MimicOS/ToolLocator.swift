@@ -66,12 +66,21 @@ enum ToolLocator {
     /// Environment to launch the tools with: extends PATH and, when we ship a
     /// bundled scrcpy-server, points scrcpy at it (and at the bundled adb) so
     /// the app works on machines with no Homebrew install.
-    static func toolEnvironment() -> [String: String] {
+    ///
+    /// `backgroundApp` controls `SDL_MAC_BACKGROUND_APP`, which makes scrcpy a
+    /// `.prohibited` (dock-less) app. That's desirable for the headless clipboard
+    /// session, but it MUST be off for the visible mirror window — a prohibited
+    /// app's windows are invisible to the Accessibility API, which breaks the
+    /// pin-across-desktops and the docked sidebar (both rely on AX). So the
+    /// mirror session is launched with `backgroundApp: false`.
+    static func toolEnvironment(backgroundApp: Bool = true) -> [String: String] {
         var env = ProcessInfo.processInfo.environment
         env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + (env["PATH"] ?? "/usr/bin:/bin")
         if let server = bundledServerPath { env["SCRCPY_SERVER_PATH"] = server }
         if isAvailable("adb") { env["ADB"] = adb }   // scrcpy uses $ADB if set
-        env["SDL_MAC_BACKGROUND_APP"] = "1"          // Prevents duplicate scrcpy icon in Dock
+        if backgroundApp {
+            env["SDL_MAC_BACKGROUND_APP"] = "1"      // dock-less; hides AX windows
+        }
         return env
     }
 }
