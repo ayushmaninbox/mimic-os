@@ -2,6 +2,7 @@ import Foundation
 import AppKit
 import ApplicationServices
 
+
 /// Tracks scrcpy's mirror window and reports its frame the instant it moves or
 /// resizes — **event-driven** via `AXObserver`, not polling — so anything docked
 /// to it (the floating remote) follows perfectly smoothly.
@@ -23,6 +24,7 @@ final class ScrcpyWindowTracker {
     var onRaise: (() -> Void)?
 
     private var windowTitle: String?
+    private var scrcpyPID: pid_t?
     private var axApp: AXUIElement?
     private var axWindow: AXUIElement?
     private var observer: AXObserver?
@@ -36,8 +38,9 @@ final class ScrcpyWindowTracker {
 
     private var activationObserver: NSObjectProtocol?
 
-    func start(windowTitle title: String) {
+    func start(windowTitle title: String, scrcpyPID: pid_t? = nil) {
         windowTitle = title
+        self.scrcpyPID = scrcpyPID
         acquireWindow()
         // Low-frequency safety net: re-acquire if scrcpy recreated its window,
         // or first-acquire if it wasn't up yet when we started. This does NOT
@@ -75,6 +78,7 @@ final class ScrcpyWindowTracker {
         activationObserver = nil
         teardownObserver()
         windowTitle = nil
+        scrcpyPID = nil
         axApp = nil
         axWindow = nil
         currentFrame = nil
@@ -100,6 +104,31 @@ final class ScrcpyWindowTracker {
 
     private func acquireWindow() {
         guard let title = windowTitle else { return }
+
+        // 1. If we have a specific target PID, try that directly.
+        if let targetPID = scrcpyPID {
+            let appElement = AXUIElementCreateApplication(targetPID)
+            var value: CFTypeRef?
+            let axRes = AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &value)
+            if axRes == .success, let windows = value as? [AXUIElement] {
+                if !windows.isEmpty {
+                    if let exact = windows.first(where: { w in
+                        if let t = string(w, kAXTitleAttribute) { 
+                            return t == title || t.contains(title) 
+                        }
+                        return false
+                    }) {
+                        bind(pid: targetPID, app: appElement, window: exact)
+                        return
+                    }
+                    // Fallback: Bind to the first window of the target process if it has no exact title match.
+                    bind(pid: targetPID, app: appElement, window: windows[0])
+                    return
+                }
+            }
+        }
+
+        // 2. Fallback to scanning all running applications if PID lookup failed.
         // scrcpy spawns more than one process (the SDL UI app plus dock-less
         // helpers). Only one actually owns the mirror window, so scan ALL of them
         // and match on the window title — picking the first matching process by
@@ -114,10 +143,14 @@ final class ScrcpyWindowTracker {
             let appElement = AXUIElementCreateApplication(app.processIdentifier)
             var value: CFTypeRef?
             guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &value) == .success,
-                  let windows = value as? [AXUIElement], !windows.isEmpty else { continue }
+                  let windows = value as? [AXUIElement], !windows.isEmpty else { 
+                continue 
+            }
 
             if let exact = windows.first(where: { w in
-                if let t = string(w, kAXTitleAttribute) { return t == title || t.contains(title) }
+                if let t = string(w, kAXTitleAttribute) { 
+                    return t == title || t.contains(title) 
+                }
                 return false
             }) {
                 bind(pid: app.processIdentifier, app: appElement, window: exact)

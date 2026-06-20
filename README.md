@@ -360,7 +360,18 @@ Build number × 7 taps → Developer mode unlocked → USB debugging toggle
 1. Go to [**Releases**](https://github.com/ayushmaninbox/mimic-os/releases)
 2. Download `MimicOS-v2.0.dmg`
 3. Open the DMG, drag MimicOS to Applications
-4. **First launch:** Right-click → Open → Click "Open" (bypasses Gatekeeper for unsigned apps)
+4. **Bypassing macOS Gatekeeper (since MimicOS is ad-hoc signed):**
+   Because the app is not signed with an Apple Developer ID, macOS might show a dialog saying *"MimicOS Not Opened — Apple could not verify..."* with only **Done** and **Move to Bin** options. 
+
+   To bypass this:
+   * **Fix 1 (Right-click → Open):** In Finder, open Applications, right-click (or Control-click) `MimicOS`, and select **Open**. Click **Open** on the confirmation dialog. *(Note: On macOS Sequoia 15+, this might be hidden on the first attempt; use Fix 2 or 3 if needed).*
+   * **Fix 2 (System Settings):** Double-click the app (let it get blocked), click **Done**. Go to **System Settings** → **Privacy & Security**, scroll down to the security section, and click **Open Anyway** next to the block notice.
+   * **Fix 3 (Strip Quarantine - Most Reliable):** Open Terminal and run:
+     ```bash
+     xattr -dr com.apple.quarantine /Applications/MimicOS.app
+     ```
+     This strips the internet download quarantine attribute, letting the app open instantly.
+
 
 ### Option 2: Build from Source
 

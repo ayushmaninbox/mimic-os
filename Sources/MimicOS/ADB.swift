@@ -466,5 +466,32 @@ enum ADB {
             ["-s", serial, "shell", "settings", "put", "system", "user_rotation", "\(next)"])
     }
 
+    // MARK: - Audio & Do Not Disturb Controls
+
+    /// Sets the phone's ringer mode ("SILENT", "VIBRATE", or "NORMAL").
+    @discardableResult
+    static func setRingerMode(_ serial: String, mode: String) async -> ProcessResult {
+        await Shell.run(ToolLocator.adb, ["-s", serial, "shell", "cmd", "audio", "set-ringer-mode", mode])
+    }
+
+    /// Gets the phone's current ringer mode (0 = SILENT, 1 = VIBRATE, 2 = NORMAL).
+    static func getRingerMode(_ serial: String) async -> Int? {
+        let result = await Shell.run(ToolLocator.adb, ["-s", serial, "shell", "settings", "get", "global", "mode_ringer"])
+        return Int(result.stdout.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    /// Toggles Do Not Disturb mode (DND ON maps to zen_mode > 0, DND OFF maps to zen_mode == 0).
+    @discardableResult
+    static func setDND(_ serial: String, enabled: Bool) async -> ProcessResult {
+        let dndMode = enabled ? "none" : "all"
+        return await Shell.run(ToolLocator.adb, ["-s", serial, "shell", "cmd", "notification", "set_dnd", dndMode])
+    }
+
+    /// Gets the phone's current zen mode (DND state: 0 = OFF, >=1 = ON).
+    static func getZenMode(_ serial: String) async -> Int? {
+        let result = await Shell.run(ToolLocator.adb, ["-s", serial, "shell", "settings", "get", "global", "zen_mode"])
+        return Int(result.stdout.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
 }
 

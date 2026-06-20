@@ -7,6 +7,9 @@
 #
 set -euo pipefail
 
+# Kill any running instances of MimicOS so codesigning doesn't fail with "Operation not permitted"
+pkill -x "MimicOS" || true
+
 APP_NAME="MimicOS"
 BUNDLE_ID="com.ayushman.mimicos"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -108,7 +111,9 @@ else
   echo "  Warning: docs/images/logo.png not found; skipping icon generation"
 fi
 
-bold "6/6  Ad-hoc signing (so it launches; not notarized)"
+bold "6/6  Removing quarantine attributes & ad-hoc signing"
+# Remove any quarantine/extended attributes recursively first so they don't invalidate signing.
+xattr -cr "$APP" 2>/dev/null || true
 # Ad-hoc sign every binary and library so Gatekeeper allows it.
 find "$TOOLS" -type f \( -name "*.dylib" -o -perm +111 \) -exec codesign --force --sign - {} \;
 codesign --force --deep --sign - "$APP"
@@ -117,3 +122,9 @@ echo
 bold "Done: $APP"
 echo "Run it:  open \"$APP\""
 echo "Make a DMG:  ./Scripts/make-dmg.sh"
+echo
+echo "⚠️  NOTE: Rebuilding changes the app's ad-hoc code signature hash."
+echo "   macOS will revoke/invalidate any previously granted Accessibility permissions."
+echo "   If you use the sidebar, you will need to re-grant access in System Settings"
+echo "   (or toggle it off and on) and relaunch the app."
+echo

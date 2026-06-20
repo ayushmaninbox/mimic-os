@@ -46,11 +46,46 @@ cp -R "$APP" "$MOUNT_DIR/"
 # Create a symlink to /Applications for the drag-to-install UX
 ln -s /Applications "$MOUNT_DIR/Applications"
 
-# Optional: set background and icon layout with AppleScript
-# (basic version — works without a background image)
+# Create a Gatekeeper helper note
+cat > "$MOUNT_DIR/Readme (If App Does Not Open).txt" << 'EOF'
+MimicOS - If the App Won't Open
+===============================
+Because MimicOS is an open-source tool and signed with an ad-hoc signature,
+macOS Gatekeeper might block it with a message saying:
+"MimicOS Not Opened — Apple could not verify..." and only offer "Done" or "Move to Bin".
+
+To bypass this and run the app, choose one of these methods:
+
+Method 1: Right-Click Bypass (Recommended)
+------------------------------------------
+1. Drag MimicOS to your Applications folder.
+2. In Finder, open your Applications folder.
+3. Right-click (or Control-click) MimicOS.app and choose "Open".
+4. A similar dialog will appear, but this time it will have an "Open" button. Click "Open".
+5. macOS will remember your choice, and the app will open normally from then on.
+
+Method 2: System Settings (macOS Ventura/Sonoma/Sequoia+)
+---------------------------------------------------------
+1. Attempt to open MimicOS once (letting it show the blocked dialog), then click "Done".
+2. Open System Settings -> Privacy & Security.
+3. Scroll down to the Security section. You will see:
+   "MimicOS was blocked to protect your Mac."
+4. Click "Open Anyway", enter your password/TouchID, and click "Open".
+
+Method 3: Terminal Command (Most Reliable)
+------------------------------------------
+If macOS remains stubborn, open Terminal and run the following command to strip the quarantine attribute:
+
+    xattr -dr com.apple.quarantine /Applications/MimicOS.app
+
+Then open it normally from Applications.
+EOF
+
+# Set background and icon layout with AppleScript (clean, standard style)
+VOLUME_BASE="$(basename "$MOUNT_DIR")"
 echo '
    tell application "Finder"
-     tell disk "'"$VOLUME_NAME"'"
+     tell disk "'"$VOLUME_BASE"'"
        open
        set current view of container window to icon view
        set toolbar visible of container window to false
@@ -59,8 +94,9 @@ echo '
        set viewOptions to the icon view options of container window
        set arrangement of viewOptions to not arranged
        set icon size of viewOptions to 96
-       set position of item "'"$APP_NAME.app"'" of container window to {140, 150}
-       set position of item "Applications" of container window to {400, 150}
+       set position of item "'"$APP_NAME.app"'" of container window to {140, 120}
+       set position of item "Applications" of container window to {400, 120}
+       set position of item "Readme (If App Does Not Open).txt" of container window to {270, 240}
        close
        open
        update without registering applications
@@ -68,7 +104,7 @@ echo '
        close
      end tell
    end tell
-' | osascript 2>/dev/null || echo "  (DMG layout hint skipped — cosmetic only)"
+' | osascript || echo "  (DMG layout hint skipped — cosmetic only)"
 
 bold "3/4  Unmounting"
 sync

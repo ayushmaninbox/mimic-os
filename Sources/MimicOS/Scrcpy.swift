@@ -85,6 +85,12 @@ final class Scrcpy {
     /// True while a mirror session is running.
     var isRunning: Bool { process?.isRunning ?? false }
 
+    /// The PID of the active scrcpy process, or nil if not running.
+    var processPID: pid_t? {
+        guard let process, process.isRunning else { return nil }
+        return process.processIdentifier
+    }
+
     /// Starts a mirror session for the given device serial. `onExit` fires when
     /// scrcpy terminates for any reason, passing the exit status and collected stderr.
     @discardableResult

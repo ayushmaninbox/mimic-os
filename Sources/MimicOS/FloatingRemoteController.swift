@@ -11,7 +11,7 @@ final class FloatingRemoteController {
     private var panel: NSPanel?
     private weak var model: AppModel?
     private let stripWidth: CGFloat = 56
-    private let gap: CGFloat = 6
+    private let gap: CGFloat = 0
     private var enabled = true
 
     /// Position the strip flush to the phone window for the given frame, which is
@@ -85,8 +85,8 @@ final class FloatingRemoteController {
             panel.hasShadow = true
             panel.hidesOnDeactivate = false
             panel.becomesKeyOnlyIfNeeded = true
-            // Always on every space so it accompanies the phone window across desktops.
-            panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            // Restricted to the space where the scrcpy window resides.
+            panel.collectionBehavior = [.fullScreenAuxiliary]
             panel.contentView = NSHostingView(rootView: RemoteStrip(model: model))
             self.panel = panel
         }
@@ -163,6 +163,30 @@ private struct RemoteStrip: View {
                                  tint: model.isRecording ? .red : nil) {
                         Task { await model.toggleScreenRecording() }
                     }
+
+                    Divider().frame(width: 28)
+
+                    RemoteButton(
+                        systemName: model.isSilent ? "bell.slash.fill" : "bell",
+                        help: model.isSilent ? "Turn silent off" : "Silent mode",
+                        tint: model.isSilent ? .orange : nil
+                    ) {
+                        Task { await model.toggleSilent() }
+                    }
+                    RemoteButton(
+                        systemName: model.isVibrate ? "bell.and.waves.left.and.right.fill" : "bell.and.waves.left.and.right",
+                        help: model.isVibrate ? "Turn vibrate off" : "Vibrate mode",
+                        tint: model.isVibrate ? .blue : nil
+                    ) {
+                        Task { await model.toggleVibrate() }
+                    }
+                    RemoteButton(
+                        systemName: model.isDND ? "moon.fill" : "moon",
+                        help: model.isDND ? "Turn DND off" : "Do Not Disturb",
+                        tint: model.isDND ? .purple : nil
+                    ) {
+                        Task { await model.toggleDND() }
+                    }
                 }
                 .padding(.vertical, 8)
             }
@@ -171,6 +195,9 @@ private struct RemoteStrip: View {
         .frame(width: 56)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
         .overlay(RoundedRectangle(cornerRadius: 16).stroke(.white.opacity(0.18), lineWidth: 1))
+        .onAppear {
+            Task { await model.refreshRingerAndDNDStatus() }
+        }
     }
 }
 

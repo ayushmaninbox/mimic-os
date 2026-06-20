@@ -56,6 +56,11 @@ final class AppModel {
     /// Where the phone's audio plays while mirroring.
     var audioRoute: Scrcpy.AudioRoute = .mac
 
+    // MARK: - Audio & DND status
+    var isSilent: Bool = false
+    var isVibrate: Bool = false
+    var isDND: Bool = false
+
     // MARK: - Clipboard sync
     //
     // Modern Android (≈13+, confirmed gone on Android 16) removed the
@@ -431,6 +436,7 @@ final class AppModel {
         info = await ADB.info(serial)
         updateBackgroundClipboardSync()
         startScreenshotWatch()
+        await refreshRingerAndDNDStatus()
     }
 
     // MARK: - Phone screenshot -> Mac clipboard
@@ -544,11 +550,14 @@ final class AppModel {
             ? (turnScreenOff ? "Mirroring (phone screen off)" : "Mirroring")
             : "Failed to start scrcpy"
 
-        if ok { beginWindowTracking(title: title) }
+        if ok { beginWindowTracking(title: title, pid: scrcpy.processPID) }
     }
 
     /// Bumped on every scrcpy (re)start; old exit handlers compare against it.
     @ObservationIgnored private var mirrorGeneration = 0
+
+    /// Tracks if we've already prompted the user for accessibility access during this session.
+    @ObservationIgnored private var hasPromptedAccessibility = false
 
     /// Apply mirror-affecting settings (screen-off, awake, UHID, audio) to the
     /// live session by restarting scrcpy in place. No-op when not mirroring.
@@ -579,11 +588,16 @@ final class AppModel {
 
     /// Hook the shared window tracker so move/resize events drive the floating
     /// remote with zero polling lag (and enforce the window's minimum size).
-    private func beginWindowTracking(title: String) {
+    private func beginWindowTracking(title: String, pid: pid_t?) {
         if settings.showSidebar, !AXIsProcessTrusted() {
             // The sidebar follows scrcpy's window via the Accessibility API.
-            _ = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
-            status = "Grant MimicOS Accessibility access (System Settings ▸ Privacy) so the sidebar can follow the phone window."
+            if !hasPromptedAccessibility {
+                hasPromptedAccessibility = true
+                _ = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
+                status = "Grant MimicOS Accessibility access (System Settings ▸ Privacy) so the sidebar can follow the phone window."
+            } else {
+                status = "Accessibility access required. If you just granted it in Settings, please relaunch MimicOS."
+            }
         }
 
         windowTracker.onAppear = { [weak self] frame in
@@ -607,7 +621,7 @@ final class AppModel {
             self.floatingRemote.raiseWithPhoneWindow(self.windowTracker.windowID)
         }
 
-        windowTracker.start(windowTitle: title)
+        windowTracker.start(windowTitle: title, scrcpyPID: pid)
     }
 
     /// Save the scrcpy window's current frame so the next session restores it.
@@ -1495,6 +1509,48 @@ final class AppModel {
         }
         await ADB.rotateDisplay(serial)
         status = "Rotated screen"
+    }
+
+    func refreshRingerAndDNDStatus() async {
+        guard let serial = selectedSerial,
+              selectedDevice?.state.isUsable == true else { return }
+        let ringer = await ADB.getRingerMode(serial)
+        let zen = await ADB.getZenMode(serial)
+        isSilent = (ringer == 0)
+        isVibrate = (ringer == 1)
+        isDND = (zen != nil && zen! > 0)
+    }
+
+    func toggleSilent() async {
+        guard let serial = selectedSerial,
+              selectedDevice?.state.isUsable == true else { return }
+        let targetMode = isSilent ? "NORMAL" : "SILENT"
+        isSilent = !isSilent
+        if isSilent { isVibrate = false }
+        status = isSilent ? "Silent mode ON" : "Silent mode OFF"
+        _ = await ADB.setRingerMode(serial, mode: targetMode)
+        await refreshRingerAndDNDStatus()
+    }
+
+    func toggleVibrate() async {
+        guard let serial = selectedSerial,
+              selectedDevice?.state.isUsable == true else { return }
+        let targetMode = isVibrate ? "NORMAL" : "VIBRATE"
+        isVibrate = !isVibrate
+        if isVibrate { isSilent = false }
+        status = isVibrate ? "Vibrate mode ON" : "Vibrate mode OFF"
+        _ = await ADB.setRingerMode(serial, mode: targetMode)
+        await refreshRingerAndDNDStatus()
+    }
+
+    func toggleDND() async {
+        guard let serial = selectedSerial,
+              selectedDevice?.state.isUsable == true else { return }
+        let targetActive = !isDND
+        isDND = targetActive
+        status = isDND ? "Do Not Disturb ON" : "Do Not Disturb OFF"
+        _ = await ADB.setDND(serial, enabled: targetActive)
+        await refreshRingerAndDNDStatus()
     }
 
     // MARK: - Screenshot & screen recording (to the user's capture folder)
