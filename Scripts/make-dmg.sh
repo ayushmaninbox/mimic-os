@@ -4,12 +4,12 @@
 #
 # Prerequisites: run ./Scripts/build-app.sh first to produce dist/MimicOS.app.
 #
-# Output: dist/MimicOS-v1.0.dmg
+# Output: dist/MimicOS-v2.0.dmg
 #
 set -euo pipefail
 
 APP_NAME="MimicOS"
-VERSION="1.0"
+VERSION="2.0"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DIST="$ROOT/dist"
 APP="$DIST/$APP_NAME.app"

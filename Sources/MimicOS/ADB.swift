@@ -68,13 +68,7 @@ enum ADB {
         return info
     }
 
-    // MARK: - Wireless pairing (same Wi-Fi)
-
-    /// Android 11+ pairing: `adb pair host:port` with the 6-digit code shown
-    /// under Wireless debugging.
-    static func pair(hostPort: String, code: String) async -> ProcessResult {
-        await Shell.run(ToolLocator.adb, ["pair", hostPort, code])
-    }
+    // MARK: - Wireless connect (USB → TCP/IP over hotspot)
 
     /// Connects to an already-paired device, or one switched into TCP/IP mode.
     static func connect(hostPort: String) async -> ProcessResult {
@@ -169,39 +163,6 @@ enum ADB {
             || ip.hasPrefix("192.168.")
             || (172...172).contains(Int(ip.split(separator: ".").first ?? "") ?? 0)
                 && (16...31).contains(Int(ip.split(separator: ".").dropFirst().first ?? "") ?? 0)
-    }
-
-    /// One service line from `adb mdns services`.
-    struct MDNSService {
-        let instanceName: String   // e.g. "adb-XXXX-YYYY" or our QR service name
-        let serviceType: String    // "_adb-tls-pairing._tcp." / "_adb-tls-connect._tcp."
-        let hostPort: String       // "192.168.1.5:37123"
-
-        var isPairing: Bool { serviceType.contains("pairing") }
-        var isConnect: Bool { serviceType.contains("connect") }
-    }
-
-    /// Parses `adb mdns services`. adb's own discovery daemon is the most
-    /// reliable source for ADB services — and it's the same daemon that will
-    /// perform the pairing handshake, so what it sees here is what `adb pair`
-    /// can actually reach.
-    ///
-    /// Output rows look like:
-    ///   adb-39031FDH-vWms8w  _adb-tls-pairing._tcp.  192.168.1.5:37123
-    static func mdnsServices() async -> [MDNSService] {
-        let result = await Shell.run(ToolLocator.adb, ["mdns", "services"])
-        guard result.succeeded else { return [] }
-
-        return result.stdout
-            .split(separator: "\n")
-            .dropFirst() // "List of discovered mdns services"
-            .compactMap { line in
-                let cols = line.split(whereSeparator: { $0 == " " || $0 == "\t" })
-                    .map(String.init)
-                    .filter { !$0.isEmpty }
-                guard cols.count >= 3 else { return nil }
-                return MDNSService(instanceName: cols[0], serviceType: cols[1], hostPort: cols[2])
-            }
     }
 
     // MARK: - Files
@@ -479,79 +440,9 @@ enum ADB {
         }
     }
 
-    /// The phone's display size as "WxH", used to pick a safe recording size.
-    private static func displaySize(_ serial: String) async -> (w: Int, h: Int)? {
-        let result = await Shell.run(ToolLocator.adb, ["-s", serial, "shell", "wm", "size"])
-        // Prefer "Override size:" if present, else "Physical size:".
-        let lines = result.stdout.split(separator: "\n").map(String.init)
-        let line = lines.last(where: { $0.contains("size:") }) ?? ""
-        guard let dims = line.split(separator: ":").last?.trimmingCharacters(in: .whitespaces),
-              case let parts = dims.split(separator: "x"), parts.count == 2,
-              let w = Int(parts[0]), let h = Int(parts[1]) else { return nil }
-        return (w, h)
-    }
-
-    /// Starts `screenrecord` on the phone, writing to a temp path on the phone.
-    /// Returns the live adb `Process`. To STOP cleanly, call `stopScreenRecord`
-    /// (which SIGINTs the on-device process) — killing this adb process would
-    /// leave the MP4 unfinalized.
-    ///
-    /// Some devices (e.g. Android 16 on certain hardware) reject the default
-    /// encoder config with "Encoder failed (err=-38)". We cap the size to a safe
-    /// height (scaling to keep aspect) and set a moderate bitrate, which the
-    /// hardware encoder reliably accepts. `--time-limit 180` is Android's max.
-    static func startScreenRecord(_ serial: String, remotePath: String,
-                                  onStart: @escaping @Sendable (Process) -> Void) async -> Bool {
-        var args = ["-s", serial, "shell", "screenrecord", "--time-limit", "180", "--bit-rate", "8000000"]
-        if let size = await displaySize(serial) {
-            // Scale the long edge down to ~1280 so the encoder accepts it, keeping
-            // the device's aspect ratio (avoids the err=-38 rejection).
-            let longEdge = max(size.w, size.h)
-            if longEdge > 1280 {
-                let scale = 1280.0 / Double(longEdge)
-                // Round to even numbers — H.264 requires even dimensions.
-                let w = (Int(Double(size.w) * scale) / 2) * 2
-                let h = (Int(Double(size.h) * scale) / 2) * 2
-                args.append(contentsOf: ["--size", "\(w)x\(h)"])
-            }
-        }
-        args.append(remotePath)
-        let proc = Shell.launch(ToolLocator.adb, args)
-        if let proc { onStart(proc) }
-        return proc != nil
-    }
-
-    /// Cleanly stops an in-progress recording by sending SIGINT to the on-device
-    /// `screenrecord` process. SIGINT is what makes screenrecord flush and write
-    /// the MP4 moov atom; killing the local adb pipe does not. We then wait for
-    /// the device process to actually exit before returning.
-    static func stopScreenRecord(_ serial: String) async {
-        // -INT = SIGINT. `pkill` matches by process name; `-l INT` is the
-        // portable spelling on Android's toybox. Try a couple of spellings.
-        _ = await Shell.run(ToolLocator.adb, ["-s", serial, "shell", "pkill", "-INT", "screenrecord"])
-        _ = await Shell.run(ToolLocator.adb, ["-s", serial, "shell", "pkill", "-l", "INT", "screenrecord"])
-        // Wait until no screenrecord process remains (up to ~4s) so the file is
-        // fully finalized before we pull it.
-        for _ in 0..<20 {
-            let check = await Shell.run(ToolLocator.adb, ["-s", serial, "shell", "pidof", "screenrecord"])
-            if check.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return }
-            try? await Task.sleep(for: .milliseconds(200))
-        }
-    }
-
-    /// After stopping, pulls the finalized .mp4 off the phone into `localFile`
-    /// and deletes the temp file on the phone. Returns the saved URL or nil.
-    static func finishScreenRecord(_ serial: String, remotePath: String,
-                                   localFile: URL) async -> URL? {
-        let pull = await Shell.run(ToolLocator.adb,
-                                   ["-s", serial, "pull", remotePath, localFile.path])
-        _ = await delete(serial, path: remotePath)
-        guard pull.succeeded,
-              FileManager.default.fileExists(atPath: localFile.path),
-              (try? FileManager.default.attributesOfItem(atPath: localFile.path)[.size] as? Int ?? 0) ?? 0 > 0
-        else { return nil }
-        return localFile
-    }
+    // Screen recording is handled by scrcpy's own `--record` pipeline (see
+    // `Scrcpy.startRecording`), which bypasses the device's `screenrecord` and
+    // its "Encoder failed (err=-38)" issues on some phones.
 
     // MARK: - Display rotation
 

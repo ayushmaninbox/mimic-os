@@ -3,6 +3,7 @@ import Observation
 import AppKit
 import AVFoundation
 import QuickLook
+import ApplicationServices
 
 /// The app's central state and the bridge between the SwiftUI views and the
 /// ADB/scrcpy engine. All UI-facing mutations happen on the main actor.
@@ -77,13 +78,10 @@ final class AppModel {
     /// Global preferences (capture folder, auto-reconnect, pin, background).
     let settings = AppSettings()
 
-    /// Shared, event-driven tracker for scrcpy's window (drives both the pinner
-    /// and the floating remote off live AXObserver callbacks — no polling).
+    /// Shared, event-driven tracker for scrcpy's window (drives the floating
+    /// remote off live AXObserver callbacks — no polling — and enforces the
+    /// window's minimum size).
     @ObservationIgnored private let windowTracker = ScrcpyWindowTracker()
-
-    /// Controls pinning of scrcpy's mirror window (sticky / all spaces) and
-    /// enforces its minimum size.
-    @ObservationIgnored private lazy var pinner = PhoneWindowPinner(tracker: windowTracker)
 
     /// The attached floating remote-control window shown beside the phone screen.
     @ObservationIgnored let floatingRemote = FloatingRemoteController()
@@ -92,27 +90,13 @@ final class AppModel {
     private let headlessScrcpy = Scrcpy()
     private var headlessSerial: String?
 
-    /// Stable window title handed to scrcpy so the pinner can find its window.
+    /// Stable window title handed to scrcpy so the tracker can find its window.
     private var mirrorWindowTitle: String?
 
     /// Serial of the device currently being mirrored, or nil. This is observable
     /// (unlike `scrcpy.isRunning`), so the UI updates the moment we start/stop.
     private(set) var mirroringSerial: String?
     var isMirroring: Bool { mirroringSerial != nil }
-
-    // MARK: - Wireless discovery & pairing
-
-    /// Live mDNS discovery of wireless-debugging phones on the LAN.
-    let browser = BonjourBrowser()
-    /// Convenience passthrough so views can read the discovered list.
-    var discoveredPhones: [DiscoveredPhone] { browser.phones }
-
-    /// Auto-discovered "host:port" of a phone showing its pairing screen, so the
-    /// user only has to type the 6-digit code. nil until mDNS resolves one.
-    var pairingHostPort: String? { browser.pairingHostPort }
-
-    /// The active QR pairing session, if the user has opened the QR sheet.
-    var pairingSession: QRPairing.Session?
 
     /// Drives the "Add Device" sheet opened by the + button.
     var showAddDevice: Bool = false
@@ -152,7 +136,8 @@ final class AppModel {
     }
 
     func onDisappear() {
-        // Bonjour browser not used anymore
+        // Nothing to tear down here; the background monitor and trackers are
+        // owned by the model and cleaned up on quit.
     }
 
     /// Tear down everything that outlives the UI: the scrcpy mirror window, the
@@ -164,7 +149,6 @@ final class AppModel {
             recorder.interruptRecording()
             recorder.forceStopRecording()
         }
-        pinner.stop()
         windowTracker.stop()
         floatingRemote.hide()
         mirroringSerial = nil
@@ -525,7 +509,6 @@ final class AppModel {
         options.stayAwake = stayAwake
         options.useHIDKeyboard = useHIDKeyboard
         options.audio = audioRoute
-        options.alwaysOnTop = settings.pinPhoneWindow
         options.windowTitle = title
         // Reopen where the user last left the phone window (current frame on a
         // live restart, otherwise the persisted one).
@@ -544,7 +527,6 @@ final class AppModel {
                       self.mirroringSerial == serial else { return }
                 self.persistPhoneWindowFrame()
                 self.mirroringSerial = nil
-                self.pinner.stop()
                 self.windowTracker.stop()
                 self.floatingRemote.hide()
                 self.mirrorWindowTitle = nil
@@ -575,7 +557,6 @@ final class AppModel {
         // Capture the current frame so the new window reopens in the same place.
         if let frame = windowTracker.currentFrame { settings.phoneWindowFrame = frame }
         windowTracker.stop()
-        pinner.stop()
         // startMirror bumps the generation token, so the old process's exit
         // handler is ignored when it fires.
         scrcpy.stop()
@@ -583,12 +564,11 @@ final class AppModel {
         status = "Updated mirror settings"
     }
 
-    /// Stop mirroring and tear down tracking / pinner / floating remote, saving
-    /// the window's last frame first.
+    /// Stop mirroring and tear down tracking / floating remote, saving the
+    /// window's last frame first.
     private func stopMirror() {
         persistPhoneWindowFrame()
         mirroringSerial = nil
-        pinner.stop()
         windowTracker.stop()
         floatingRemote.hide()
         mirrorWindowTitle = nil
@@ -597,18 +577,17 @@ final class AppModel {
         updateBackgroundClipboardSync()
     }
 
-    /// Hook the shared window tracker so move/resize events drive the pinner and
-    /// the floating remote with zero polling lag.
+    /// Hook the shared window tracker so move/resize events drive the floating
+    /// remote with zero polling lag (and enforce the window's minimum size).
     private func beginWindowTracking(title: String) {
-        if settings.pinPhoneWindow || settings.showSidebar {
-            if !PhoneWindowPinner.ensureAccessibilityPermission(prompt: true) {
-                status = "Grant MimicOS Accessibility access (System Settings ▸ Privacy) so the sidebar can follow and pin the phone window."
-            }
+        if settings.showSidebar, !AXIsProcessTrusted() {
+            // The sidebar follows scrcpy's window via the Accessibility API.
+            _ = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
+            status = "Grant MimicOS Accessibility access (System Settings ▸ Privacy) so the sidebar can follow the phone window."
         }
 
         windowTracker.onAppear = { [weak self] frame in
             guard let self else { return }
-            self.pinner.handleWindowAppeared(frame)
             if self.settings.showSidebar {
                 self.floatingRemote.show(model: self)
                 self.floatingRemote.update(for: frame, phoneWindowID: self.windowTracker.windowID)
@@ -616,7 +595,6 @@ final class AppModel {
         }
         windowTracker.onFrameChange = { [weak self] frame in
             guard let self else { return }
-            self.pinner.handleFrameChange(frame)
             if self.settings.showSidebar {
                 self.floatingRemote.update(for: frame, phoneWindowID: self.windowTracker.windowID)
             }
@@ -624,34 +602,18 @@ final class AppModel {
         windowTracker.onDisappear = { [weak self] in
             self?.floatingRemote.hideTemporarily()
         }
+        windowTracker.onRaise = { [weak self] in
+            guard let self, self.settings.showSidebar else { return }
+            self.floatingRemote.raiseWithPhoneWindow(self.windowTracker.windowID)
+        }
 
-        pinner.startTracking(sticky: settings.pinPhoneWindow)
         windowTracker.start(windowTitle: title)
     }
 
     /// Save the scrcpy window's current frame so the next session restores it.
     private func persistPhoneWindowFrame() {
-        if let frame = windowTracker.currentFrame ?? pinner.lastKnownFrame {
+        if let frame = windowTracker.currentFrame {
             settings.phoneWindowFrame = frame
-        }
-    }
-
-    /// Toggle whether the mirrored phone window rides across every Mission
-    /// Control desktop (sticky). The window stays freely movable/resizable; only
-    /// its presence on all spaces is what's "pinned". Persisted and applied live.
-    func togglePinPhoneWindow() {
-        settings.pinPhoneWindow.toggle()
-        let sticky = settings.pinPhoneWindow
-        if sticky && isMirroring {
-            if !PhoneWindowPinner.ensureAccessibilityPermission(prompt: true) {
-                status = "Grant MimicOS Accessibility access (System Settings ▸ Privacy) to pin across desktops."
-            }
-        }
-        pinner.setSticky(sticky)
-        if isMirroring {
-            status = sticky ? "Phone window pinned to all desktops" : "Phone window unpinned"
-        } else {
-            status = sticky ? "Phone window will show on all desktops when you mirror" : "Phone window unpinned"
         }
     }
 
@@ -706,13 +668,7 @@ final class AppModel {
 
     // MARK: - Wireless
 
-    func pairWireless(hostPort: String, code: String) async {
-        isWorking = true
-        defer { isWorking = false }
-        let result = await ADB.pair(hostPort: hostPort, code: code)
-        status = result.succeeded ? "Paired \(hostPort)" : "Pair failed: \(result.stderr.trimmingCharacters(in: .whitespacesAndNewlines))"
-    }
-
+    /// Connects to an already-paired / TCP-IP device at host:port.
     func connectWireless(hostPort: String) async {
         isConnecting = true
         isWorking = true
@@ -723,135 +679,6 @@ final class AppModel {
         let result = await ADB.connect(hostPort: hostPort)
         status = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
         await refreshDevices()
-    }
-
-    /// One-click connect to a phone that mDNS discovered. If the discovered
-    /// service is a "connect" endpoint with a resolved address, we can connect
-    /// straight away; a "pairing"-only endpoint means the user still needs to
-    /// pair first (open the QR sheet or enter the code).
-    func connect(to phone: DiscoveredPhone) async {
-        switch phone.kind {
-        case .connect:
-            guard let hostPort = phone.hostPort else {
-                status = "\(phone.name) found but not resolved yet — try again in a moment"
-                return
-            }
-            await connectWireless(hostPort: hostPort)
-        case .pairing:
-            status = "\(phone.name) needs pairing first — show the QR or enter the code"
-        }
-    }
-
-    /// Pairs using the 6-digit code, then immediately connects so the device
-    /// becomes usable in one step. Host:port comes from mDNS autofill when
-    /// available, otherwise from what the user typed.
-    /// Returns true on a successful pair.
-    @discardableResult
-    func pairAndConnect(hostPort: String, code: String) async -> Bool {
-        isConnecting = true
-        isWorking = true
-        defer {
-            isWorking = false
-            isConnecting = false
-        }
-
-        let pairResult = await ADB.pair(hostPort: hostPort, code: code)
-        guard pairResult.succeeded else {
-            status = "Pairing failed: \(pairResult.stdout.trimmingCharacters(in: .whitespacesAndNewlines)) \(pairResult.stderr.trimmingCharacters(in: .whitespacesAndNewlines))"
-            return false
-        }
-
-        // After pairing, the connect port differs from the pairing port. mDNS
-        // usually surfaces a `_adb-tls-connect._tcp` entry we can use; fall back
-        // to the same host on the default 5555 if not yet discovered.
-        status = "Paired. Connecting…"
-        if let connectPhone = browser.phones.first(where: { $0.kind == .connect && $0.hostPort != nil }),
-           let connectHostPort = connectPhone.hostPort {
-            await connectWireless(hostPort: connectHostPort)
-        } else {
-            await connectWireless(hostPort: hostPort)
-        }
-        return true
-    }
-
-    // MARK: - QR pairing
-
-    /// State machine for the QR pairing UI.
-    enum QRPhase: Equatable {
-        case showing          // QR is up, waiting for the phone to scan
-        case pairing          // phone scanned; running adb pair
-        case success
-        case failed(String)
-    }
-
-    var qrPhase: QRPhase = .showing
-    private var qrPollingTask: Task<Void, Never>?
-
-    /// Opens a fresh QR pairing session and starts watching for the phone to
-    /// scan it. Once the phone advertises our service name over mDNS, we pair.
-    func startQRPairing() {
-        qrPollingTask?.cancel()
-        let session = QRPairing.newSession()
-        pairingSession = session
-        qrPhase = .showing
-        status = "Scan the QR with the phone's 'Pair device with QR code'"
-        qrPollingTask = Task { await self.watchForScan(session: session) }
-    }
-
-    /// Polls `adb mdns services` until the phone advertises a pairing service
-    /// whose instance name matches our QR session, then runs `adb pair`.
-    private func watchForScan(session: QRPairing.Session) async {
-        // Poll for up to ~60s (the phone's QR screen times out around there).
-        for _ in 0..<60 {
-            if Task.isCancelled { return }
-
-            let services = await ADB.mdnsServices()
-            // The phone advertises a pairing service after scanning. Match our
-            // service name when present; otherwise take any pairing service that
-            // appeared (phones often append a suffix to the advertised name).
-            let match = services.first { $0.isPairing && $0.instanceName.contains(session.serviceName) }
-                ?? services.first { $0.isPairing }
-
-            if let match {
-                qrPhase = .pairing
-                status = "Phone scanned — pairing…"
-                let result = await ADB.pair(hostPort: match.hostPort, code: session.code)
-                if result.succeeded {
-                    qrPhase = .success
-                    status = "Paired via QR. Connecting…"
-                    await connectAfterPairing(pairingHostPort: match.hostPort)
-                } else {
-                    let detail = (result.stdout + " " + result.stderr).trimmingCharacters(in: .whitespacesAndNewlines)
-                    qrPhase = .failed(detail.isEmpty ? "Pairing failed" : detail)
-                    status = "QR pairing failed"
-                }
-                return
-            }
-
-            try? await Task.sleep(for: .seconds(1))
-        }
-        if !Task.isCancelled {
-            qrPhase = .failed("Timed out waiting for the phone to scan the code.")
-        }
-    }
-
-    /// After a successful pair, find the connect service and connect.
-    private func connectAfterPairing(pairingHostPort: String) async {
-        let services = await ADB.mdnsServices()
-        if let connect = services.first(where: { $0.isConnect }) {
-            await connectWireless(hostPort: connect.hostPort)
-        } else {
-            // Fall back to the same host on the default connect port.
-            let host = pairingHostPort.split(separator: ":").first.map(String.init) ?? pairingHostPort
-            await connectWireless(hostPort: "\(host):5555")
-        }
-    }
-
-    func cancelQRPairing() {
-        qrPollingTask?.cancel()
-        qrPollingTask = nil
-        pairingSession = nil
-        qrPhase = .showing
     }
 
     // MARK: - USB -> wireless over hotspot (no Wi-Fi / Wireless-debugging needed)

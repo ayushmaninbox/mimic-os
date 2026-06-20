@@ -48,9 +48,6 @@ private struct MenuBarContent: View {
                 Button(model.isMirroring ? "Stop Mirroring" : "Start Mirroring") {
                     model.toggleMirror()
                 }
-                Toggle("Pin Phone Window to All Desktops", isOn: Binding(
-                    get: { model.settings.pinPhoneWindow },
-                    set: { _ in model.togglePinPhoneWindow() }))
                 Toggle("Show Control Sidebar", isOn: Binding(
                     get: { model.settings.showSidebar },
                     set: { model.setSidebarVisible($0) }))

@@ -69,13 +69,35 @@ Copy text on your phone, paste it on your Mac — and vice versa. Works automati
 ### 📸 Screenshot Mirroring
 Take a screenshot on your phone and it **automatically appears on your Mac's clipboard**. MimicOS watches the phone's Screenshots folder and pulls new captures instantly — paste them straight into Slack, Notes, or any app.
 
+### 🎬 Screenshot & Screen Recording to Disk
+Capture the phone screen straight to your Mac with the sidebar/menu-bar buttons:
+
+- **Screenshot** — grabs a PNG via `adb exec-out screencap` (no file left on the phone) and saves it to your chosen folder, then reveals it in Finder.
+- **Screen recording** — records via scrcpy's own H.264 pipeline (bypassing the device's `screenrecord`, which fails on some phones), saved as a playable `.mp4`.
+
+Both land in a **capture folder you pick in Settings** (defaults to `~/Pictures/MimicOS`).
+
+### 📍 Menu-Bar Agent & Launch at Login
+MimicOS lives in the **menu bar** and keeps running quietly in the background when you close the main window, so your device stays connected and you can screenshot/record without reopening it — at near-zero idle CPU. Optionally **launch at login** so it returns after a reboot. Both are toggles in Settings.
+
+### 🔁 Auto-Reconnect
+If your phone's wireless connection drops (Wi-Fi or hotspot) and later comes back, MimicOS **reconnects it automatically**. The first time a device drops, it asks whether to enable this — you stay in control.
+
+### 🎛 Floating Control Sidebar
+While mirroring, a slim **floating sidebar docks to the side of the phone window** and follows it as you move it — auto-flipping between the left and right edge depending on available room, and sharing the window's z-order so it comes forward with the mirror. It carries the hardware controls (back, home, recents, power, volume ±, rotate) plus screenshot and screen-record buttons. Toggle it from Settings or the menu bar.
+
+> The sidebar follows scrcpy's window via the macOS **Accessibility API**, so the first time you use it MimicOS asks for Accessibility access (**System Settings → Privacy & Security → Accessibility**).
+
 ### 🤖 Quick Controls & Automation
 Hardware button shortcuts without touching your phone:
 
 | Button | Action |
 |--------|--------|
-| **Home** | Android home screen (keycode 3) |
 | **Back** | Navigate back (keycode 4) |
+| **Home** | Android home screen (keycode 3) |
+| **Recents** | Recent-apps overview (keycode 187) |
+| **Volume ± ** | Raise/lower volume (keycodes 24/25) |
+| **Rotate** | Rotate the display 90° |
 | **Power** | Toggle screen on/off (keycode 26) |
 
 Plus programmable automation via ADB:
@@ -185,11 +207,14 @@ MimicOS is a **controller and UI layer** — it doesn't reimplement screen mirro
 | `ControlPanelView.swift` | The detail pane — tabs for Control, Files, Settings |
 | `AddDeviceSheet.swift` | The `+` button flow: USB guide, Hotspot guide |
 | `AppModel.swift` | Central observable state — bridges engine ↔ UI |
-| `ADB.swift` | All app-free Android control: devices, files, input, info, wireless, clipboard |
-| `Scrcpy.swift` | Launches/stops mirror sessions, options management |
+| `AppSettings.swift` | Persisted preferences: capture folder, auto-reconnect, sidebar, background, login |
+| `ADB.swift` | All app-free Android control: devices, files, input, info, capture, wireless, clipboard |
+| `Scrcpy.swift` | Launches/stops mirror & recording sessions, options management |
+| `ScrcpyWindowTracker.swift` | Event-driven (AXObserver) tracking of scrcpy's window for the docked sidebar |
+| `FloatingRemoteController.swift` | The floating control sidebar that docks to the phone window |
+| `LoginItem.swift` | Launch-at-login registration via `SMAppService` |
 | `Shell.swift` | Async `Process` wrapper with cancellation support |
 | `ToolLocator.swift` | Finds `adb`/`scrcpy` (bundled → Homebrew → PATH) |
-| `BonjourBrowser.swift` | mDNS discovery of wireless-debugging phones via `NWBrowser` |
 | `Device.swift` | Device model + DeviceInfo (battery, version, resolution) |
 | `DeviceStore.swift` | UserDefaults persistence for remembered devices + custom names |
 
@@ -242,28 +267,6 @@ adb connect 192.168.43.1:5555  # Connect over the network
 - **IP addressing** — The phone has a private IPv4 address (RFC 1918: `10.x`, `192.168.x`, `172.16-31.x`)
 - **Connection-oriented protocol** — TCP guarantees delivery (vs UDP)
 - **NAT traversal** — When on a hotspot, the phone acts as the gateway (`192.168.43.1`)
-
-### 📡 mDNS / Bonjour (Zero-Configuration Networking)
-
-MimicOS uses **mDNS (Multicast DNS)** for network-level device discovery — the same technology that lets your Mac find AirPlay devices and printers without configuration. The app's `BonjourBrowser` listens for ADB services advertised by phones on the LAN.
-
-```
-Phone broadcasts:
-  _adb-tls-connect._tcp.local.    → "I'm available, connect to me"
-
-Mac (MimicOS) listens via NWBrowser:
-  → Discovers phone name, resolves IP:port
-```
-
-<p align="center">
-  <img src="docs/images/mdns-discovery.png" alt="mDNS discovery" width="600" />
-</p>
-
-**Concepts:**
-- **Multicast DNS** — Queries sent to `224.0.0.251:5353` (multicast group), all devices on the LAN respond
-- **Service Discovery (DNS-SD)** — Structured service types (`_tcp`, `_udp`) with metadata
-- **Zero-conf networking** — No manual IP configuration needed; devices find each other automatically
-- **Apple Network framework** — `NWBrowser` for native, efficient mDNS listening on macOS
 
 ### 🎥 H.264 Video Streaming
 
@@ -342,7 +345,7 @@ Build number × 7 taps → Developer mode unlocked → USB debugging toggle
 | **Build** | Swift Package Manager |
 | **Mirroring engine** | [scrcpy](https://github.com/Genymobile/scrcpy) (v4.0) |
 | **Device bridge** | [Android Debug Bridge (adb)](https://developer.android.com/tools/adb) |
-| **Network discovery** | Apple Network framework (`NWBrowser`, Bonjour/mDNS) |
+| **Window tracking** | Accessibility API (`AXObserver`) for the docked sidebar |
 | **Video rendering** | Metal (hardware-accelerated) |
 | **File previews** | QuickLook framework |
 | **Thumbnails** | AVFoundation (video) + AppKit (images) |
@@ -355,7 +358,7 @@ Build number × 7 taps → Developer mode unlocked → USB debugging toggle
 ### Option 1: Download the DMG (Recommended)
 
 1. Go to [**Releases**](https://github.com/ayushmaninbox/mimic-os/releases)
-2. Download `MimicOS-v1.0.dmg`
+2. Download `MimicOS-v2.0.dmg`
 3. Open the DMG, drag MimicOS to Applications
 4. **First launch:** Right-click → Open → Click "Open" (bypasses Gatekeeper for unsigned apps)
 

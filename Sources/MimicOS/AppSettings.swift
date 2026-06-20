@@ -10,7 +10,6 @@ final class AppSettings {
     private static let captureFolderKey = "MimicOS.captureFolderBookmark"
     private static let captureFolderPathKey = "MimicOS.captureFolderPath"
     private static let autoReconnectKey = "MimicOS.autoReconnect"
-    private static let pinPhoneWindowKey = "MimicOS.pinPhoneWindow"
     private static let runInBackgroundKey = "MimicOS.runInBackground"
 
     private var defaults: UserDefaults { .standard }
@@ -31,13 +30,6 @@ final class AppSettings {
     /// don't keep prompting.
     var autoReconnectAsked: Bool {
         didSet { defaults.set(autoReconnectAsked, forKey: "MimicOS.autoReconnectAsked") }
-    }
-
-    /// Keep the mirrored phone window pinned (always-on-top + all spaces, locked
-    /// frame). Toggled from the sidebar pin button; persisted so it survives
-    /// relaunches and reapplies to new mirror sessions.
-    var pinPhoneWindow: Bool {
-        didSet { defaults.set(pinPhoneWindow, forKey: Self.pinPhoneWindowKey) }
     }
 
     /// Keep MimicOS running in the background (menu-bar agent) when the main
@@ -82,7 +74,6 @@ final class AppSettings {
         let store = UserDefaults.standard
         autoReconnect = store.object(forKey: Self.autoReconnectKey) as? Bool ?? true
         autoReconnectAsked = store.bool(forKey: "MimicOS.autoReconnectAsked")
-        pinPhoneWindow = store.bool(forKey: Self.pinPhoneWindowKey)
         runInBackground = store.object(forKey: Self.runInBackgroundKey) as? Bool ?? true
         launchAtLogin = store.object(forKey: "MimicOS.launchAtLogin") as? Bool ?? true
         showSidebar = store.object(forKey: "MimicOS.showSidebar") as? Bool ?? true

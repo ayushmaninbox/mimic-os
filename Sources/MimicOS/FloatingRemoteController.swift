@@ -50,6 +50,18 @@ final class FloatingRemoteController {
         }
     }
 
+    /// Re-order the strip just above the phone window — called when scrcpy is
+    /// brought to the front (clicked / opened from Mission Control) so the
+    /// sidebar comes forward with it instead of staying buried.
+    func raiseWithPhoneWindow(_ phoneWindowID: CGWindowID?) {
+        guard enabled, let panel else { return }
+        if let wid = phoneWindowID {
+            panel.order(.above, relativeTo: Int(wid))
+        } else {
+            panel.orderFront(nil)
+        }
+    }
+
     /// Show the remote and start hosting the controls for `model`.
     func show(model: AppModel) {
         self.model = model
@@ -143,11 +155,6 @@ private struct RemoteStrip: View {
 
                     Divider().frame(width: 28)
 
-                    RemoteButton(systemName: model.settings.pinPhoneWindow ? "pin.fill" : "pin",
-                                 help: "Pin to all desktops",
-                                 tint: model.settings.pinPhoneWindow ? .accentColor : nil) {
-                        model.togglePinPhoneWindow()
-                    }
                     RemoteButton(systemName: "camera.fill", help: "Screenshot") {
                         Task { await model.captureScreenshot() }
                     }

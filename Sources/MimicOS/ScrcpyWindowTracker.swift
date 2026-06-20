@@ -18,6 +18,9 @@ final class ScrcpyWindowTracker {
     var onAppear: ((CGRect) -> Void)?
     /// Fired when the window goes away.
     var onDisappear: (() -> Void)?
+    /// Fired when scrcpy's window is raised/focused (so the docked sidebar can be
+    /// re-ordered to come forward with it).
+    var onRaise: (() -> Void)?
 
     private var windowTitle: String?
     private var axApp: AXUIElement?
@@ -26,6 +29,12 @@ final class ScrcpyWindowTracker {
     private var reacquireTimer: Timer?
     private(set) var currentFrame: CGRect?
     private(set) var windowID: CGWindowID?
+
+    /// Smallest size (points) the phone window is allowed to shrink to. Enforced
+    /// on every resize event so the mirror never becomes a tiny unusable sliver.
+    var minimumSize = CGSize(width: 280, height: 480)
+
+    private var activationObserver: NSObjectProtocol?
 
     func start(windowTitle title: String) {
         windowTitle = title
@@ -37,11 +46,33 @@ final class ScrcpyWindowTracker {
         reacquireTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.acquireIfNeeded() }
         }
+        // When scrcpy is brought to the front (e.g. clicked, or opened from
+        // Mission Control), raise the docked sidebar with it. A click that only
+        // focuses the window fires no AX move event, so we listen for app
+        // activation instead.
+        if activationObserver == nil {
+            activationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.didActivateApplicationNotification,
+                object: nil, queue: .main) { [weak self] _ in
+                    // The queue is .main, so read the now-frontmost app directly
+                    // rather than the non-Sendable notification payload.
+                    let isScrcpy = NSWorkspace.shared.frontmostApplication?
+                        .localizedName?.lowercased().contains("scrcpy") ?? false
+                    MainActor.assumeIsolated {
+                        guard let self, isScrcpy else { return }
+                        self.onRaise?()
+                    }
+                }
+        }
     }
 
     func stop() {
         reacquireTimer?.invalidate()
         reacquireTimer = nil
+        if let activationObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(activationObserver)
+        }
+        activationObserver = nil
         teardownObserver()
         windowTitle = nil
         axApp = nil
@@ -109,7 +140,8 @@ final class ScrcpyWindowTracker {
         axWindow = window
         windowID = Self.windowID(of: window)
         installObserver(pid: pid, window: window)
-        if let frame = frame(of: window) {
+        if let raw = frame(of: window) {
+            let frame = enforceMinimumSize(raw)
             currentFrame = frame
             onAppear?(frame)
             onFrameChange?(frame)
@@ -149,7 +181,7 @@ final class ScrcpyWindowTracker {
 
     private func handleAXEvent() {
         guard let axWindow else { return }
-        guard let frame = frame(of: axWindow) else {
+        guard var frame = frame(of: axWindow) else {
             // Window destroyed.
             teardownObserver()
             self.axWindow = nil
@@ -158,9 +190,21 @@ final class ScrcpyWindowTracker {
             onDisappear?()
             return
         }
+        frame = enforceMinimumSize(frame)
         currentFrame = frame
         windowID = Self.windowID(of: axWindow)
         onFrameChange?(frame)
+    }
+
+    /// Grow the window back up to the minimum size if the user shrank it too far.
+    private func enforceMinimumSize(_ frame: CGRect) -> CGRect {
+        guard frame.width < minimumSize.width || frame.height < minimumSize.height else { return frame }
+        let clamped = CGSize(width: max(frame.width, minimumSize.width),
+                             height: max(frame.height, minimumSize.height))
+        setSize(clamped)
+        var out = frame
+        out.size = clamped
+        return out
     }
 
     // MARK: - AX attribute helpers

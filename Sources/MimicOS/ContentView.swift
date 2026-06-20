@@ -95,7 +95,7 @@ struct DeviceListView: View {
         .sheet(isPresented: Binding(
             get: { model.showAddDevice },
             set: { model.showAddDevice = $0 }
-        ), onDismiss: { model.cancelQRPairing() }) {
+        )) {
             AddDeviceSheet()
         }
     }

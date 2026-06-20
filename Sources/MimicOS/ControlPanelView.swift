@@ -193,18 +193,13 @@ private struct SettingsTab: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Divider()
-                SectionCard(title: "Phone window", systemImage: "pin") {
-                    Toggle("Pin the mirror window to every desktop",
-                           isOn: Binding(
-                            get: { model.settings.pinPhoneWindow },
-                            set: { _ in model.togglePinPhoneWindow() }))
-                        .font(.body)
+                SectionCard(title: "Phone window", systemImage: "sidebar.right") {
                     Toggle("Show the control sidebar docked to the phone screen",
                            isOn: Binding(
                             get: { model.settings.showSidebar },
                             set: { model.setSidebarVisible($0) }))
                         .font(.body)
-                    Text("The pin keeps the phone window visible on every Mission Control desktop as you switch spaces — it stays movable and resizable, and its last size & position are remembered. The sidebar is a floating control strip that sticks to the side of the phone screen (auto-flips left/right based on room) and follows it. Both need Accessibility access (you'll be prompted).")
+                    Text("The sidebar is a floating control strip that sticks to the side of the phone screen (auto-flips left/right based on room) and follows it as you move it. It needs Accessibility access (you'll be prompted). The window's last size & position are remembered for next time.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Divider()
@@ -280,7 +275,7 @@ private struct MirrorSection: View {
                       systemImage: model.isMirroring ? "stop.circle" : "play.circle")
             }
             .buttonStyle(.borderedProminent)
-            Text("A floating remote (power, volume, rotate, pin, screenshot, record) appears attached to the phone window while mirroring. Options (screen-off, clipboard sync, capture folder, pin) live in the Settings tab.")
+            Text("A floating sidebar (back, home, recents, power, volume, rotate, screenshot, record) appears attached to the phone window while mirroring. Options (screen-off, clipboard sync, capture folder, sidebar) live in the Settings tab.")
                 .font(.caption).foregroundStyle(.secondary)
         }
     }

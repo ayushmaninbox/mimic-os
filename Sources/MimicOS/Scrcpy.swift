@@ -24,12 +24,8 @@ final class Scrcpy {
         var useHIDKeyboard: Bool = false
         /// Where the phone's audio should play while mirroring.
         var audio: AudioRoute = .mac
-        /// Keep scrcpy's mirror window above other windows. Maps to
-        /// `--always-on-top`. The "show on all spaces" behaviour is layered on
-        /// top via the Accessibility / CGS APIs in `PhoneWindowPinner`.
-        var alwaysOnTop: Bool = false
-        /// A stable window title so we can find scrcpy's window via the
-        /// Accessibility API for pinning. Maps to `--window-title`.
+        /// A stable window title so the tracker can find scrcpy's window via the
+        /// Accessibility API (used to dock the sidebar). Maps to `--window-title`.
         var windowTitle: String? = nil
         /// Restore the window's last position/size (top-left origin, points).
         /// Maps to `--window-x/--window-y/--window-width/--window-height`.
@@ -42,7 +38,6 @@ final class Scrcpy {
             if let maxSize { args.append(contentsOf: ["--max-size", "\(maxSize)"]) }
             if let bitRateMbps { args.append(contentsOf: ["--video-bit-rate", "\(bitRateMbps)M"]) }
             if useHIDKeyboard { args.append("--keyboard=uhid") }
-            if alwaysOnTop { args.append("--always-on-top") }
             if let windowTitle { args.append(contentsOf: ["--window-title", windowTitle]) }
             if let f = windowFrame, f.width > 1, f.height > 1 {
                 args.append(contentsOf: [
