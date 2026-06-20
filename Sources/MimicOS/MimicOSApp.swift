@@ -5,7 +5,6 @@ import AppKit
 struct MimicOSApp: App {
     @State private var model = AppModel()
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @Environment(\.openWindow) private var openWindow
 
     var body: some Scene {
         Window("MimicOS", id: "main") {
@@ -14,11 +13,6 @@ struct MimicOSApp: App {
                 .frame(minWidth: 720, minHeight: 480)
                 .task {
                     appDelegate.model = model
-                    model.openMainWindowAction = {
-                        openWindow(id: "main")
-                        NSApp.setActivationPolicy(.regular)
-                        NSApp.activate(ignoringOtherApps: true)
-                    }
                     appDelegate.setupStatusItem()
                     await model.onAppear()
                 }
@@ -36,7 +30,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     weak var model: AppModel?
     private var statusItem: NSStatusItem?
     private var portalPanel: PortalPanel?
-    private var dragTriggerWindow: DragTriggerWindow?
     private var hideTimer: Timer?
     private let portalDragModel = PortalDragModel()
 
@@ -47,9 +40,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func setupStatusItem() {
         guard statusItem == nil else { return }
         
-        statusItem = NSStatusBar.system.statusItem(withLength: 48)
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = statusItem?.button {
-            button.image = NSImage(systemSymbolName: "laptopcomputer.and.iphone", accessibilityDescription: "MimicOS")
+            let config = NSImage.SymbolConfiguration(pointSize: 16.0, weight: .medium)
+            button.image = NSImage(systemSymbolName: "laptopcomputer.and.iphone", accessibilityDescription: "MimicOS")?
+                .withSymbolConfiguration(config)
             
             // Create and add the drag-and-drop overlay view
             let dragView = DragDropOverlayView(frame: button.bounds)
@@ -70,36 +65,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             button.addSubview(dragView)
         }
         
-        // Setup Drag Trigger Window
-        let triggerView = DragTriggerView(frame: .zero)
-        triggerView.appDelegate = self
-        let triggerWindow = DragTriggerWindow(contentView: triggerView)
-        self.dragTriggerWindow = triggerWindow
-        updateDragTriggerWindowFrame()
-        triggerWindow.orderFront(nil)
-        
-        // Timer to align the trigger window horizontally as status items shift
-        Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.updateDragTriggerWindowFrame()
-            }
-        }
-        
         let menu = NSMenu()
         menu.delegate = self
         statusItem?.menu = menu
     }
 
-    private func updateDragTriggerWindowFrame() {
-        guard let button = statusItem?.button, let window = button.window else { return }
-        let buttonFrame = window.frame
-        let width: CGFloat = 160
-        let height: CGFloat = 80
-        let x = buttonFrame.midX - width / 2
-        let y = buttonFrame.midY - height / 2
-        
-        dragTriggerWindow?.setFrame(NSRect(x: x, y: y, width: width, height: height), display: true)
-    }
+
 
     /// On quit, stop scrcpy and tear down floating windows so nothing is left
     /// running (the mirror window is a separate process that would otherwise
@@ -135,9 +106,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         hideTimer = nil
         
         if portalPanel == nil {
-            let hostingView = NSHostingView(rootView: PortalView(dragModel: portalDragModel, destinationProvider: { [weak self] in
-                self?.model?.settings.phoneDestFolder ?? "Downloads/MimicOS"
-            }))
+            let hostingView = NSHostingView(rootView: PortalView(dragModel: portalDragModel))
             let panel = PortalPanel(contentView: hostingView)
             panel.onDragEntered = { [weak self] pt in
                 self?.hideTimer?.invalidate()
@@ -164,23 +133,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         
         guard let button = statusItem?.button, let window = button.window else { return }
         let buttonFrame = window.frame
-        let portalWidth: CGFloat = 260
-        let portalHeight: CGFloat = 190
+        // Panel includes the transparent inset margin on every side (so the
+        // card's rounded border + shadow aren't clipped); the visible card is
+        // ~320×220 inside it.
+        let portalWidth: CGFloat = 320 + PortalView.panelInset * 2
+        let portalHeight: CGFloat = 220 + PortalView.panelInset * 2
         let x = buttonFrame.midX - portalWidth / 2
-        let y = buttonFrame.minY - portalHeight - 4
-        
+        // Position so the *visible card* top sits just below the menu bar. The
+        // card is inset by `panelInset` inside the panel, so:
+        //   cardTop = y + portalHeight - panelInset
+        // We want cardTop at buttonFrame.minY (the menu bar's bottom) minus a
+        // couple points so the card clears the menu items above it. The
+        // transparent inset still bridges up to the icon for drag continuity.
+        let cardTopGap: CGFloat = 2
+        let y = buttonFrame.minY - cardTopGap - (portalHeight - PortalView.panelInset)
+
         portalPanel?.setFrame(NSRect(x: x, y: y, width: portalWidth, height: portalHeight), display: true)
-        portalPanel?.orderFront(nil)
+        if portalPanel?.isVisible == false {
+            portalPanel?.orderFront(nil)
+        }
     }
     
     func updatePortal(at screenPoint: CGPoint) {
-        portalPanel?.orderFront(nil)
+        if portalPanel?.isVisible == false {
+            portalPanel?.orderFront(nil)
+        }
     }
     
     func hidePortalWithDelay() {
         hideTimer?.invalidate()
-        hideTimer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: false) { [weak self] _ in
+        // Generous grace period: the cursor needs time to travel from the
+        // menu-bar icon down to the portal (and to pause over it) without the
+        // panel vanishing underneath. Any drag re-entry invalidates this timer.
+        hideTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: false) { [weak self] _ in
             Task { @MainActor in
+                self?.portalDragModel.isDraggingOver = false
                 self?.portalPanel?.orderOut(nil)
             }
         }
@@ -216,33 +203,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let device = model.selectedDevice, device.state.isUsable {
             let titleItem = NSMenuItem(title: device.displayName, action: nil, keyEquivalent: "")
             titleItem.isEnabled = false
+            titleItem.image = NSImage(systemSymbolName: "iphone.gen3", accessibilityDescription: "")
             menu.addItem(titleItem)
             
             menu.addItem(NSMenuItem.separator())
             
             let screenshotItem = NSMenuItem(title: "Take Screenshot", action: #selector(takeScreenshot), keyEquivalent: "")
             screenshotItem.target = self
+            screenshotItem.image = NSImage(systemSymbolName: "camera", accessibilityDescription: "")
             menu.addItem(screenshotItem)
             
             let recordingTitle = model.isRecording ? "Stop Recording" : "Record Screen"
             let recordingItem = NSMenuItem(title: recordingTitle, action: #selector(toggleRecording), keyEquivalent: "")
             recordingItem.target = self
+            recordingItem.image = NSImage(systemSymbolName: model.isRecording ? "stop.circle" : "record.circle", accessibilityDescription: "")
             menu.addItem(recordingItem)
             
             let mirroringTitle = model.isMirroring ? "Stop Mirroring" : "Start Mirroring"
             let mirroringItem = NSMenuItem(title: mirroringTitle, action: #selector(toggleMirroring), keyEquivalent: "")
             mirroringItem.target = self
+            mirroringItem.image = NSImage(systemSymbolName: model.isMirroring ? "stop.circle" : "play.circle", accessibilityDescription: "")
             menu.addItem(mirroringItem)
             
             let sidebarItem = NSMenuItem(title: "Show Control Sidebar", action: #selector(toggleSidebar), keyEquivalent: "")
             sidebarItem.target = self
             sidebarItem.state = model.settings.showSidebar ? .on : .off
+            sidebarItem.image = NSImage(systemSymbolName: "sidebar.right", accessibilityDescription: "")
             menu.addItem(sidebarItem)
             
             menu.addItem(NSMenuItem.separator())
         } else {
             let noDeviceItem = NSMenuItem(title: "No device connected", action: nil, keyEquivalent: "")
             noDeviceItem.isEnabled = false
+            noDeviceItem.image = NSImage(systemSymbolName: "cable.connector.slash", accessibilityDescription: "")
             menu.addItem(noDeviceItem)
             
             menu.addItem(NSMenuItem.separator())
@@ -250,17 +243,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         
         let openItem = NSMenuItem(title: "Open MimicOS", action: #selector(openMimicOS), keyEquivalent: "o")
         openItem.target = self
+        openItem.image = NSImage(systemSymbolName: "laptopcomputer", accessibilityDescription: "")
         menu.addItem(openItem)
+        
+        let fileManagerItem = NSMenuItem(title: "File Manager", action: #selector(openFileManager), keyEquivalent: "f")
+        fileManagerItem.target = self
+        fileManagerItem.image = NSImage(systemSymbolName: "folder", accessibilityDescription: "")
+        menu.addItem(fileManagerItem)
+        
+        let settingsItem = NSMenuItem(title: "Settings", action: #selector(openSettings), keyEquivalent: ",")
+        settingsItem.target = self
+        settingsItem.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: "")
+        menu.addItem(settingsItem)
+        
+        menu.addItem(NSMenuItem.separator())
         
         let runInBackgroundItem = NSMenuItem(title: "Run in Background", action: #selector(toggleRunInBackground), keyEquivalent: "")
         runInBackgroundItem.target = self
         runInBackgroundItem.state = model.settings.runInBackground ? .on : .off
+        runInBackgroundItem.image = NSImage(systemSymbolName: "menubar.arrow.up.rectangle", accessibilityDescription: "")
         menu.addItem(runInBackgroundItem)
         
         menu.addItem(NSMenuItem.separator())
         
         let quitItem = NSMenuItem(title: "Quit MimicOS", action: #selector(quitApp), keyEquivalent: "q")
         quitItem.target = self
+        quitItem.image = NSImage(systemSymbolName: "power", accessibilityDescription: "")
         menu.addItem(quitItem)
     }
     
@@ -289,6 +297,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         model?.openMainWindowAction?()
     }
     
+    @objc private func openFileManager() {
+        guard let model = model else { return }
+        model.openSection(.files)
+    }
+    
+    @objc private func openSettings() {
+        guard let model = model else { return }
+        model.openSection(.settings)
+    }
+    
     @objc private func toggleRunInBackground() {
         guard let model = model else { return }
         model.settings.runInBackground.toggle()
@@ -305,10 +323,34 @@ final class PortalDragModel: ObservableObject {
     @Published var isDraggingOver = false
 }
 
-class DragTriggerWindow: NSPanel {
+
+
+/// Floating glass panel that hosts the SwiftUI `PortalView`. Drag handling
+/// lives on its content view (`PortalContentView`) — AppKit routes drag events
+/// to a window's *content view*, not the window object, so the panel itself
+/// can't intercept them.
+class PortalPanel: NSPanel {
+    var onDragEntered: ((CGPoint) -> Void)? {
+        didSet { dropView.onDragEntered = onDragEntered }
+    }
+    var onDragUpdated: ((CGPoint) -> Void)? {
+        didSet { dropView.onDragUpdated = onDragUpdated }
+    }
+    var onDragExited: (() -> Void)? {
+        didSet { dropView.onDragExited = onDragExited }
+    }
+    var onPerformDrop: (([URL]) -> Void)? {
+        didSet { dropView.onPerformDrop = onPerformDrop }
+    }
+
+    private let dropView: PortalContentView
+
     init(contentView: NSView) {
+        let size = NSSize(width: 320 + PortalView.panelInset * 2,
+                          height: 220 + PortalView.panelInset * 2)
+        dropView = PortalContentView(frame: NSRect(origin: .zero, size: size))
         super.init(
-            contentRect: NSRect(x: 0, y: 0, width: 160, height: 80),
+            contentRect: NSRect(origin: .zero, size: size),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -317,101 +359,59 @@ class DragTriggerWindow: NSPanel {
         self.level = .statusBar
         self.backgroundColor = .clear
         self.isOpaque = false
+        // No window shadow: the panel is transparent and larger than the
+        // visible card (it includes the inset margin), so a window shadow would
+        // draw a ghost box around the whole panel. The SwiftUI card draws its
+        // own shadow instead.
         self.hasShadow = false
-        self.contentView = contentView
-        self.ignoresMouseEvents = false
+
+        // The SwiftUI view fills the drop view, which is the panel's content
+        // view and the actual drag destination.
+        contentView.frame = dropView.bounds
+        contentView.autoresizingMask = [.width, .height]
+        dropView.addSubview(contentView)
+        self.contentView = dropView
     }
 }
 
-class DragTriggerView: NSView {
-    weak var appDelegate: AppDelegate?
-    
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        registerForDraggedTypes([.fileURL])
-    }
-    
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-    
-    override func hitTest(_ point: NSPoint) -> NSView? {
-        let pasteboard = NSPasteboard(name: .drag)
-        if pasteboard.types?.contains(.fileURL) == true {
-            return self
-        }
-        return nil
-    }
-    
-    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        let location = sender.draggingLocation
-        let screenPoint = self.window?.convertToScreen(NSRect(origin: location, size: .zero)).origin ?? .zero
-        appDelegate?.showPortal(at: screenPoint)
-        return .copy
-    }
-    
-    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
-        let location = sender.draggingLocation
-        let screenPoint = self.window?.convertToScreen(NSRect(origin: location, size: .zero)).origin ?? .zero
-        appDelegate?.updatePortal(at: screenPoint)
-        return .copy
-    }
-    
-    override func draggingExited(_ sender: NSDraggingInfo?) {
-        appDelegate?.hidePortalWithDelay()
-    }
-    
-    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        let pasteboard = sender.draggingPasteboard
-        if let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] {
-            appDelegate?.handleDrop(urls: urls)
-            return true
-        }
-        return false
-    }
-}
-
-class PortalPanel: NSPanel {
+/// Content view for `PortalPanel` that receives the file-drag events. Because
+/// it sits in a borderless panel, it converts drag locations back to screen
+/// coordinates so the manager can keep the panel pinned under the cursor.
+final class PortalContentView: NSView {
     var onDragEntered: ((CGPoint) -> Void)?
     var onDragUpdated: ((CGPoint) -> Void)?
     var onDragExited: (() -> Void)?
     var onPerformDrop: (([URL]) -> Void)?
 
-    init(contentView: NSView) {
-        super.init(
-            contentRect: NSRect(x: 0, y: 0, width: 260, height: 190),
-            styleMask: [.borderless, .nonactivatingPanel],
-            backing: .buffered,
-            defer: false
-        )
-        self.isFloatingPanel = true
-        self.level = .statusBar
-        self.backgroundColor = .clear
-        self.isOpaque = false
-        self.hasShadow = true
-        self.contentView = contentView
-        self.registerForDraggedTypes([.fileURL])
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        registerForDraggedTypes([.fileURL])
     }
 
-    func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    private func screenPoint(for sender: NSDraggingInfo) -> CGPoint {
         let location = sender.draggingLocation
-        let screenPoint = self.convertToScreen(NSRect(origin: location, size: .zero)).origin
-        onDragEntered?(screenPoint)
+        return window?.convertToScreen(NSRect(origin: location, size: .zero)).origin ?? .zero
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        onDragEntered?(screenPoint(for: sender))
         return .copy
     }
 
-    func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
-        let location = sender.draggingLocation
-        let screenPoint = self.convertToScreen(NSRect(origin: location, size: .zero)).origin
-        onDragUpdated?(screenPoint)
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        onDragUpdated?(screenPoint(for: sender))
         return .copy
     }
 
-    func draggingExited(_ sender: NSDraggingInfo?) {
+    override func draggingExited(_ sender: NSDraggingInfo?) {
         onDragExited?()
     }
 
-    func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
         let pasteboard = sender.draggingPasteboard
         if let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] {
             onPerformDrop?(urls)
@@ -440,133 +440,193 @@ struct VisualEffectView: NSViewRepresentable {
 }
 
 struct PortalView: View {
+    /// Transparent margin between the visible card and the panel edges, so the
+    /// rounded border and drop shadow aren't clipped. The panel dimensions in
+    /// `showPortal` / `PortalPanel` add 2× this on each axis.
+    static let panelInset: CGFloat = 22
+
     @ObservedObject var dragModel: PortalDragModel
-    var destinationProvider: () -> String
-    
+
     @State private var isAnimating = false
     @State private var pulseActive = false
 
+    private var active: Bool { dragModel.isDraggingOver }
+
+    /// Monochrome grey/white palette. On drag-over everything goes bright
+    /// white; idle is a clearly-visible light grey (kept high so it reads on
+    /// the dark card backing).
+    private var monoColors: [Color] {
+        active
+            ? [.white, .white.opacity(0.9)]
+            : [.white.opacity(0.95), Color(white: 0.7)]
+    }
+
     var body: some View {
-        VStack(spacing: 14) {
-            ZStack {
-                // Outer glowing circle
-                Circle()
-                    .stroke(
-                        LinearGradient(
-                            colors: dragModel.isDraggingOver 
-                                ? [.purple, .pink, .orange] 
-                                : [.accentColor, .purple],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        ),
-                        lineWidth: dragModel.isDraggingOver ? 3 : 2
-                    )
-                    .frame(width: 58, height: 58)
-                    .scaleEffect(dragModel.isDraggingOver ? (pulseActive ? 1.15 : 1.05) : (isAnimating ? 1.12 : 1.0))
-                    .opacity(dragModel.isDraggingOver ? 0.9 : (isAnimating ? 0.4 : 0.8))
-                
-                // Inner circle background
-                Circle()
-                    .fill(
-                        dragModel.isDraggingOver 
-                            ? Color.purple.opacity(0.2) 
-                            : Color.accentColor.opacity(0.12)
-                    )
-                    .frame(width: 48, height: 48)
-                
-                Image(systemName: dragModel.isDraggingOver ? "arrow.down.circle.fill" : "square.and.arrow.down.fill")
-                    .font(.system(size: 24, weight: .bold))
-                    .foregroundStyle(
-                        LinearGradient(
-                            colors: dragModel.isDraggingOver 
-                                ? [.purple, .pink] 
-                                : [.accentColor, .purple],
-                            startPoint: .top,
-                            endPoint: .bottom
-                        )
-                    )
-                    .scaleEffect(dragModel.isDraggingOver ? 1.1 : 1.0)
-                    .offset(y: dragModel.isDraggingOver ? (pulseActive ? 2 : -1) : (isAnimating ? 2 : -2))
-            }
-            .padding(.top, 4)
-            
-            VStack(spacing: 6) {
-                Text(dragModel.isDraggingOver ? "Drop to Transfer!" : "Drop Files Here")
-                    .font(.system(size: 15, weight: .bold, design: .rounded))
-                    .foregroundStyle(
-                        dragModel.isDraggingOver 
-                            ? AnyShapeStyle(LinearGradient(colors: [.purple, .pink], startPoint: .leading, endPoint: .trailing))
-                            : AnyShapeStyle(Color.primary)
-                    )
-                
-                Text(dragModel.isDraggingOver ? "Release to start copy" : "to copy directly to your phone")
-                    .font(.system(size: 11, weight: .medium, design: .rounded))
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-            }
-            
-            Divider()
-                .opacity(0.3)
-                .padding(.horizontal, 10)
-            
-            // Destination path indicator
-            HStack(spacing: 4) {
-                Image(systemName: "folder.fill")
-                    .font(.system(size: 10))
-                    .foregroundColor(.secondary)
-                Text(destinationProvider())
-                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .foregroundColor(.secondary)
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 4)
-            .background(Color.primary.opacity(0.04))
-            .cornerRadius(6)
-        }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 14)
+        // Card content.
+        dropZone
+        .padding(20)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(
-            VisualEffectView(material: .hudWindow, blendingMode: .behindWindow)
-                .clipShape(RoundedRectangle(cornerRadius: 22))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 22)
-                .stroke(
-                    LinearGradient(
-                        colors: dragModel.isDraggingOver
-                            ? [.purple, .pink, .orange]
-                            : [.white.opacity(0.35), .clear, .white.opacity(0.1)],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    ),
-                    lineWidth: dragModel.isDraggingOver ? 2.5 : 1.5
-                )
-        )
+        .background(cardBackground)
+        .overlay(cardBorder)
         .shadow(
-            color: dragModel.isDraggingOver 
-                ? Color.purple.opacity(0.35) 
-                : Color.black.opacity(0.25),
-            radius: dragModel.isDraggingOver ? 22 : 15,
+            color: Color.black.opacity(active ? 0.34 : 0.28),
+            radius: active ? 24 : 16,
             x: 0,
-            y: 8
+            y: 10
         )
+        // Transparent margin inside the panel so the rounded border and the
+        // drop shadow have room to render instead of being clipped at the
+        // panel edges. The panel is sized larger to compensate.
+        .padding(PortalView.panelInset)
         .onAppear {
-            withAnimation(.easeInOut(duration: 1.2).repeatForever(autoreverses: true)) {
+            withAnimation(.easeInOut(duration: 1.6).repeatForever(autoreverses: true)) {
                 isAnimating = true
             }
         }
         .onChange(of: dragModel.isDraggingOver) { _, newValue in
             if newValue {
-                withAnimation(.easeInOut(duration: 0.6).repeatForever(autoreverses: true)) {
+                withAnimation(.easeInOut(duration: 0.7).repeatForever(autoreverses: true)) {
                     pulseActive = true
                 }
             } else {
-                pulseActive = false
+                withAnimation(.easeOut(duration: 0.2)) { pulseActive = false }
             }
         }
+    }
+
+    // MARK: - Drop zone
+
+    /// The dashed ring + icon + labels. This whole region is the visual target
+    /// the user drags onto.
+    private var dropZone: some View {
+        VStack(spacing: 12) {
+            ZStack {
+                // Soft radial halo that breathes / intensifies on drag-over.
+                Circle()
+                    .fill(
+                        RadialGradient(
+                            colors: [Color.white.opacity(active ? 0.4 : 0.22), .clear],
+                            center: .center,
+                            startRadius: 2,
+                            endRadius: active ? 48 : 40
+                        )
+                    )
+                    .frame(width: 96, height: 96)
+                    .scaleEffect(active ? (pulseActive ? 1.12 : 1.0) : (isAnimating ? 1.06 : 0.96))
+
+                // Animated dashed orbit ring.
+                Circle()
+                    .stroke(
+                        AngularGradient(colors: monoColors + [monoColors.first!], center: .center),
+                        style: StrokeStyle(lineWidth: active ? 3 : 2.5, lineCap: .round, dash: [5, 6])
+                    )
+                    .frame(width: 64, height: 64)
+                    .shadow(color: .black.opacity(0.25), radius: 3)
+                    .rotationEffect(.degrees(isAnimating ? 360 : 0))
+                    .scaleEffect(active && pulseActive ? 1.08 : 1.0)
+                    .animation(.linear(duration: 14).repeatForever(autoreverses: false), value: isAnimating)
+
+                // Filled inner disc.
+                Circle()
+                    .fill(
+                        LinearGradient(
+                            colors: [Color.white.opacity(active ? 0.28 : 0.18), Color.white.opacity(0.08)],
+                            startPoint: .top, endPoint: .bottom
+                        )
+                    )
+                    .frame(width: 50, height: 50)
+
+                Image(systemName: active ? "arrow.down.circle.fill" : "tray.and.arrow.down.fill")
+                    .font(.system(size: 24, weight: .semibold))
+                    .foregroundStyle(
+                        LinearGradient(colors: monoColors, startPoint: .top, endPoint: .bottom)
+                    )
+                    .shadow(color: .black.opacity(0.35), radius: 4, y: 1)
+                    .scaleEffect(active ? (pulseActive ? 1.12 : 1.0) : 1.0)
+                    .offset(y: active ? (pulseActive ? 3 : -1) : (isAnimating ? 2 : -2))
+            }
+
+            VStack(spacing: 4) {
+                Text(active ? "Release to Transfer" : "Drop Files Here")
+                    .font(.system(size: 16, weight: .bold, design: .rounded))
+                    .foregroundColor(.white)
+                    .shadow(color: .black.opacity(0.4), radius: 4, y: 1)
+
+                Text(active ? "Copying straight to your phone" : "to copy directly to your phone")
+                    .font(.system(size: 11.5, weight: .medium, design: .rounded))
+                    .foregroundColor(.white.opacity(0.85))
+                    .shadow(color: .black.opacity(0.35), radius: 3, y: 1)
+                    .multilineTextAlignment(.center)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 16)
+        .background(
+            // Inner "glass within glass" panel: a faint frosted inset that adds
+            // depth without going opaque.
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(.ultraThinMaterial)
+                .opacity(active ? 0.9 : 0.6)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                        .fill(Color.white.opacity(active ? 0.1 : 0.04))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                        .strokeBorder(
+                            Color.white.opacity(active ? 0.9 : 0.45),
+                            style: StrokeStyle(lineWidth: active ? 2 : 1.4, dash: active ? [] : [6, 5])
+                        )
+                )
+        )
+    }
+
+    // MARK: - Card chrome
+
+    /// Liquid-glass card surface: a frosted translucent material you can see
+    /// through, a faint light tint, a glossy specular highlight across the top,
+    /// and a bright rim — the Apple "glassmorphism" look.
+    private var cardBackground: some View {
+        ZStack {
+            // Frosted, blurred backdrop. `.underWindowBackground` reads as light
+            // translucent glass rather than the dark slab `.hudWindow` gives.
+            VisualEffectView(material: .underWindowBackground, blendingMode: .behindWindow)
+
+            // Very light diagonal tint so the glass has body without going
+            // opaque — the wallpaper still glows through.
+            LinearGradient(
+                colors: [
+                    Color.white.opacity(active ? 0.22 : 0.16),
+                    Color.white.opacity(active ? 0.10 : 0.06)
+                ],
+                startPoint: .topLeading, endPoint: .bottomTrailing
+            )
+
+            // Glossy specular sweep across the upper third — the "wet glass"
+            // sheen that catches the light.
+            LinearGradient(
+                colors: [Color.white.opacity(active ? 0.4 : 0.28), .clear],
+                startPoint: .top, endPoint: .center
+            )
+            .blendMode(.plusLighter)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+    }
+
+    /// Two-pass rim: a soft outer stroke plus a bright inner highlight on the
+    /// top edge, so light appears to wrap the glass.
+    private var cardBorder: some View {
+        RoundedRectangle(cornerRadius: 28, style: .continuous)
+            .strokeBorder(
+                LinearGradient(
+                    colors: active
+                        ? [.white.opacity(0.95), .white.opacity(0.4), .white.opacity(0.6)]
+                        : [.white.opacity(0.7), .white.opacity(0.15), .white.opacity(0.35)],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                ),
+                lineWidth: active ? 1.6 : 1.2
+            )
     }
 }
 
@@ -611,6 +671,14 @@ class DragDropOverlayView: NSView {
             return true
         }
         return false
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let pasteboard = NSPasteboard(name: .drag)
+        if pasteboard.types?.contains(.fileURL) == true {
+            return self
+        }
+        return nil
     }
 
     override func mouseDown(with event: NSEvent) {

@@ -17,7 +17,7 @@ final class AppSettings {
     private var defaults: UserDefaults { .standard }
 
     /// Folder where screenshots and screen recordings are saved. Defaults to
-    /// `~/Pictures/MimicOS` and is created on first use.
+    /// `~/Downloads/MimicOS` and is created on first use.
     var captureFolder: URL {
         didSet { persistCaptureFolder() }
     }
@@ -92,12 +92,12 @@ final class AppSettings {
         alwaysOnTop = store.object(forKey: Self.alwaysOnTopKey) as? Bool ?? false
         phoneDestFolder = store.string(forKey: Self.phoneDestFolderKey) ?? "/sdcard/Download/MimicOS"
 
-        // Resolve the saved capture folder, falling back to ~/Pictures/MimicOS.
+        // Resolve the saved capture folder, falling back to ~/Downloads/MimicOS.
         let fallback = FileManager.default
-            .urls(for: .picturesDirectory, in: .userDomainMask).first?
+            .urls(for: .downloadsDirectory, in: .userDomainMask).first?
             .appendingPathComponent("MimicOS", isDirectory: true)
             ?? FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent("MimicOS", isDirectory: true)
+                .appendingPathComponent("Downloads/MimicOS", isDirectory: true)
 
         if let bookmark = store.data(forKey: Self.captureFolderKey) {
             var stale = false

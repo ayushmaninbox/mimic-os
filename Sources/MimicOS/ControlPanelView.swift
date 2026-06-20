@@ -492,7 +492,7 @@ private struct FilesTab: View {
             .opacity(0)
         }
         .task(id: model.selectedSerial) {
-            if model.selectedSerial != nil { await model.loadFiles(path: "/sdcard/") }
+            if model.selectedSerial != nil { await model.loadFiles() }
         }
         // Drag files in from Finder/Desktop -> upload to the current folder.
         .dropDestination(for: URL.self) { urls, _ in

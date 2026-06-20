@@ -438,6 +438,9 @@ final class AppModel {
     }
 
     func select(_ serial: String) async {
+        if selectedSerial != serial {
+            browsePath = "/sdcard/"
+        }
         selectedSerial = serial
         info = await ADB.info(serial)
         updateBackgroundClipboardSync()
@@ -1206,14 +1209,22 @@ final class AppModel {
     }
 
     func transferFilesFromDragDrop(_ filePaths: [String]) async {
-        // If no device is selected, try to pick the first connected/usable one
+        // If no device is selected, try to refresh first to see if any are connected
+        if selectedSerial == nil {
+            await refreshDevices()
+        }
+        
+        // If still nil, try to pick the first connected/usable one
         if selectedSerial == nil {
             if let firstUsable = devices.first(where: { $0.state.isUsable }) {
                 await select(firstUsable.serial)
             }
         }
         
-        guard let serial = selectedSerial else { return }
+        guard let serial = selectedSerial else {
+            status = "No connected device available for file transfer."
+            return
+        }
         
         // Ensure the destination folder exists on the phone
         let dest = settings.phoneDestFolder
