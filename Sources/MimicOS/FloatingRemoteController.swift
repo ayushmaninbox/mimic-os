@@ -16,10 +16,11 @@ final class FloatingRemoteController {
 
     /// Position the strip flush to the phone window for the given frame, which is
     /// supplied live by the window tracker. `frame` is top-left-origin screen
-    /// coordinates (AX convention).
-    func update(for frame: CGRect) {
+    /// coordinates (AX convention). `phoneWindowID` lets us keep the strip in the
+    /// same z-layer as the phone window (just above it), instead of floating over
+    /// every app.
+    func update(for frame: CGRect, phoneWindowID: CGWindowID?) {
         guard enabled, let panel else { return }
-        if !panel.isVisible { panel.orderFrontRegardless() }
 
         // Convert the AX (top-left) frame to AppKit (bottom-left) coordinates,
         // choosing the screen the phone window is actually on.
@@ -37,7 +38,16 @@ final class FloatingRemoteController {
         let fitsRight = rightX + stripWidth <= screen.frame.maxX
         let x = fitsRight ? rightX : (frame.origin.x - gap - stripWidth)
 
-        panel.setFrame(NSRect(x: x, y: y, width: stripWidth, height: height), display: true)
+        panel.setFrame(NSRect(x: x, y: y, width: stripWidth, height: height), display: false)
+
+        // Keep the strip directly above the phone window in the stacking order, so
+        // it rises and sinks WITH the phone window instead of floating over other
+        // apps. If we don't know the window number yet, just make it visible.
+        if let wid = phoneWindowID {
+            panel.order(.above, relativeTo: Int(wid))
+        } else if !panel.isVisible {
+            panel.orderFront(nil)
+        }
     }
 
     /// Show the remote and start hosting the controls for `model`.
@@ -50,7 +60,10 @@ final class FloatingRemoteController {
                 styleMask: [.nonactivatingPanel, .fullSizeContentView, .borderless],
                 backing: .buffered, defer: false)
             panel.isFloatingPanel = true
-            panel.level = .floating
+            // Normal window level so the strip shares the phone window's z-order
+            // (it doesn't float above other apps) — we keep it just above the
+            // scrcpy window via `order(.above:)` in `update(for:)`.
+            panel.level = .normal
             panel.titleVisibility = .hidden
             panel.titlebarAppearsTransparent = true
             panel.isMovable = false
@@ -65,7 +78,7 @@ final class FloatingRemoteController {
             panel.contentView = NSHostingView(rootView: RemoteStrip(model: model))
             self.panel = panel
         }
-        panel?.orderFrontRegardless()
+        panel?.orderFront(nil)
     }
 
     /// Hide the strip (e.g. when the phone window moves to another space).

@@ -160,8 +160,9 @@ final class AppModel {
     /// recording. Called from the app delegate on quit so no orphan windows or
     /// child processes are left behind.
     func shutdown() {
-        if isRecording, let proc = recordProcess, proc.isRunning {
-            proc.terminate()
+        if isRecording {
+            recorder.interruptRecording()
+            recorder.forceStopRecording()
         }
         pinner.stop()
         windowTracker.stop()
@@ -610,13 +611,15 @@ final class AppModel {
             self.pinner.handleWindowAppeared(frame)
             if self.settings.showSidebar {
                 self.floatingRemote.show(model: self)
-                self.floatingRemote.update(for: frame)
+                self.floatingRemote.update(for: frame, phoneWindowID: self.windowTracker.windowID)
             }
         }
         windowTracker.onFrameChange = { [weak self] frame in
             guard let self else { return }
             self.pinner.handleFrameChange(frame)
-            if self.settings.showSidebar { self.floatingRemote.update(for: frame) }
+            if self.settings.showSidebar {
+                self.floatingRemote.update(for: frame, phoneWindowID: self.windowTracker.windowID)
+            }
         }
         windowTracker.onDisappear = { [weak self] in
             self?.floatingRemote.hideTemporarily()
@@ -658,7 +661,7 @@ final class AppModel {
         floatingRemote.setEnabled(visible)
         if visible, isMirroring, let frame = windowTracker.currentFrame {
             floatingRemote.show(model: self)
-            floatingRemote.update(for: frame)
+            floatingRemote.update(for: frame, phoneWindowID: windowTracker.windowID)
         }
     }
 
@@ -1691,21 +1694,21 @@ final class AppModel {
 
     /// True while a phone screen recording is in progress.
     private(set) var isRecording = false
-    @ObservationIgnored private var recordProcess: Process?
-    @ObservationIgnored private var recordRemotePath: String?
+    /// Dedicated scrcpy session used purely for recording (separate from the
+    /// mirror session so the two don't interfere).
+    @ObservationIgnored private let recorder = Scrcpy()
     @ObservationIgnored private var recordDest: URL?
-    @ObservationIgnored private var recordSerial: String?
 
     /// Start or stop a screen recording, saved to the capture folder on stop.
     func toggleScreenRecording() async {
         if isRecording {
             await stopScreenRecording()
         } else {
-            await startScreenRecording()
+            startScreenRecording()
         }
     }
 
-    private func startScreenRecording() async {
+    private func startScreenRecording() {
         guard let serial = selectedSerial,
               selectedDevice?.state.isUsable == true else {
             status = "Select a connected device first"
@@ -1713,54 +1716,55 @@ final class AppModel {
         }
         let folder = settings.ensureCaptureFolderExists()
         let name = "Recording-\(Self.timestamp()).mp4"
-        let remotePath = "/sdcard/MimicOS-rec-\(UUID().uuidString).mp4"
-        recordDest = folder.appendingPathComponent(name)
-        recordRemotePath = remotePath
-        recordSerial = serial
+        let dest = folder.appendingPathComponent(name)
+        recordDest = dest
 
-        let started = await ADB.startScreenRecord(serial, remotePath: remotePath) { [weak self] proc in
-            Task { @MainActor in self?.recordProcess = proc }
+        // Record via scrcpy's own H.264 pipeline (no-window session) straight to
+        // the Mac. This avoids the device's `screenrecord`, which fails with
+        // "Encoder failed (err=-38)" on some phones. No 3-minute cap either.
+        let started = recorder.startRecording(serial: serial, to: dest) { [weak self] code in
+            Task { @MainActor in
+                guard let self, self.isRecording else { return }
+                // scrcpy exited on its own (device dropped, etc.).
+                self.isRecording = false
+                if code == 0, FileManager.default.fileExists(atPath: dest.path) {
+                    self.status = "Saved \(dest.lastPathComponent)"
+                    NSWorkspace.shared.activateFileViewerSelecting([dest])
+                } else {
+                    self.status = "Recording stopped unexpectedly"
+                }
+            }
         }
         if started {
             isRecording = true
-            status = "Recording… (tap again to stop · max 3 min)"
+            status = "Recording… (tap again to stop)"
         } else {
             status = "Couldn't start recording"
             recordDest = nil
-            recordRemotePath = nil
-            recordSerial = nil
         }
     }
 
     private func stopScreenRecording() async {
-        guard let serial = recordSerial,
-              let remotePath = recordRemotePath,
-              let dest = recordDest else {
-            isRecording = false
-            return
-        }
+        guard let dest = recordDest else { isRecording = false; return }
         isRecording = false
         status = "Finalizing recording…"
-
-        // Stop the ON-DEVICE screenrecord cleanly (SIGINT) so the MP4 is
-        // finalized and playable; only after it exits do we tear down the adb
-        // pipe and pull the file.
-        await ADB.stopScreenRecord(serial)
-        if let proc = recordProcess, proc.isRunning {
-            proc.terminate()
+        // SIGINT lets scrcpy write the MP4 moov atom; wait (without blocking the
+        // main thread) for it to exit, then force-stop if it overstays.
+        recorder.interruptRecording()
+        for _ in 0..<50 {   // up to ~5s
+            if !recorder.isRecordingProcessRunning { break }
+            try? await Task.sleep(for: .milliseconds(100))
         }
-        recordProcess = nil
+        recorder.forceStopRecording()
 
-        status = "Saving recording…"
-        if let url = await ADB.finishScreenRecord(serial, remotePath: remotePath, localFile: dest) {
-            status = "Saved \(url.lastPathComponent)"
-            NSWorkspace.shared.activateFileViewerSelecting([url])
+        if FileManager.default.fileExists(atPath: dest.path),
+           (try? FileManager.default.attributesOfItem(atPath: dest.path)[.size] as? Int ?? 0) ?? 0 > 0 {
+            status = "Saved \(dest.lastPathComponent)"
+            NSWorkspace.shared.activateFileViewerSelecting([dest])
         } else {
             status = "Recording failed to save"
         }
-        recordRemotePath = nil
         recordDest = nil
-        recordSerial = nil
     }
 
     private static func timestamp() -> String {

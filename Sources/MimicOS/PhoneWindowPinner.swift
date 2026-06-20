@@ -20,6 +20,41 @@ final class PhoneWindowPinner {
 
     init(tracker: ScrcpyWindowTracker) {
         self.tracker = tracker
+        // CRITICAL: macOS only keeps a window on the spaces it was added to *at
+        // the moment of the call*; switching desktops doesn't fire an AX move
+        // event, so we must re-add the window to all spaces every time the active
+        // space changes — otherwise the phone window drops off other desktops.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.activeSpaceDidChangeNotification,
+            object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.reapplyOnSpaceChange() }
+            }
+    }
+
+    // The pinner lives for the whole app session (owned by AppModel), so the
+    // space-change observer is intentionally left registered until the process
+    // exits — no deinit cleanup needed.
+
+    /// Re-assert all-spaces membership after a desktop switch. Without a
+    /// SIP-disabled scripting addition there's no permanent sticky bit, so the
+    /// window must be re-added to all spaces each time the active space changes.
+    /// We fire a short burst because the window/space state can settle a beat
+    /// after the notification.
+    private func reapplyOnSpaceChange() {
+        guard isPinned else { return }
+        applyAllSpaces()
+        // A couple of delayed retries to cover the window-recreation / settle race.
+        for delay in [0.15, 0.4] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self, self.isPinned else { return }
+                self.applyAllSpaces()
+            }
+        }
+    }
+
+    private func applyAllSpaces() {
+        guard let wid = tracker.windowID else { return }
+        PrivateSpaces.setWindowOnAllSpaces(wid, enabled: true)
     }
 
     @discardableResult

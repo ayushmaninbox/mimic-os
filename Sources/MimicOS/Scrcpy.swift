@@ -168,6 +168,57 @@ final class Scrcpy {
         return launched != nil
     }
 
+    /// Records the screen to `file` using scrcpy's own H.264 pipeline (a hidden,
+    /// no-window session). This bypasses the device's `screenrecord`, which fails
+    /// with "Encoder failed (err=-38)" on some phones (e.g. Android 16 hardware).
+    /// Stop with `stopRecording`, which lets scrcpy finalize the MP4 cleanly.
+    @discardableResult
+    func startRecording(serial: String, to file: URL,
+                        onExit: (@Sendable (Int32) -> Void)? = nil) -> Bool {
+        stop()
+        let args = ["-s", serial, "--no-window", "--no-audio",
+                    "--record", file.path]
+        let proc = Process()
+        let launchPath = ToolLocator.scrcpy
+        if launchPath.contains("/") {
+            proc.executableURL = URL(fileURLWithPath: launchPath)
+            proc.arguments = args
+        } else {
+            proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            proc.arguments = [launchPath] + args
+        }
+        proc.environment = ToolLocator.toolEnvironment()
+        proc.terminationHandler = { p in onExit?(p.terminationStatus) }
+        do {
+            try proc.run()
+            process = proc
+            return true
+        } catch {
+            lastError = error.localizedDescription
+            return false
+        }
+    }
+
+    /// Sends SIGINT so scrcpy finalizes the MP4 (writes the moov atom). The
+    /// caller should wait briefly, then call `forceStopRecording` to confirm exit.
+    func interruptRecording() {
+        if let process, process.isRunning {
+            process.interrupt()       // SIGINT → clean MP4 finalize
+        }
+    }
+
+    /// True while the recording process is still finalizing.
+    var isRecordingProcessRunning: Bool { process?.isRunning ?? false }
+
+    /// Ensure the recording process is gone after the SIGINT grace period.
+    func forceStopRecording() {
+        if let process, process.isRunning {
+            process.terminate()
+            process.waitUntilExit()
+        }
+        process = nil
+    }
+
     /// Terminates the running mirror session, if any.
     func stop() {
         if let process {
