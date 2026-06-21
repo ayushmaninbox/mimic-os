@@ -57,8 +57,7 @@ struct RenameRequest: Identifiable {
 struct SidebarView: View {
     @Environment(AppModel.self) private var model
     @State private var renameRequest: RenameRequest?
-    @State private var editorHost: RemoteHost?
-    @State private var showEditor = false
+    @State private var editorState: HostEditorState?
 
     var body: some View {
         @Bindable var model = model
@@ -125,18 +124,17 @@ struct SidebarView: View {
         )) {
             AddDeviceSheet(onAddComputer: {
                 model.showAddDevice = false
-                editorHost = nil
-                showEditor = true
+                editorState = HostEditorState(host: nil)
             })
         }
         // Add / edit a computer.
-        .sheet(isPresented: $showEditor) {
-            RemoteHostEditor(host: editorHost) { host, password in
+        .sheet(item: $editorState) { state in
+            RemoteHostEditor(host: state.host) { host, password in
                 model.saveRemoteHost(host, password: password)
                 model.selection = .computer(host.id)
-                showEditor = false
+                editorState = nil
             } onCancel: {
-                showEditor = false
+                editorState = nil
             }
         }
         .task { await model.refreshAllHostReachability() }
@@ -169,8 +167,7 @@ struct SidebarView: View {
     @ViewBuilder
     private func hostMenu(_ host: RemoteHost) -> some View {
         Button {
-            editorHost = host
-            showEditor = true
+            editorState = HostEditorState(host: host)
         } label: { Label("Edit…", systemImage: "pencil") }
         Button {
             Task { await model.pingHost(host) }

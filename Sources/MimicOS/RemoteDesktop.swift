@@ -158,10 +158,9 @@ final class RemoteDesktop {
         if !c.password.isEmpty { args.append("/p:\(c.password)") }
 
         if c.fullscreen {
-            // Open straight into fullscreen (Ctrl+Alt+Enter toggles back). Use the
-            // `/f` slash form, not `+f` — on the SDL client `+f` triggers a
-            // multi-monitor detection path that fails ("invalid monitor config").
-            args.append("/f")
+            // Avoid native macOS space-switching which causes black screens under XQuartz/SDL.
+            // Launch as a borderless window matching full screen size instead.
+            args.append(contentsOf: ["-decorations", "/size:100%", "/smart-sizing", "/gdi:sw"])
         } else {
             // Open in a generous resizable window and scale the remote desktop to
             // fit it (smart-sizing) so nothing is clipped and dragging resizes the

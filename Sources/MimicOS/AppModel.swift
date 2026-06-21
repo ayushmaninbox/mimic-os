@@ -182,16 +182,32 @@ final class AppModel {
     /// The attached floating remote-control window shown beside the phone screen.
     @ObservationIgnored let floatingRemote = FloatingRemoteController()
 
-    private let scrcpy = Scrcpy()
+    @ObservationIgnored private var scrcpySessions: [String: Scrcpy] = [:]
+    var mirroringSerials: Set<String> = []
+    
+    private func scrcpySession(for serial: String) -> Scrcpy {
+        if let session = scrcpySessions[serial] {
+            return session
+        }
+        let session = Scrcpy()
+        scrcpySessions[serial] = session
+        return session
+    }
+
     private let headlessScrcpy = Scrcpy()
     private var headlessSerial: String?
 
     /// Stable window title handed to scrcpy so the tracker can find its window.
     private var mirrorWindowTitle: String?
 
-    /// Serial of the device currently being mirrored, or nil. This is observable
-    /// (unlike `scrcpy.isRunning`), so the UI updates the moment we start/stop.
-    private(set) var mirroringSerial: String?
+    /// Serial of the device currently being mirrored, or nil. This is observable,
+    /// and checks if the currently selected phone is mirrored.
+    var mirroringSerial: String? {
+        if let serial = selectedSerial, mirroringSerials.contains(serial) {
+            return serial
+        }
+        return nil
+    }
     var isMirroring: Bool { mirroringSerial != nil }
 
     /// Drives the "Add Device" sheet opened by the + button.
@@ -256,9 +272,12 @@ final class AppModel {
         }
         windowTracker.stop()
         floatingRemote.hide()
-        mirroringSerial = nil
+        mirroringSerials.removeAll()
         mirrorWindowTitle = nil
-        scrcpy.stop()
+        for session in scrcpySessions.values {
+            session.stop()
+        }
+        scrcpySessions.removeAll()
         headlessScrcpy.stop()
         remoteDesktop.stop()
         connectedRemoteHostID = nil
@@ -499,12 +518,12 @@ final class AppModel {
 
         devices = found
 
-        if let serial = mirroringSerial,
-           let device = found.first(where: { $0.serial == serial }),
-           !device.state.isUsable {
-            scrcpy.stop()
-            mirroringSerial = nil
-            status = "Mirror stopped (device disconnected)"
+        for serial in mirroringSerials {
+            if let device = found.first(where: { $0.serial == serial }),
+               !device.state.isUsable {
+                stopMirror(serial: serial)
+                status = "Mirror stopped for \(device.displayName) (device disconnected)"
+            }
         }
 
         // Keep a valid selection.
@@ -551,9 +570,8 @@ final class AppModel {
     /// Drop the connection but keep the device remembered.
     func disconnect(_ device: Device) async {
         DeviceStore.disconnect(device.serial)
-        if mirroringSerial == device.serial {
-            scrcpy.stop()
-            mirroringSerial = nil
+        if mirroringSerials.contains(device.serial) {
+            stopMirror(serial: device.serial)
         }
         if device.isWireless {
             _ = await ADB.disconnect(hostPort: device.serial)
@@ -568,9 +586,8 @@ final class AppModel {
         if device.isWireless {
             _ = await ADB.disconnect(hostPort: device.serial)
         }
-        if mirroringSerial == device.serial {
-            scrcpy.stop()
-            mirroringSerial = nil
+        if mirroringSerials.contains(device.serial) {
+            stopMirror(serial: device.serial)
         }
         DeviceStore.forget(device.serial)
         if selectedSerial == device.serial { selectedSerial = nil; info = nil }
@@ -585,6 +602,16 @@ final class AppModel {
         selectedHostID = nil          // selecting a phone deselects any computer
         selectedSerial = serial
         info = await ADB.info(serial)
+        
+        // Update window tracker for the newly selected device
+        windowTracker.stop()
+        floatingRemote.hide()
+        if mirroringSerials.contains(serial) {
+            let title = "MimicOS — \(devices.first(where: { $0.serial == serial })?.displayName ?? serial)"
+            let pid = scrcpySessions[serial]?.processPID
+            beginWindowTracking(title: title, pid: pid)
+        }
+        
         updateBackgroundClipboardSync()
         startScreenshotWatch()
         await refreshRingerAndDNDStatus()
@@ -652,8 +679,8 @@ final class AppModel {
             status = "Select a device first"
             return
         }
-        if isMirroring {
-            stopMirror()
+        if mirroringSerials.contains(serial) {
+            stopMirror(serial: serial)
         } else {
             startMirror(serial: serial, restarting: false)
         }
@@ -663,12 +690,19 @@ final class AppModel {
     /// keep the current window frame (so a live settings change reopens in the
     /// same spot) and don't touch the headless clipboard session.
     private func startMirror(serial: String, restarting: Bool) {
-        if !restarting {
-            headlessScrcpy.stop()
-            headlessSerial = nil
+        if !restarting && mirroringSerials.contains(serial) {
+            status = "Device is already mirroring"
+            return
         }
 
-        let title = "MimicOS — \(selectedDevice?.displayName ?? serial)"
+        if !restarting {
+            if headlessSerial == serial {
+                headlessScrcpy.stop()
+                headlessSerial = nil
+            }
+        }
+
+        let title = "MimicOS — \(devices.first(where: { $0.serial == serial })?.displayName ?? serial)"
         mirrorWindowTitle = title
 
         var options = Scrcpy.Options()
@@ -683,66 +717,67 @@ final class AppModel {
         options.windowFrame = (restarting ? windowTracker.currentFrame : nil) ?? settings.phoneWindowFrame
 
         // Each start gets a unique token. An exit handler only tears the session
-        // down if it's still the current one — so an intentional restart (which
-        // bumps the token before the old process's async handler runs) won't kill
-        // the fresh session. Race-free, unlike a plain "is restarting" flag.
-        mirrorGeneration &+= 1
-        let token = mirrorGeneration
-
-        let ok = scrcpy.start(serial: serial, options: options) { [weak self] status, errText in
+        let session = scrcpySession(for: serial)
+        let ok = session.start(serial: serial, options: options) { [weak self] status, errText in
             Task { @MainActor in
-                guard let self, self.mirrorGeneration == token,
-                      self.mirroringSerial == serial else { return }
-                self.persistPhoneWindowFrame()
-                self.mirroringSerial = nil
-                self.windowTracker.stop()
-                self.floatingRemote.hide()
-                self.mirrorWindowTitle = nil
+                guard let self else { return }
+                if self.mirroringSerials.contains(serial) {
+                    self.persistPhoneWindowFrame()
+                    self.mirroringSerials.remove(serial)
+                    if self.selectedSerial == serial {
+                        self.windowTracker.stop()
+                        self.floatingRemote.hide()
+                    }
+                }
+                
                 if status != 0 && !errText.isEmpty {
                     let cleanErr = errText.split(separator: "\n").last.map(String.init) ?? errText
-                    self.status = "Mirror failed: \(cleanErr.trimmingCharacters(in: .whitespacesAndNewlines))"
+                    self.status = "Mirror failed for \(serial): \(cleanErr.trimmingCharacters(in: .whitespacesAndNewlines))"
                 } else {
-                    self.status = "Mirror stopped"
+                    self.status = "Mirror stopped for \(serial)"
                 }
                 self.updateBackgroundClipboardSync()
                 self.updatePasswordFieldWatch()
             }
         }
-        mirroringSerial = ok ? serial : nil
-        status = ok
-            ? (turnScreenOff ? "Mirroring (phone screen off)" : "Mirroring")
-            : "Failed to start scrcpy"
-
-        if ok { beginWindowTracking(title: title, pid: scrcpy.processPID) }
+        if ok {
+            mirroringSerials.insert(serial)
+            status = turnScreenOff ? "Mirroring (phone screen off)" : "Mirroring"
+            if selectedSerial == serial {
+                beginWindowTracking(title: title, pid: session.processPID)
+            }
+        } else {
+            status = "Failed to start scrcpy"
+        }
         updatePasswordFieldWatch()
     }
 
-    /// Bumped on every scrcpy (re)start; old exit handlers compare against it.
-    @ObservationIgnored private var mirrorGeneration = 0
 
     /// Apply mirror-affecting settings (screen-off, awake, UHID, audio) to the
     /// live session by restarting scrcpy in place. No-op when not mirroring.
     func applyMirrorSettingsLive() {
-        guard isMirroring, let serial = mirroringSerial else { return }
+        guard let serial = selectedSerial, mirroringSerials.contains(serial) else { return }
         // Capture the current frame so the new window reopens in the same place.
         if let frame = windowTracker.currentFrame { settings.phoneWindowFrame = frame }
         windowTracker.stop()
         // startMirror bumps the generation token, so the old process's exit
         // handler is ignored when it fires.
-        scrcpy.stop()
+        scrcpySessions[serial]?.stop()
         startMirror(serial: serial, restarting: true)
         status = "Updated mirror settings"
     }
 
     /// Stop mirroring and tear down tracking / floating remote, saving the
     /// window's last frame first.
-    private func stopMirror() {
+    private func stopMirror(serial: String) {
         persistPhoneWindowFrame()
-        mirroringSerial = nil
-        windowTracker.stop()
-        floatingRemote.hide()
-        mirrorWindowTitle = nil
-        scrcpy.stop()
+        mirroringSerials.remove(serial)
+        if selectedSerial == serial {
+            windowTracker.stop()
+            floatingRemote.hide()
+            mirrorWindowTitle = nil
+        }
+        scrcpySessions[serial]?.stop()
         status = "Mirror stopped"
         updateBackgroundClipboardSync()
         updatePasswordFieldWatch()
@@ -768,8 +803,8 @@ final class AppModel {
         }
 
         windowTracker.onAppear = { [weak self] frame in
-            guard let self else { return }
-            if let pid = self.scrcpy.processPID, let app = NSRunningApplication(processIdentifier: pid) {
+            guard let self, let serial = self.selectedSerial else { return }
+            if let pid = self.scrcpySessions[serial]?.processPID, let app = NSRunningApplication(processIdentifier: pid) {
                 app.activate(options: [])
             }
             if self.settings.showSidebar {
@@ -971,6 +1006,9 @@ final class AppModel {
     /// Saved connections shown in the Remote Desktop tab.
     var remoteHosts: [RemoteHost] = []
 
+    /// Setup confirmation per host and tab: true = setup has been completed/confirmed.
+    var hostSetupConfirmed: [UUID: [String: Bool]] = [:]
+
     /// id of the host whose RDP session is currently running (nil if none, or if
     /// the active session is VNC, which the OS owns).
     private(set) var connectedRemoteHostID: UUID?
@@ -990,20 +1028,40 @@ final class AppModel {
         if let id = selectedHostID, !remoteHosts.contains(where: { $0.id == id }) {
             selectedHostID = nil
         }
+        
+        // Load setup confirmations from UserDefaults
+        for host in remoteHosts {
+            hostSetupConfirmed[host.id] = UserDefaults.standard.dictionary(forKey: "MimicOS.setupConfirmed.\(host.id)") as? [String: Bool] ?? [:]
+        }
+        
         Task {
             await refreshAllHostReachability()
         }
     }
 
     /// Save (or update) a host. If a non-empty password is supplied, it's stored
-    /// in the Keychain; an empty password leaves any existing one untouched.
+    /// in the Keychain; an empty password clears any existing password in the Keychain.
     func saveRemoteHost(_ host: RemoteHost, password: String) {
         RemoteHostStore.upsert(host)
-        if !password.isEmpty {
+        if password.isEmpty {
+            SecretStore.clearRemotePassword(hostID: host.idString)
+        } else {
             SecretStore.setRemotePassword(password, hostID: host.idString)
-            remoteSecretsRevision += 1
         }
+        remoteSecretsRevision += 1
         loadRemoteHosts()
+    }
+
+    func isSetupConfirmed(for host: RemoteHost, tab: PCTab) -> Bool {
+        hostSetupConfirmed[host.id]?[tab.rawValue] ?? false
+    }
+
+    func setSetupConfirmed(_ confirmed: Bool, for host: RemoteHost, tab: PCTab) {
+        if hostSetupConfirmed[host.id] == nil {
+            hostSetupConfirmed[host.id] = [:]
+        }
+        hostSetupConfirmed[host.id]?[tab.rawValue] = confirmed
+        UserDefaults.standard.set(hostSetupConfirmed[host.id], forKey: "MimicOS.setupConfirmed.\(host.id)")
     }
 
     func deleteRemoteHost(_ host: RemoteHost) {
@@ -1128,6 +1186,38 @@ final class AppModel {
                 : "Opening \(host.name)'s files in Finder…"
         } else {
             status = "Couldn't open file share for \(host.name)"
+        }
+    }
+
+    /// Copy files to remote PC using scp
+    func transferFilesToPC(_ filePaths: [String], toHost host: RemoteHost) async {
+        let username = host.username
+        let hostname = host.host
+        let portArg = host.port.map { ["-P", "\($0)"] } ?? []
+        let portArgSSH = host.port.map { ["-p", "\($0)"] } ?? []
+        let target = username.isEmpty ? hostname : "\(username)@\(hostname)"
+        let dest = host.destFolder
+        
+        status = "Transferring to \(host.name)..."
+        
+        let mkdirCmd = "/usr/bin/ssh"
+        let mkdirArgs = portArgSSH + [target, "mkdir -p \"\(dest)\""]
+        _ = await Shell.run(mkdirCmd, mkdirArgs)
+        
+        var succeeded = true
+        for path in filePaths {
+            let scpCmd = "/usr/bin/scp"
+            let scpArgs = portArg + ["-r", path, "\(target):\"\(dest)\""]
+            let result = await Shell.run(scpCmd, scpArgs)
+            if result.exitCode != 0 {
+                succeeded = false
+            }
+        }
+        
+        if succeeded {
+            status = "Successfully transferred \(filePaths.count) files to \(host.name): \(dest)"
+        } else {
+            status = "Failed to transfer files to \(host.name). Make sure SSH/Samba is configured and SSH keys are set up."
         }
     }
 

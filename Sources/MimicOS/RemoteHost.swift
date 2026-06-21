@@ -46,9 +46,13 @@ struct RemoteHost: Identifiable, Codable, Hashable {
     /// predate this field) still decode; defaults to Windows when absent.
     var os: RemoteOS = .windows
     var proto: RemoteDesktop.Kind
+    var destFolder: String = "~/Downloads/MimicOS"
+    var autoReconnect: Bool = true
+    var runInBackground: Bool = false
 
     init(id: UUID = UUID(), name: String, host: String, port: Int? = nil,
-         username: String, os: RemoteOS = .windows, proto: RemoteDesktop.Kind) {
+         username: String, os: RemoteOS = .windows, proto: RemoteDesktop.Kind,
+         destFolder: String = "~/Downloads/MimicOS", autoReconnect: Bool = true, runInBackground: Bool = false) {
         self.id = id
         self.name = name
         self.host = host
@@ -56,13 +60,16 @@ struct RemoteHost: Identifiable, Codable, Hashable {
         self.username = username
         self.os = os
         self.proto = proto
+        self.destFolder = destFolder
+        self.autoReconnect = autoReconnect
+        self.runInBackground = runInBackground
     }
 
     // Custom decoding so hosts saved before `os` existed still load (defaulting
     // to Windows) instead of failing the whole list decode. Any keys from
     // removed fields (e.g. an old `macAddress`) are ignored.
     private enum CodingKeys: String, CodingKey {
-        case id, name, host, port, username, os, proto
+        case id, name, host, port, username, os, proto, destFolder, autoReconnect, runInBackground
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -73,6 +80,9 @@ struct RemoteHost: Identifiable, Codable, Hashable {
         username = try c.decode(String.self, forKey: .username)
         os = try c.decodeIfPresent(RemoteOS.self, forKey: .os) ?? .windows
         proto = try c.decode(RemoteDesktop.Kind.self, forKey: .proto)
+        destFolder = try c.decodeIfPresent(String.self, forKey: .destFolder) ?? "~/Downloads/MimicOS"
+        autoReconnect = try c.decodeIfPresent(Bool.self, forKey: .autoReconnect) ?? true
+        runInBackground = try c.decodeIfPresent(Bool.self, forKey: .runInBackground) ?? false
     }
 
     /// What to show as the connection target, e.g. "user@192.168.1.50".

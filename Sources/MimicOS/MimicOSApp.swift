@@ -185,22 +185,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let model = model else { return }
         let paths = urls.map { $0.path }
         let active = model.usableDevices
+        let computers = model.remoteHosts
 
-        // With more than one active device, ask which one should receive the
-        // files — pop up a small menu at the status item. With 0 or 1, just
-        // transfer (the existing path picks the only/selected device).
-        if active.count > 1 {
-            presentDropTargetPicker(devices: active, paths: paths)
+        let totalCount = active.count + computers.count
+        if totalCount > 1 {
+            presentDropTargetPicker(devices: active, computers: computers, paths: paths)
             return
         }
 
-        model.openMainWindowAction?()
-        Task { await model.transferFilesFromDragDrop(paths) }
+        if let device = active.first {
+            model.openMainWindowAction?()
+            Task { await model.transferFiles(paths, toSerial: device.serial) }
+        } else if let host = computers.first {
+            Task { await model.transferFilesToPC(paths, toHost: host) }
+        } else {
+            model.status = "No connected device or computer available for file transfer."
+        }
     }
 
-    /// Pops up a menu under the status item listing the active devices, so the
+    /// Pops up a menu under the status item listing the active devices and PCs, so the
     /// user picks which one receives the dropped files.
-    private func presentDropTargetPicker(devices: [Device], paths: [String]) {
+    private func presentDropTargetPicker(devices: [Device], computers: [RemoteHost], paths: [String]) {
         let menu = NSMenu()
 
         let header = NSMenuItem(
@@ -210,13 +215,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(header)
         menu.addItem(NSMenuItem.separator())
 
-        for device in devices {
-            let item = NSMenuItem(title: device.displayName, action: #selector(dropTargetChosen(_:)), keyEquivalent: "")
-            item.target = self
-            item.image = NSImage(systemSymbolName: "iphone.gen3", accessibilityDescription: "")
-            // Carry both the serial and the paths so the action can run the transfer.
-            item.representedObject = DropTarget(serial: device.serial, paths: paths)
-            menu.addItem(item)
+        if !devices.isEmpty {
+            let phoneHeader = NSMenuItem(title: "Phones", action: nil, keyEquivalent: "")
+            phoneHeader.isEnabled = false
+            menu.addItem(phoneHeader)
+            
+            for device in devices {
+                let item = NSMenuItem(title: device.displayName, action: #selector(dropTargetChosen(_:)), keyEquivalent: "")
+                item.target = self
+                item.image = NSImage(systemSymbolName: "iphone.gen3", accessibilityDescription: "")
+                item.representedObject = DropTarget(serial: device.serial, isPC: false, id: nil, paths: paths)
+                menu.addItem(item)
+            }
+        }
+
+        if !computers.isEmpty {
+            if !devices.isEmpty {
+                menu.addItem(NSMenuItem.separator())
+            }
+            let pcHeader = NSMenuItem(title: "Computers", action: nil, keyEquivalent: "")
+            pcHeader.isEnabled = false
+            menu.addItem(pcHeader)
+            
+            for host in computers {
+                let item = NSMenuItem(title: host.name, action: #selector(dropTargetChosen(_:)), keyEquivalent: "")
+                item.target = self
+                item.image = NSImage(systemSymbolName: host.os.systemImage, accessibilityDescription: "")
+                item.representedObject = DropTarget(serial: nil, isPC: true, id: host.id, paths: paths)
+                menu.addItem(item)
+            }
         }
 
         // Show the menu anchored to the status item.
@@ -227,17 +254,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// Box carrying a drop's target serial + file paths through `representedObject`.
+    /// Box carrying a drop's target serial/id + file paths through `representedObject`.
     private final class DropTarget: NSObject {
-        let serial: String
+        let serial: String?
+        let isPC: Bool
+        let id: UUID?
         let paths: [String]
-        init(serial: String, paths: [String]) { self.serial = serial; self.paths = paths }
+        init(serial: String?, isPC: Bool, id: UUID?, paths: [String]) {
+            self.serial = serial
+            self.isPC = isPC
+            self.id = id
+            self.paths = paths
+        }
     }
 
     @objc private func dropTargetChosen(_ sender: NSMenuItem) {
         guard let model = model, let target = sender.representedObject as? DropTarget else { return }
-        model.openMainWindowAction?()
-        Task { await model.transferFiles(target.paths, toSerial: target.serial) }
+        if target.isPC {
+            if let id = target.id, let host = model.remoteHosts.first(where: { $0.id == id }) {
+                Task { await model.transferFilesToPC(target.paths, toHost: host) }
+            }
+        } else if let serial = target.serial {
+            model.openMainWindowAction?()
+            Task { await model.transferFiles(target.paths, toSerial: serial) }
+        }
     }
 
     // MARK: - NSMenuDelegate
@@ -282,128 +322,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
         guard let model = model else { return }
-
-        let active = model.usableDevices
-
-        switch active.count {
-        case 0:
-            let noDeviceItem = NSMenuItem(title: "No device connected", action: nil, keyEquivalent: "")
-            noDeviceItem.isEnabled = false
-            noDeviceItem.image = NSImage(systemSymbolName: "cable.connector.slash", accessibilityDescription: "")
-            menu.addItem(noDeviceItem)
-            menu.addItem(NSMenuItem.separator())
-
-        case 1:
-            // A single device collapses to flat inline controls (like before).
-            let device = active[0]
-            let titleItem = NSMenuItem(title: device.displayName, action: nil, keyEquivalent: "")
-            titleItem.isEnabled = false
-            titleItem.image = NSImage(systemSymbolName: "iphone.gen3", accessibilityDescription: "")
-            menu.addItem(titleItem)
-            menu.addItem(NSMenuItem.separator())
-            addDeviceControlItems(to: menu, device: device)
-            menu.addItem(NSMenuItem.separator())
-
-        default:
-            // Multiple devices: one expandable submenu per device.
-            let header = NSMenuItem(title: "Devices", action: nil, keyEquivalent: "")
-            header.isEnabled = false
-            menu.addItem(header)
-            for device in active {
-                let item = NSMenuItem(title: device.displayName, action: nil, keyEquivalent: "")
-                item.image = NSImage(systemSymbolName: "iphone.gen3", accessibilityDescription: "")
-                let submenu = NSMenu()
-                addDeviceControlItems(to: submenu, device: device)
-                item.submenu = submenu
-                menu.addItem(item)
-            }
-            menu.addItem(NSMenuItem.separator())
-        }
-
-        let computers = model.remoteHosts
-        if !computers.isEmpty {
-            let compHeader = NSMenuItem(title: "Computers", action: nil, keyEquivalent: "")
-            compHeader.isEnabled = false
-            menu.addItem(compHeader)
-            
-            for host in computers {
-                let isConnected = model.connectedRemoteHostID == host.id
-                let reachable = model.hostReachability[host.id] ?? false
-                
-                let item = NSMenuItem(title: host.name, action: nil, keyEquivalent: "")
-                item.image = NSImage(systemSymbolName: host.os.systemImage, accessibilityDescription: "")
-                if #available(macOS 12.0, *) {
-                    let color = (isConnected || reachable) ? NSColor.systemGreen : NSColor.systemGray
-                    item.image = item.image?.withSymbolConfiguration(NSImage.SymbolConfiguration(paletteColors: [color]))
-                }
-                
-                let submenu = NSMenu()
-                
-                let connectItem = NSMenuItem(
-                    title: isConnected ? "Disconnect Screen" : "Start Screen Sharing",
-                    action: isConnected ? #selector(disconnectComputer(_:)) : #selector(connectComputer(_:)),
-                    keyEquivalent: ""
-                )
-                connectItem.target = self
-                connectItem.representedObject = host.idString
-                connectItem.image = NSImage(systemSymbolName: isConnected ? "wifi.slash" : "display", accessibilityDescription: "")
-                submenu.addItem(connectItem)
-                
-                let filesItem = NSMenuItem(
-                    title: "Open Files in Finder",
-                    action: #selector(openComputerFiles(_:)),
-                    keyEquivalent: ""
-                )
-                filesItem.target = self
-                filesItem.representedObject = host.idString
-                filesItem.image = NSImage(systemSymbolName: "folder", accessibilityDescription: "")
-                submenu.addItem(filesItem)
-                
-                let termItem = NSMenuItem(
-                    title: "Open SSH Terminal",
-                    action: #selector(openComputerTerminal(_:)),
-                    keyEquivalent: ""
-                )
-                termItem.target = self
-                termItem.representedObject = host.idString
-                termItem.image = NSImage(systemSymbolName: "terminal", accessibilityDescription: "")
-                submenu.addItem(termItem)
-                
-                item.submenu = submenu
-                menu.addItem(item)
-            }
-            menu.addItem(NSMenuItem.separator())
-        }
-
-        let openItem = NSMenuItem(title: "Open MimicOS", action: #selector(openMimicOS), keyEquivalent: "o")
-        openItem.target = self
-        openItem.image = NSImage(systemSymbolName: "laptopcomputer", accessibilityDescription: "")
-        menu.addItem(openItem)
         
-        let fileManagerItem = NSMenuItem(title: "File Manager", action: #selector(openFileManager), keyEquivalent: "f")
-        fileManagerItem.target = self
-        fileManagerItem.image = NSImage(systemSymbolName: "folder", accessibilityDescription: "")
-        menu.addItem(fileManagerItem)
-        
-        let settingsItem = NSMenuItem(title: "Settings", action: #selector(openSettings), keyEquivalent: ",")
-        settingsItem.target = self
-        settingsItem.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: "")
-        menu.addItem(settingsItem)
-        
-        menu.addItem(NSMenuItem.separator())
-        
-        let runInBackgroundItem = NSMenuItem(title: "Run in Background", action: #selector(toggleRunInBackground), keyEquivalent: "")
-        runInBackgroundItem.target = self
-        runInBackgroundItem.state = model.settings.runInBackground ? .on : .off
-        runInBackgroundItem.image = NSImage(systemSymbolName: "menubar.arrow.up.rectangle", accessibilityDescription: "")
-        menu.addItem(runInBackgroundItem)
-        
-        menu.addItem(NSMenuItem.separator())
-        
-        let quitItem = NSMenuItem(title: "Quit MimicOS", action: #selector(quitApp), keyEquivalent: "q")
-        quitItem.target = self
-        quitItem.image = NSImage(systemSymbolName: "power", accessibilityDescription: "")
-        menu.addItem(quitItem)
+        let menuItem = NSMenuItem()
+        let hostingView = NSHostingView(rootView: MenuBarView(model: model))
+        hostingView.frame = NSRect(x: 0, y: 0, width: 250, height: 350)
+        menuItem.view = hostingView
+        menu.addItem(menuItem)
     }
     
     // MARK: - Menu Actions
@@ -850,5 +774,261 @@ class DragDropOverlayView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         self.superview?.mouseDown(with: event)
+    }
+}
+
+struct MenuBarView: View {
+    let model: AppModel
+    
+    @State private var expandedSerials: Set<String> = []
+    @State private var expandedPCIDs: Set<UUID> = []
+    
+    var body: some View {
+        VStack(spacing: 0) {
+            ScrollView {
+                VStack(spacing: 8) {
+                    let active = model.usableDevices
+                    let computers = model.remoteHosts
+                    
+                    if active.isEmpty && computers.isEmpty {
+                        VStack(spacing: 8) {
+                            Image(systemName: "cable.connector.slash")
+                                .font(.system(size: 28))
+                                .foregroundStyle(.secondary)
+                            Text("No devices connected")
+                                .font(.headline)
+                            Text("Connect a phone or add a computer in settings")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .multilineTextAlignment(.center)
+                        }
+                        .padding(.vertical, 30)
+                        .frame(maxWidth: .infinity)
+                    } else {
+                        // Phones
+                        ForEach(active) { device in
+                            let isExpanded = expandedSerials.contains(device.serial)
+                            let isMirroring = model.mirroringSerials.contains(device.serial)
+                            
+                            VStack(spacing: 0) {
+                                Button {
+                                    withAnimation(.easeInOut(duration: 0.2)) {
+                                        if isExpanded {
+                                            expandedSerials.remove(device.serial)
+                                        } else {
+                                            expandedSerials.insert(device.serial)
+                                        }
+                                    }
+                                } label: {
+                                    HStack {
+                                        Image(systemName: "iphone")
+                                            .font(.system(size: 14, weight: .semibold))
+                                            .foregroundStyle(isMirroring ? .green : .secondary)
+                                        Text(device.displayName)
+                                            .font(.system(size: 13, weight: .medium))
+                                        Spacer()
+                                        Image(systemName: "chevron.right")
+                                            .font(.system(size: 10, weight: .bold))
+                                            .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    .padding(.vertical, 8)
+                                    .padding(.horizontal, 12)
+                                    .background(Color.white.opacity(isExpanded ? 0.08 : 0.0))
+                                    .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                
+                                if isExpanded {
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        deviceOptionRow(title: "Take Screenshot", icon: "camera") {
+                                            Task {
+                                                await model.menuBarScreenshot(serial: device.serial)
+                                                dismissMenu()
+                                            }
+                                        }
+                                        
+                                        let recording = device.serial == model.selectedSerial && model.isRecording
+                                        deviceOptionRow(
+                                            title: recording ? "Stop Recording" : "Record Screen",
+                                            icon: recording ? "stop.circle" : "record.circle"
+                                        ) {
+                                            Task {
+                                                await model.menuBarToggleRecording(serial: device.serial)
+                                                dismissMenu()
+                                            }
+                                        }
+                                        
+                                        deviceOptionRow(
+                                            title: isMirroring ? "Stop Mirroring" : "Start Mirroring",
+                                            icon: isMirroring ? "stop.circle" : "play.circle"
+                                        ) {
+                                            Task {
+                                                await model.menuBarToggleMirror(serial: device.serial)
+                                                dismissMenu()
+                                            }
+                                        }
+                                        
+                                        let sidebar = model.settings.showSidebar
+                                        deviceOptionRow(
+                                            title: sidebar ? "Hide Control Sidebar" : "Show Control Sidebar",
+                                            icon: "sidebar.right"
+                                        ) {
+                                            model.setSidebarVisible(!sidebar)
+                                            dismissMenu()
+                                        }
+                                    }
+                                    .padding(.leading, 24)
+                                    .padding(.vertical, 4)
+                                    .background(Color.black.opacity(0.1))
+                                    .transition(.opacity.combined(with: .move(edge: .top)))
+                                }
+                            }
+                            .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.04)))
+                        }
+                        
+                        // Computers
+                        ForEach(computers) { host in
+                            let isExpanded = expandedPCIDs.contains(host.id)
+                            let isConnected = model.connectedRemoteHostID == host.id
+                            let reachable = model.hostReachability[host.id] ?? false
+                            
+                            VStack(spacing: 0) {
+                                Button {
+                                    withAnimation(.easeInOut(duration: 0.2)) {
+                                        if isExpanded {
+                                            expandedPCIDs.remove(host.id)
+                                        } else {
+                                            expandedPCIDs.insert(host.id)
+                                        }
+                                    }
+                                } label: {
+                                    HStack {
+                                        Image(systemName: host.os.systemImage)
+                                            .font(.system(size: 14, weight: .semibold))
+                                            .foregroundStyle(isConnected || reachable ? .green : .secondary)
+                                        Text(host.name)
+                                            .font(.system(size: 13, weight: .medium))
+                                        Spacer()
+                                        Image(systemName: "chevron.right")
+                                            .font(.system(size: 10, weight: .bold))
+                                            .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    .padding(.vertical, 8)
+                                    .padding(.horizontal, 12)
+                                    .background(Color.white.opacity(isExpanded ? 0.08 : 0.0))
+                                    .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                
+                                if isExpanded {
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        deviceOptionRow(
+                                            title: isConnected ? "Disconnect Screen" : "Start Screen Sharing",
+                                            icon: isConnected ? "wifi.slash" : "display"
+                                        ) {
+                                            if isConnected {
+                                                model.disconnectRemoteHost()
+                                            } else {
+                                                model.selection = .computer(host.id)
+                                                model.connectRemoteHost(host)
+                                            }
+                                            dismissMenu()
+                                        }
+                                        
+                                        deviceOptionRow(title: "Open Files in Finder", icon: "folder") {
+                                            model.selection = .computer(host.id)
+                                            Task {
+                                                await model.openFiles(host)
+                                                dismissMenu()
+                                            }
+                                        }
+                                        
+                                        deviceOptionRow(title: "Open SSH Terminal", icon: "terminal") {
+                                            model.selection = .computer(host.id)
+                                            Task {
+                                                await model.openSSH(host)
+                                                dismissMenu()
+                                            }
+                                        }
+                                    }
+                                    .padding(.leading, 24)
+                                    .padding(.vertical, 4)
+                                    .background(Color.black.opacity(0.1))
+                                    .transition(.opacity.combined(with: .move(edge: .top)))
+                                }
+                            }
+                            .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.04)))
+                        }
+                    }
+                }
+                .padding(10)
+            }
+            
+            Divider()
+            
+            HStack(spacing: 16) {
+                Button {
+                    model.openMainWindowAction?()
+                    dismissMenu()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "laptopcomputer")
+                        Text("Open MimicOS")
+                    }
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                
+                Spacer()
+                
+                Button {
+                    model.openSection(.settings)
+                    dismissMenu()
+                } label: {
+                    Image(systemName: "gearshape")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Settings")
+                
+                Button {
+                    NSApp.terminate(nil)
+                } label: {
+                    Image(systemName: "power")
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundStyle(.red.opacity(0.8))
+                }
+                .buttonStyle(.plain)
+                .help("Quit MimicOS")
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .background(Color.white.opacity(0.02))
+        }
+        .frame(width: 250)
+    }
+    
+    private func deviceOptionRow(title: String, icon: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Image(systemName: icon)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                Text(title)
+                    .font(.system(size: 12))
+                Spacer()
+            }
+            .padding(.vertical, 5)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+    
+    private func dismissMenu() {
+        NSApp.sendAction(#selector(NSMenu.cancelTracking), to: nil, from: nil)
     }
 }

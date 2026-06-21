@@ -54,7 +54,10 @@ enum RemotePC {
             let enc = username.addingPercentEncoding(withAllowedCharacters: .urlUserAllowed) ?? username
             credentials = "\(enc)@"
         }
-        let url = "\(scheme)://\(credentials)\(host)"
+        var url = "\(scheme)://\(credentials)\(host)"
+        if scheme == "smb" && !username.isEmpty {
+            url += "/\(username)"
+        }
         let result = await Shell.run("/usr/bin/open", [url])
         return result.succeeded
     }
