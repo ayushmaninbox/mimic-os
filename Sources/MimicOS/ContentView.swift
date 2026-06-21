@@ -186,29 +186,50 @@ struct PCSidebarRow: View {
     @Environment(AppModel.self) private var model
     let host: RemoteHost
 
+    /// Reachability: nil = not yet checked. The OS icon turns green when the host
+    /// responds (mirrors how a connected phone's icon goes green).
+    private var reachable: Bool? { model.hostReachability[host.id] }
+    private var isPinging: Bool { model.hostsBeingPinged.contains(host.id) }
+    private var isConnected: Bool { model.connectedRemoteHostID == host.id }
+
     var body: some View {
         HStack(spacing: 10) {
-            Image(systemName: host.os.systemImage)
-                .foregroundStyle(.secondary)
+            Group {
+                if isPinging {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Image(systemName: host.os.systemImage)
+                        .foregroundStyle(iconColor)
+                }
+            }
+            .frame(width: 18)
             VStack(alignment: .leading, spacing: 2) {
                 Text(host.name).font(.body)
-                Text(host.subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                Text(stateLabel).font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
             Spacer()
-            statusDot
         }
         .padding(.vertical, 2)
+        .opacity(reachable == false ? 0.55 : 1)
     }
 
-    @ViewBuilder
-    private var statusDot: some View {
-        if model.hostsBeingPinged.contains(host.id) {
-            ProgressView().controlSize(.small)
-        } else if let reachable = model.hostReachability[host.id] {
-            Circle()
-                .fill(reachable ? Color.green : Color.secondary.opacity(0.4))
-                .frame(width: 8, height: 8)
-                .help(reachable ? "Online" : "Offline")
+    /// Matches the phone row: green when reachable/connected, grey when offline,
+    /// secondary while unknown.
+    private var iconColor: Color {
+        if isConnected { return .green }
+        switch reachable {
+        case .some(true):  return .green
+        case .some(false): return .secondary
+        case .none:        return .secondary
+        }
+    }
+
+    private var stateLabel: String {
+        if isConnected { return "Connected" }
+        switch reachable {
+        case .some(true):  return "Online · \(host.subtitle)"
+        case .some(false): return "Offline · \(host.subtitle)"
+        case .none:        return host.subtitle
         }
     }
 }
@@ -313,6 +334,16 @@ struct StatusBar: View {
     }
 
     private var dotColor: Color {
+        if model.isComputerSelected, let host = model.selectedHost {
+            let isConnected = model.connectedRemoteHostID == host.id
+            let reachable = model.hostReachability[host.id]
+            if isConnected { return .green }
+            switch reachable {
+            case .some(true):  return .green
+            case .some(false): return .secondary
+            case .none:        return .secondary
+            }
+        }
         guard let device = model.selectedDevice else { return .red }
         if device.isOffline { return .secondary }
         return device.state.isUsable ? .green : .orange
@@ -321,6 +352,16 @@ struct StatusBar: View {
     private var connectionStatusText: String {
         if model.isConnecting {
             return "Connecting..."
+        }
+        if model.isComputerSelected, let host = model.selectedHost {
+            let isConnected = model.connectedRemoteHostID == host.id
+            let reachable = model.hostReachability[host.id]
+            if isConnected { return "Connected to \(host.name)" }
+            switch reachable {
+            case .some(true):  return "\(host.name) Online"
+            case .some(false): return "\(host.name) Offline"
+            case .none:        return "Checking \(host.name)..."
+            }
         }
         guard let device = model.selectedDevice else {
             return "No device connected"

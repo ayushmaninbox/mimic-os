@@ -990,6 +990,9 @@ final class AppModel {
         if let id = selectedHostID, !remoteHosts.contains(where: { $0.id == id }) {
             selectedHostID = nil
         }
+        Task {
+            await refreshAllHostReachability()
+        }
     }
 
     /// Save (or update) a host. If a non-empty password is supplied, it's stored
@@ -1080,7 +1083,13 @@ final class AppModel {
 
     /// Pings every saved host and records whether it replied.
     func refreshAllHostReachability() async {
-        for host in remoteHosts { await pingHost(host) }
+        await withTaskGroup(of: Void.self) { group in
+            for host in remoteHosts {
+                group.addTask {
+                    await self.pingHost(host)
+                }
+            }
+        }
     }
 
     func pingHost(_ host: RemoteHost) async {
@@ -1516,34 +1525,74 @@ final class AppModel {
         await loadFiles()
     }
 
+    /// All currently-connected, usable phones — what the menu bar lists and what
+    /// a file drop can target.
+    var usableDevices: [Device] {
+        devices.filter { $0.state.isUsable }
+    }
+
     func transferFilesFromDragDrop(_ filePaths: [String]) async {
         // If no device is selected, try to refresh first to see if any are connected
         if selectedSerial == nil {
             await refreshDevices()
         }
-        
+
         // If still nil, try to pick the first connected/usable one
         if selectedSerial == nil {
             if let firstUsable = devices.first(where: { $0.state.isUsable }) {
                 await select(firstUsable.serial)
             }
         }
-        
+
         guard let serial = selectedSerial else {
             status = "No connected device available for file transfer."
             return
         }
-        
+        await transferFiles(filePaths, toSerial: serial)
+    }
+
+    /// Transfer dropped files to a specific device by serial (used by the menu
+    /// bar's drop-target picker). Selects that device, navigates to its transfer
+    /// folder, and uploads.
+    func transferFiles(_ filePaths: [String], toSerial serial: String) async {
+        guard devices.contains(where: { $0.serial == serial && $0.state.isUsable }) else {
+            status = "That device is no longer connected."
+            return
+        }
+        if selectedSerial != serial { await select(serial) }
+
         // Ensure the destination folder exists on the phone
         let dest = settings.phoneDestFolder
         _ = await ADB.makeDirectory(serial, path: dest)
-        
+
         // Open/select the files tab and navigate there
         selectedTab = .files
         browsePath = dest
-        
+
         // Upload the files
         await uploadToCurrentFolder(localPaths: filePaths)
+    }
+
+    // MARK: - Menu-bar per-device actions
+    //
+    // The screenshot / record / mirror logic operates on the currently-selected
+    // device (and owns a single recorder/mirror session). To act on a specific
+    // device from the menu bar, select it first, then run the existing action —
+    // reusing all the session-management logic without duplicating it.
+
+    func menuBarScreenshot(serial: String) async {
+        if selectedSerial != serial { await select(serial) }
+        await captureScreenshot()
+    }
+
+    func menuBarToggleRecording(serial: String) async {
+        if selectedSerial != serial { await select(serial) }
+        await toggleScreenRecording()
+    }
+
+    func menuBarToggleMirror(serial: String) async {
+        if selectedSerial != serial { await select(serial) }
+        toggleMirror()
     }
 
     /// Delete a file/folder on the phone.

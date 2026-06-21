@@ -54,11 +54,23 @@ private struct PCDetailHeader: View {
     let host: RemoteHost
     let onEdit: () -> Void
 
+    private var isConnected: Bool { model.connectedRemoteHostID == host.id }
+    private var reachable: Bool? { model.hostReachability[host.id] }
+
+    private var iconColor: Color {
+        if isConnected { return .green }
+        switch reachable {
+        case .some(true):  return .green
+        case .some(false): return .secondary
+        case .none:        return .secondary
+        }
+    }
+
     var body: some View {
         HStack(alignment: .center, spacing: 16) {
             Image(systemName: host.os.systemImage)
                 .font(.system(size: 30))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(iconColor)
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 8) {
                     Text(host.name).font(.title2).bold()
@@ -79,6 +91,32 @@ private struct PCDetailHeader: View {
                 }
             }
             Spacer()
+            
+            HStack(spacing: 10) {
+                if isConnected {
+                    Button {
+                        model.disconnectRemoteHost()
+                    } label: {
+                        Label("Disconnect", systemImage: "wifi.slash")
+                    }
+                    .buttonStyle(.bordered)
+                } else {
+                    Button {
+                        model.connectRemoteHost(host)
+                    } label: {
+                        Label("Connect", systemImage: "link")
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+                
+                Button(role: .destructive) {
+                    model.deleteRemoteHost(host)
+                } label: {
+                    Label("Forget", systemImage: "trash")
+                }
+                .buttonStyle(.bordered)
+                .foregroundStyle(.red)
+            }
         }
         .padding(.horizontal, 20).padding(.vertical, 14)
     }
@@ -88,8 +126,7 @@ private struct PCDetailHeader: View {
         if model.hostsBeingPinged.contains(host.id) {
             ProgressView().controlSize(.small)
         } else if let reachable = model.hostReachability[host.id] {
-            Label(reachable ? "Online" : "Offline",
-                  systemImage: reachable ? "circle.fill" : "circle")
+            Text(reachable ? "Online" : "Offline")
                 .font(.caption)
                 .foregroundStyle(reachable ? .green : .secondary)
         }

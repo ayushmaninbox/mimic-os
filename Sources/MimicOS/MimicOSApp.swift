@@ -181,66 +181,200 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         hideTimer?.invalidate()
         hideTimer = nil
         portalPanel?.orderOut(nil)
-        
+
         guard let model = model else { return }
-        
-        // Open the app main window
-        model.openMainWindowAction?()
-        
-        // Start transfer
         let paths = urls.map { $0.path }
-        Task {
-            await model.transferFilesFromDragDrop(paths)
+        let active = model.usableDevices
+
+        // With more than one active device, ask which one should receive the
+        // files — pop up a small menu at the status item. With 0 or 1, just
+        // transfer (the existing path picks the only/selected device).
+        if active.count > 1 {
+            presentDropTargetPicker(devices: active, paths: paths)
+            return
+        }
+
+        model.openMainWindowAction?()
+        Task { await model.transferFilesFromDragDrop(paths) }
+    }
+
+    /// Pops up a menu under the status item listing the active devices, so the
+    /// user picks which one receives the dropped files.
+    private func presentDropTargetPicker(devices: [Device], paths: [String]) {
+        let menu = NSMenu()
+
+        let header = NSMenuItem(
+            title: paths.count == 1 ? "Send 1 file to…" : "Send \(paths.count) files to…",
+            action: nil, keyEquivalent: "")
+        header.isEnabled = false
+        menu.addItem(header)
+        menu.addItem(NSMenuItem.separator())
+
+        for device in devices {
+            let item = NSMenuItem(title: device.displayName, action: #selector(dropTargetChosen(_:)), keyEquivalent: "")
+            item.target = self
+            item.image = NSImage(systemSymbolName: "iphone.gen3", accessibilityDescription: "")
+            // Carry both the serial and the paths so the action can run the transfer.
+            item.representedObject = DropTarget(serial: device.serial, paths: paths)
+            menu.addItem(item)
+        }
+
+        // Show the menu anchored to the status item.
+        if let button = statusItem?.button {
+            menu.popUp(positioning: nil,
+                       at: NSPoint(x: 0, y: button.bounds.height + 4),
+                       in: button)
         }
     }
 
+    /// Box carrying a drop's target serial + file paths through `representedObject`.
+    private final class DropTarget: NSObject {
+        let serial: String
+        let paths: [String]
+        init(serial: String, paths: [String]) { self.serial = serial; self.paths = paths }
+    }
+
+    @objc private func dropTargetChosen(_ sender: NSMenuItem) {
+        guard let model = model, let target = sender.representedObject as? DropTarget else { return }
+        model.openMainWindowAction?()
+        Task { await model.transferFiles(target.paths, toSerial: target.serial) }
+    }
+
     // MARK: - NSMenuDelegate
-    
+
+    /// Adds the per-device control items (Screenshot / Record / Mirror / Sidebar)
+    /// to `menu`, each tagged with the device serial via `representedObject` so
+    /// the action handlers know which device to act on.
+    private func addDeviceControlItems(to menu: NSMenu, device: Device) {
+        guard let model = model else { return }
+        let serial = device.serial
+        let isSelected = model.selectedSerial == serial
+
+        let screenshotItem = NSMenuItem(title: "Take Screenshot", action: #selector(takeScreenshot(_:)), keyEquivalent: "")
+        screenshotItem.target = self
+        screenshotItem.representedObject = serial
+        screenshotItem.image = NSImage(systemSymbolName: "camera", accessibilityDescription: "")
+        menu.addItem(screenshotItem)
+
+        // Recording / mirroring state is global (one session at a time) and only
+        // meaningful for the selected device, so show "Stop…" labels only there.
+        let recording = isSelected && model.isRecording
+        let recordingItem = NSMenuItem(title: recording ? "Stop Recording" : "Record Screen", action: #selector(toggleRecording(_:)), keyEquivalent: "")
+        recordingItem.target = self
+        recordingItem.representedObject = serial
+        recordingItem.image = NSImage(systemSymbolName: recording ? "stop.circle" : "record.circle", accessibilityDescription: "")
+        menu.addItem(recordingItem)
+
+        let mirroring = isSelected && model.isMirroring
+        let mirroringItem = NSMenuItem(title: mirroring ? "Stop Mirroring" : "Start Mirroring", action: #selector(toggleMirroring(_:)), keyEquivalent: "")
+        mirroringItem.target = self
+        mirroringItem.representedObject = serial
+        mirroringItem.image = NSImage(systemSymbolName: mirroring ? "stop.circle" : "play.circle", accessibilityDescription: "")
+        menu.addItem(mirroringItem)
+
+        let sidebarItem = NSMenuItem(title: "Show Control Sidebar", action: #selector(toggleSidebar), keyEquivalent: "")
+        sidebarItem.target = self
+        sidebarItem.state = model.settings.showSidebar ? .on : .off
+        sidebarItem.image = NSImage(systemSymbolName: "sidebar.right", accessibilityDescription: "")
+        menu.addItem(sidebarItem)
+    }
+
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
         guard let model = model else { return }
 
-        if let device = model.selectedDevice, device.state.isUsable {
-            let titleItem = NSMenuItem(title: device.displayName, action: nil, keyEquivalent: "")
-            titleItem.isEnabled = false
-            titleItem.image = NSImage(systemSymbolName: "iphone.gen3", accessibilityDescription: "")
-            menu.addItem(titleItem)
-            
-            menu.addItem(NSMenuItem.separator())
-            
-            let screenshotItem = NSMenuItem(title: "Take Screenshot", action: #selector(takeScreenshot), keyEquivalent: "")
-            screenshotItem.target = self
-            screenshotItem.image = NSImage(systemSymbolName: "camera", accessibilityDescription: "")
-            menu.addItem(screenshotItem)
-            
-            let recordingTitle = model.isRecording ? "Stop Recording" : "Record Screen"
-            let recordingItem = NSMenuItem(title: recordingTitle, action: #selector(toggleRecording), keyEquivalent: "")
-            recordingItem.target = self
-            recordingItem.image = NSImage(systemSymbolName: model.isRecording ? "stop.circle" : "record.circle", accessibilityDescription: "")
-            menu.addItem(recordingItem)
-            
-            let mirroringTitle = model.isMirroring ? "Stop Mirroring" : "Start Mirroring"
-            let mirroringItem = NSMenuItem(title: mirroringTitle, action: #selector(toggleMirroring), keyEquivalent: "")
-            mirroringItem.target = self
-            mirroringItem.image = NSImage(systemSymbolName: model.isMirroring ? "stop.circle" : "play.circle", accessibilityDescription: "")
-            menu.addItem(mirroringItem)
-            
-            let sidebarItem = NSMenuItem(title: "Show Control Sidebar", action: #selector(toggleSidebar), keyEquivalent: "")
-            sidebarItem.target = self
-            sidebarItem.state = model.settings.showSidebar ? .on : .off
-            sidebarItem.image = NSImage(systemSymbolName: "sidebar.right", accessibilityDescription: "")
-            menu.addItem(sidebarItem)
-            
-            menu.addItem(NSMenuItem.separator())
-        } else {
+        let active = model.usableDevices
+
+        switch active.count {
+        case 0:
             let noDeviceItem = NSMenuItem(title: "No device connected", action: nil, keyEquivalent: "")
             noDeviceItem.isEnabled = false
             noDeviceItem.image = NSImage(systemSymbolName: "cable.connector.slash", accessibilityDescription: "")
             menu.addItem(noDeviceItem)
-            
+            menu.addItem(NSMenuItem.separator())
+
+        case 1:
+            // A single device collapses to flat inline controls (like before).
+            let device = active[0]
+            let titleItem = NSMenuItem(title: device.displayName, action: nil, keyEquivalent: "")
+            titleItem.isEnabled = false
+            titleItem.image = NSImage(systemSymbolName: "iphone.gen3", accessibilityDescription: "")
+            menu.addItem(titleItem)
+            menu.addItem(NSMenuItem.separator())
+            addDeviceControlItems(to: menu, device: device)
+            menu.addItem(NSMenuItem.separator())
+
+        default:
+            // Multiple devices: one expandable submenu per device.
+            let header = NSMenuItem(title: "Devices", action: nil, keyEquivalent: "")
+            header.isEnabled = false
+            menu.addItem(header)
+            for device in active {
+                let item = NSMenuItem(title: device.displayName, action: nil, keyEquivalent: "")
+                item.image = NSImage(systemSymbolName: "iphone.gen3", accessibilityDescription: "")
+                let submenu = NSMenu()
+                addDeviceControlItems(to: submenu, device: device)
+                item.submenu = submenu
+                menu.addItem(item)
+            }
             menu.addItem(NSMenuItem.separator())
         }
-        
+
+        let computers = model.remoteHosts
+        if !computers.isEmpty {
+            let compHeader = NSMenuItem(title: "Computers", action: nil, keyEquivalent: "")
+            compHeader.isEnabled = false
+            menu.addItem(compHeader)
+            
+            for host in computers {
+                let isConnected = model.connectedRemoteHostID == host.id
+                let reachable = model.hostReachability[host.id] ?? false
+                
+                let item = NSMenuItem(title: host.name, action: nil, keyEquivalent: "")
+                item.image = NSImage(systemSymbolName: host.os.systemImage, accessibilityDescription: "")
+                if #available(macOS 12.0, *) {
+                    let color = (isConnected || reachable) ? NSColor.systemGreen : NSColor.systemGray
+                    item.image = item.image?.withSymbolConfiguration(NSImage.SymbolConfiguration(paletteColors: [color]))
+                }
+                
+                let submenu = NSMenu()
+                
+                let connectItem = NSMenuItem(
+                    title: isConnected ? "Disconnect Screen" : "Start Screen Sharing",
+                    action: isConnected ? #selector(disconnectComputer(_:)) : #selector(connectComputer(_:)),
+                    keyEquivalent: ""
+                )
+                connectItem.target = self
+                connectItem.representedObject = host.idString
+                connectItem.image = NSImage(systemSymbolName: isConnected ? "wifi.slash" : "display", accessibilityDescription: "")
+                submenu.addItem(connectItem)
+                
+                let filesItem = NSMenuItem(
+                    title: "Open Files in Finder",
+                    action: #selector(openComputerFiles(_:)),
+                    keyEquivalent: ""
+                )
+                filesItem.target = self
+                filesItem.representedObject = host.idString
+                filesItem.image = NSImage(systemSymbolName: "folder", accessibilityDescription: "")
+                submenu.addItem(filesItem)
+                
+                let termItem = NSMenuItem(
+                    title: "Open SSH Terminal",
+                    action: #selector(openComputerTerminal(_:)),
+                    keyEquivalent: ""
+                )
+                termItem.target = self
+                termItem.representedObject = host.idString
+                termItem.image = NSImage(systemSymbolName: "terminal", accessibilityDescription: "")
+                submenu.addItem(termItem)
+                
+                item.submenu = submenu
+                menu.addItem(item)
+            }
+            menu.addItem(NSMenuItem.separator())
+        }
+
         let openItem = NSMenuItem(title: "Open MimicOS", action: #selector(openMimicOS), keyEquivalent: "o")
         openItem.target = self
         openItem.image = NSImage(systemSymbolName: "laptopcomputer", accessibilityDescription: "")
@@ -274,18 +408,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     
     // MARK: - Menu Actions
     
-    @objc private func takeScreenshot() {
-        guard let model = model else { return }
-        Task { await model.captureScreenshot() }
+    @objc private func takeScreenshot(_ sender: NSMenuItem) {
+        guard let model = model, let serial = sender.representedObject as? String else { return }
+        Task { await model.menuBarScreenshot(serial: serial) }
     }
-    
-    @objc private func toggleRecording() {
-        guard let model = model else { return }
-        Task { await model.toggleScreenRecording() }
+
+    @objc private func toggleRecording(_ sender: NSMenuItem) {
+        guard let model = model, let serial = sender.representedObject as? String else { return }
+        Task { await model.menuBarToggleRecording(serial: serial) }
     }
-    
-    @objc private func toggleMirroring() {
-        model?.toggleMirror()
+
+    @objc private func toggleMirroring(_ sender: NSMenuItem) {
+        guard let model = model, let serial = sender.representedObject as? String else { return }
+        Task { await model.menuBarToggleMirror(serial: serial) }
+    }
+
+    @objc private func connectComputer(_ sender: NSMenuItem) {
+        guard let model = model,
+              let idString = sender.representedObject as? String,
+              let uuid = UUID(uuidString: idString),
+              let host = model.remoteHosts.first(where: { $0.id == uuid }) else { return }
+        model.selection = .computer(host.id)
+        model.connectRemoteHost(host)
+    }
+
+    @objc private func disconnectComputer(_ sender: NSMenuItem) {
+        guard let model = model else { return }
+        model.disconnectRemoteHost()
+    }
+
+    @objc private func openComputerFiles(_ sender: NSMenuItem) {
+        guard let model = model,
+              let idString = sender.representedObject as? String,
+              let uuid = UUID(uuidString: idString),
+              let host = model.remoteHosts.first(where: { $0.id == uuid }) else { return }
+        model.selection = .computer(host.id)
+        Task { await model.openFiles(host) }
+    }
+
+    @objc private func openComputerTerminal(_ sender: NSMenuItem) {
+        guard let model = model,
+              let idString = sender.representedObject as? String,
+              let uuid = UUID(uuidString: idString),
+              let host = model.remoteHosts.first(where: { $0.id == uuid }) else { return }
+        model.selection = .computer(host.id)
+        Task { await model.openSSH(host) }
     }
     
     @objc private func toggleSidebar() {
