@@ -12,6 +12,7 @@ final class AppSettings {
     private static let autoReconnectKey = "MimicOS.autoReconnect"
     private static let runInBackgroundKey = "MimicOS.runInBackground"
     private static let alwaysOnTopKey = "MimicOS.alwaysOnTop"
+    private static let callAlertsKey = "MimicOS.callAlerts"
     private static let phoneDestFolderKey = "MimicOS.phoneDestFolder"
 
     private var defaults: UserDefaults { .standard }
@@ -56,6 +57,12 @@ final class AppSettings {
         didSet { defaults.set(alwaysOnTop, forKey: Self.alwaysOnTopKey) }
     }
 
+    /// Show a floating panel on the Mac when the phone has an incoming call, with
+    /// Answer / Decline / Silence controls. Works without an active mirror.
+    var callAlerts: Bool {
+        didSet { defaults.set(callAlerts, forKey: Self.callAlertsKey) }
+    }
+
     /// Destination folder on the phone for dropped files.
     var phoneDestFolder: String {
         didSet { defaults.set(phoneDestFolder, forKey: Self.phoneDestFolderKey) }
@@ -90,6 +97,7 @@ final class AppSettings {
         launchAtLogin = store.object(forKey: "MimicOS.launchAtLogin") as? Bool ?? true
         showSidebar = store.object(forKey: "MimicOS.showSidebar") as? Bool ?? false
         alwaysOnTop = store.object(forKey: Self.alwaysOnTopKey) as? Bool ?? false
+        callAlerts = store.object(forKey: Self.callAlertsKey) as? Bool ?? true
         phoneDestFolder = store.string(forKey: Self.phoneDestFolderKey) ?? "/sdcard/Download/MimicOS"
 
         // Resolve the saved capture folder, falling back to ~/Downloads/MimicOS.

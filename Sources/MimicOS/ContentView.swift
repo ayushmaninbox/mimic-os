@@ -8,10 +8,12 @@ struct ContentView: View {
     var body: some View {
         VStack(spacing: 0) {
             NavigationSplitView {
-                DeviceListView()
+                SidebarView()
                     .navigationSplitViewColumnWidth(min: 220, ideal: 260)
             } detail: {
-                if model.toolsReady {
+                if model.isComputerSelected {
+                    PCPanelView()
+                } else if model.toolsReady {
                     ControlPanelView()
                 } else {
                     SetupNeededView()
@@ -49,31 +51,44 @@ struct RenameRequest: Identifiable {
     var id: String { serial }
 }
 
-struct DeviceListView: View {
+/// The left sidebar: one combined list with a "Devices" section (phones) and a
+/// "Computers" section (remote desktops). The `+` toolbar button opens a chooser
+/// that branches to either the phone-add flow or the add-computer form.
+struct SidebarView: View {
     @Environment(AppModel.self) private var model
     @State private var renameRequest: RenameRequest?
+    @State private var editorHost: RemoteHost?
+    @State private var showEditor = false
 
     var body: some View {
         @Bindable var model = model
         List(selection: Binding(
-            get: { model.selectedSerial },
-            set: { newValue in
-                if let newValue { Task { await model.select(newValue) } }
-            }
+            get: { model.selection },
+            set: { model.selection = $0 }
         )) {
             Section("Devices") {
                 if model.devices.isEmpty {
                     Text("No devices connected")
-                        .foregroundStyle(.secondary)
-                        .font(.callout)
+                        .foregroundStyle(.secondary).font(.callout)
                 }
                 ForEach(model.devices) { device in
                     DeviceRow(device: device)
-                        .tag(device.serial)
+                        .tag(AppModel.Selection.phone(device.serial))
                         .contextMenu { deviceMenu(device) }
                 }
             }
 
+            Section("Computers") {
+                if model.remoteHosts.isEmpty {
+                    Text("No computers added")
+                        .foregroundStyle(.secondary).font(.callout)
+                }
+                ForEach(model.remoteHosts) { host in
+                    PCSidebarRow(host: host)
+                        .tag(AppModel.Selection.computer(host.id))
+                        .contextMenu { hostMenu(host) }
+                }
+            }
         }
         .sheet(item: $renameRequest) { request in
             RenameSheet(initialName: request.initialName) { newName in
@@ -88,24 +103,43 @@ struct DeviceListView: View {
                 Button {
                     model.showAddDevice = true
                 } label: {
-                    Label("Add device", systemImage: "plus")
+                    Label("Add", systemImage: "plus")
                 }
             }
             ToolbarItem {
                 Button {
-                    Task { await model.refreshDevices() }
+                    Task {
+                        await model.refreshDevices()
+                        await model.refreshAllHostReachability()
+                    }
                 } label: {
                     Label("Refresh", systemImage: "arrow.clockwise")
                 }
                 .disabled(model.isWorking)
             }
         }
+        // The unified `+` chooser: phone flow OR add-computer form.
         .sheet(isPresented: Binding(
             get: { model.showAddDevice },
             set: { model.showAddDevice = $0 }
         )) {
-            AddDeviceSheet()
+            AddDeviceSheet(onAddComputer: {
+                model.showAddDevice = false
+                editorHost = nil
+                showEditor = true
+            })
         }
+        // Add / edit a computer.
+        .sheet(isPresented: $showEditor) {
+            RemoteHostEditor(host: editorHost) { host, password in
+                model.saveRemoteHost(host, password: password)
+                model.selection = .computer(host.id)
+                showEditor = false
+            } onCancel: {
+                showEditor = false
+            }
+        }
+        .task { await model.refreshAllHostReachability() }
     }
 
     @ViewBuilder
@@ -130,6 +164,52 @@ struct DeviceListView: View {
         Button(role: .destructive) {
             Task { await model.forget(device) }
         } label: { Label("Remove from MimicOS", systemImage: "trash") }
+    }
+
+    @ViewBuilder
+    private func hostMenu(_ host: RemoteHost) -> some View {
+        Button {
+            editorHost = host
+            showEditor = true
+        } label: { Label("Edit…", systemImage: "pencil") }
+        Button {
+            Task { await model.pingHost(host) }
+        } label: { Label("Check status", systemImage: "wave.3.right") }
+        Divider()
+        Button(role: .destructive) {
+            model.deleteRemoteHost(host)
+        } label: { Label("Remove", systemImage: "trash") }
+    }
+}
+
+struct PCSidebarRow: View {
+    @Environment(AppModel.self) private var model
+    let host: RemoteHost
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: host.os.systemImage)
+                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(host.name).font(.body)
+                Text(host.subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            }
+            Spacer()
+            statusDot
+        }
+        .padding(.vertical, 2)
+    }
+
+    @ViewBuilder
+    private var statusDot: some View {
+        if model.hostsBeingPinged.contains(host.id) {
+            ProgressView().controlSize(.small)
+        } else if let reachable = model.hostReachability[host.id] {
+            Circle()
+                .fill(reachable ? Color.green : Color.secondary.opacity(0.4))
+                .frame(width: 8, height: 8)
+                .help(reachable ? "Online" : "Offline")
+        }
     }
 }
 

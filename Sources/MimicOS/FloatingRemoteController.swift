@@ -2,17 +2,24 @@ import Foundation
 import AppKit
 import SwiftUI
 
+/// Verbose window-tracking debug logging. Disabled by default — set MIMICOS_DEBUG_LOG
+/// in the environment to write to a per-user scratch log while debugging the floating
+/// remote. (Previously hardcoded a developer's home path, which leaked a username
+/// and broke on other machines.)
 func writeRemoteDebugLog(_ message: String) {
-    let logURL = URL(fileURLWithPath: "/Users/ayushmaninbox/Documents/GitHub/iDroid/scratch/tracker_debug.log")
+    // Off unless MIMICOS_DEBUG_LOG is set in the environment, so it never writes
+    // by default and needs no recompile to enable while debugging.
+    guard ProcessInfo.processInfo.environment["MIMICOS_DEBUG_LOG"] != nil else { return }
+    let logURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("MimicOS-tracker_debug.log")
     let line = "[\(Date())] [Remote] \(message)\n"
-    if let data = line.data(using: .utf8) {
-        if let fileHandle = try? FileHandle(forWritingTo: logURL) {
-            fileHandle.seekToEndOfFile()
-            fileHandle.write(data)
-            fileHandle.closeFile()
-        } else {
-            try? data.write(to: logURL)
-        }
+    guard let data = line.data(using: .utf8) else { return }
+    if let fileHandle = try? FileHandle(forWritingTo: logURL) {
+        fileHandle.seekToEndOfFile()
+        fileHandle.write(data)
+        fileHandle.closeFile()
+    } else {
+        try? data.write(to: logURL)
     }
 }
 

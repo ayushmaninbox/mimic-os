@@ -46,12 +46,22 @@ enum Shell {
             process.standardOutput = outPipe
             process.standardError = errPipe
 
+            // Drain stdout concurrently so large output (e.g. a full `dumpsys`,
+            // which is well over the OS pipe buffer) can't deadlock the child:
+            // reading only in the termination handler would let the pipe fill and
+            // block the process before it ever exits.
+            final class Box: @unchecked Sendable { var data = Data() }
+            let box = Box()
+            let outHandle = outPipe.fileHandleForReading
+            let drain = DispatchQueue(label: "com.ayushman.mimicos.shell.run")
+            drain.async { box.data = outHandle.readDataToEndOfFile() }
+
             process.terminationHandler = { proc in
-                let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
                 let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                drain.sync {}   // ensure the stdout read finished
                 continuation.resume(returning: ProcessResult(
                     exitCode: proc.terminationStatus,
-                    stdout: String(decoding: outData, as: UTF8.self),
+                    stdout: String(decoding: box.data, as: UTF8.self),
                     stderr: String(decoding: errData, as: UTF8.self)
                 ))
             }

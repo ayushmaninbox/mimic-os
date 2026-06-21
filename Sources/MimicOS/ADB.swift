@@ -416,6 +416,138 @@ enum ADB {
         _ = await Shell.run(ToolLocator.adb, ["-s", serial, "shell", "input", "keyevent", "\(keycode)"])
     }
 
+    // MARK: - Unlock
+
+    /// The phone's current display size in pixels, e.g. (1080, 2400). nil if it
+    /// can't be parsed.
+    static func screenSize(_ serial: String) async -> (Int, Int)? {
+        let result = await Shell.run(ToolLocator.adb, ["-s", serial, "shell", "wm", "size"])
+        guard result.succeeded else { return nil }
+        // "Physical size: 1080x2400" (sometimes an "Override size:" line too).
+        for line in result.stdout.split(separator: "\n") {
+            guard line.contains("size:") else { continue }
+            let dims = line.split(separator: ":").last?
+                .trimmingCharacters(in: .whitespaces)
+                .split(separator: "x")
+            if let dims, dims.count == 2,
+               let w = Int(dims[0].trimmingCharacters(in: .whitespaces)),
+               let h = Int(dims[1].trimmingCharacters(in: .whitespaces)) {
+                return (w, h)
+            }
+        }
+        return nil
+    }
+
+    /// Wakes the screen and dismisses the lock curtain so the PIN/password entry
+    /// is in front. Returns once the swipe has settled.
+    static func wakeAndPrepareLockScreen(_ serial: String) async {
+        // KEYCODE_WAKEUP (224) turns the screen on without toggling it back off
+        // (unlike KEYCODE_POWER, which would sleep an already-awake screen).
+        await keyEvent(serial, keycode: 224)
+        try? await Task.sleep(for: .milliseconds(350))
+        // Swipe up to clear the lock curtain and reveal the PIN pad. Coordinates
+        // are derived from the live screen size so it works across resolutions.
+        if let (w, h) = await screenSize(serial) {
+            await swipe(serial, x1: w / 2, y1: Int(Double(h) * 0.85),
+                        x2: w / 2, y2: Int(Double(h) * 0.15), durationMs: 200)
+        } else {
+            await swipe(serial, x1: 540, y1: 1800, x2: 540, y2: 300, durationMs: 200)
+        }
+        try? await Task.sleep(for: .milliseconds(350))
+    }
+
+    /// Types a numeric/text PIN into the lock screen and confirms it.
+    ///
+    /// PIN/password unlock screens accept hardware-keyboard digits via
+    /// `input text`, then KEYCODE_ENTER (66) submits. (Pattern locks can't be
+    /// driven this way — they need per-user gesture coordinates — so this targets
+    /// PIN/password locks.)
+    static func submitLockPIN(_ serial: String, pin: String) async {
+        await typeText(serial, pin)
+        try? await Task.sleep(for: .milliseconds(200))
+        await keyEvent(serial, keycode: 66)   // KEYCODE_ENTER
+    }
+
+    /// Types text into whatever input field currently has focus on the phone —
+    /// used to autofill an app password. Does NOT submit, so the user can review
+    /// it before confirming via the mirror.
+    static func autofillFocusedField(_ serial: String, text: String) async {
+        await typeText(serial, text)
+    }
+
+    // MARK: - Focused-field detection (for auto-autofill)
+
+    /// What's currently focused on the phone, as far as the input-method service
+    /// can tell. Used to auto-offer autofill when a password field gains focus.
+    struct FocusedField: Equatable {
+        let isPassword: Bool
+        let inputType: Int          // raw EditorInfo.inputType
+        let packageName: String?    // app owning the focused field
+    }
+
+    /// Reads the currently-focused text field's input type + owning package via
+    /// `dumpsys input_method`. Returns nil if nothing editable is focused.
+    ///
+    /// The IME service reports the active `EditorInfo`: we parse its `inputType`
+    /// (whose password variations we can recognise) and the `packageName`. This
+    /// is app-free and works without root.
+    static func focusedField(_ serial: String) async -> FocusedField? {
+        let result = await Shell.run(ToolLocator.adb,
+            ["-s", serial, "shell", "dumpsys", "input_method"])
+        guard result.succeeded else { return nil }
+
+        // The current editor's line looks like:
+        //   inputType=0x12 imeOptions=0x... fieldId=0x...
+        // We take the LAST non-zero inputType we see (the live focused field;
+        // earlier 0x0 lines are stale/unfocused clients).
+        var lastType: Int?
+        var pkg: String?
+        for raw in result.stdout.split(separator: "\n") {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if let t = parseHexField(line, key: "inputType="), t != 0 {
+                lastType = t
+            }
+            if line.contains("packageName=") {
+                pkg = line.split(separator: " ")
+                    .first { $0.hasPrefix("packageName=") }
+                    .map { String($0.dropFirst("packageName=".count)) }
+            }
+        }
+        guard let type = lastType else { return nil }
+        return FocusedField(isPassword: isPasswordInputType(type),
+                            inputType: type, packageName: pkg)
+    }
+
+    /// Parses a `key=0x..` hex value out of a dumpsys line.
+    private static func parseHexField(_ line: String, key: String) -> Int? {
+        guard let range = line.range(of: key) else { return nil }
+        let rest = line[range.upperBound...]
+        let token = rest.split(whereSeparator: { $0 == " " || $0 == "\t" }).first.map(String.init) ?? ""
+        guard token.hasPrefix("0x") else { return Int(token) }
+        return Int(token.dropFirst(2), radix: 16)
+    }
+
+    /// True if an Android `EditorInfo.inputType` is a password variation.
+    /// TYPE_CLASS_TEXT(0x01) + PASSWORD/VISIBLE/WEB_PASSWORD, or
+    /// TYPE_CLASS_NUMBER(0x02) + NUMBER_PASSWORD.
+    ///
+    /// Android's inputType bit layout: class = `& 0x0f`, variation = `& 0x0ff0`,
+    /// flags = `& 0xfff000`. We must mask the VARIATION bits only — using a wider
+    /// mask would catch unrelated flag bits (e.g. NO_SUGGESTIONS 0x80000) and
+    /// false-positive on ordinary fields like a dialer search box.
+    static func isPasswordInputType(_ inputType: Int) -> Bool {
+        let cls = inputType & 0x0f
+        let variation = inputType & 0x0ff0
+        if cls == 0x01 {   // TYPE_CLASS_TEXT
+            // 0x80 PASSWORD, 0x90 VISIBLE_PASSWORD, 0xe0 WEB_PASSWORD
+            return variation == 0x80 || variation == 0x90 || variation == 0xe0
+        }
+        if cls == 0x02 {   // TYPE_CLASS_NUMBER
+            return variation == 0x10   // NUMBER_VARIATION_PASSWORD
+        }
+        return false
+    }
+
     /// Launches an app by package + activity, or just brings a package forward.
     static func launchApp(_ serial: String, package: String) async {
         _ = await Shell.run(ToolLocator.adb, ["-s", serial, "shell", "monkey",
@@ -491,6 +623,304 @@ enum ADB {
     static func getZenMode(_ serial: String) async -> Int? {
         let result = await Shell.run(ToolLocator.adb, ["-s", serial, "shell", "settings", "get", "global", "zen_mode"])
         return Int(result.stdout.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    // MARK: - Telephony (incoming-call detection & control)
+
+    /// Direction/phase of the current call, derived from `dumpsys telecom`.
+    enum CallState {
+        case idle       // no call
+        case ringing    // incoming call ringing (not yet answered)
+        case dialing    // outgoing call placed (ringing on the other end)
+        case active     // a call is connected
+    }
+
+    /// A snapshot of the phone's current call status, read over adb without any
+    /// app on the phone. `number` is the other party's number (empty/`nil` if the
+    /// OS withholds it or it's a private number).
+    struct CallStatus: Equatable {
+        var state: CallState
+        var number: String?
+    }
+
+    /// Reads the current call from `dumpsys telecom`. This is far richer than
+    /// `telephony.registry`: it reports incoming vs. outgoing, the connected/
+    /// ringing/dialing phase, AND the phone number (which modern Android hides
+    /// from `telephony.registry`). Works with no app on the phone and no mirror.
+    /// Returns `nil` if the device isn't reachable or has no telecom service.
+    static func callStatus(_ serial: String) async -> CallStatus? {
+        // Filter on the PHONE side so only the call summary line(s) come back
+        // (a few lines) instead of the full ~1000-line telecom dump. This keeps
+        // the output tiny and the call fast — important since this polls often.
+        let result = await Shell.run(ToolLocator.adb,
+            ["-s", serial, "shell", "dumpsys telecom | grep -m1 'Call id='"])
+        // grep exits 1 when there's no match (no active call) — that's not an
+        // error, it means idle. Only a launch failure (negative code) is fatal.
+        guard result.exitCode >= 0 else { return nil }
+
+        // The authoritative current-call summary is the `[Call id=...]` line,
+        // which carries both `state=` and `handle=tel:NUMBER`. No such line means
+        // there is no call.
+        let line = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard line.contains("Call id=") else {
+            return CallStatus(state: .idle, number: nil)
+        }
+
+        let state: CallState
+        if line.contains("state=RINGING") {
+            state = .ringing
+        } else if line.contains("state=DIALING") || line.contains("state=CONNECTING") {
+            state = .dialing
+        } else if line.contains("state=ACTIVE") || line.contains("state=HOLDING") {
+            state = .active
+        } else {
+            // NEW/DISCONNECTED/etc. — treat as no active call.
+            return CallStatus(state: .idle, number: nil)
+        }
+
+        // Pull the number out of `handle=tel:+123...,` (comma- or space-terminated).
+        var number: String?
+        if let r = line.range(of: "handle=tel:") {
+            let tail = line[r.upperBound...]
+            let value = tail.prefix { $0 != "," && $0 != " " && $0 != "]" }
+            let trimmed = value.trimmingCharacters(in: .whitespaces)
+            if !trimmed.isEmpty { number = trimmed }
+        }
+        return CallStatus(state: state, number: number)
+    }
+
+    /// Resolves a phone number to a saved contact name via the Contacts
+    /// PhoneLookup provider. Returns `nil` if there's no match or the number is
+    /// empty. Output looks like: `Row: 0 display_name=Alice`.
+    static func contactName(_ serial: String, number: String) async -> String? {
+        let digits = number.trimmingCharacters(in: .whitespaces)
+        guard !digits.isEmpty else { return nil }
+        let uri = "content://com.android.contacts/phone_lookup/\(digits)"
+        let result = await Shell.run(ToolLocator.adb,
+            ["-s", serial, "shell",
+             "content query --uri \(uri) --projection display_name"])
+        guard result.exitCode == 0 else { return nil }
+        guard let r = result.stdout.range(of: "display_name=") else { return nil }
+        let name = result.stdout[r.upperBound...]
+            .prefix { $0 != "\n" && $0 != "\r" }
+            .trimmingCharacters(in: .whitespaces)
+        return name.isEmpty ? nil : name
+    }
+
+    // MARK: - Call log & dialer
+
+    /// One entry from the phone's call log.
+    struct CallLogEntry: Identifiable, Equatable {
+        enum Kind: Int {
+            case incoming = 1, outgoing = 2, missed = 3, voicemail = 4, rejected = 5, blocked = 6
+        }
+        let id = UUID()
+        var number: String
+        var name: String?     // resolved contact name, if any
+        var kind: Kind
+        var date: Date
+        var duration: Int     // seconds
+    }
+
+    /// Reads the most recent call-log entries (newest first). `limit` caps how
+    /// many rows are parsed. Works with no app on the phone.
+    static func callLog(_ serial: String, limit: Int = 50) async -> [CallLogEntry] {
+        let result = await Shell.run(ToolLocator.adb,
+            ["-s", serial, "shell",
+             "content query --uri content://call_log/calls " +
+             "--projection number:type:date:duration:name --sort 'date DESC'"])
+        guard result.exitCode == 0 else { return [] }
+
+        var entries: [CallLogEntry] = []
+        for line in result.stdout.split(separator: "\n") where line.contains("Row:") {
+            // Format: `Row: 0 number=+91..., type=1, date=178..., duration=22, name=Alice`
+            func field(_ key: String) -> String? {
+                guard let r = line.range(of: "\(key)=") else { return nil }
+                let tail = line[r.upperBound...]
+                let v = tail.prefix { $0 != "," }.trimmingCharacters(in: .whitespaces)
+                return v.isEmpty || v == "NULL" ? nil : v
+            }
+            guard let number = field("number"),
+                  let typeStr = field("type"), let type = Int(typeStr),
+                  let kind = CallLogEntry.Kind(rawValue: type) else { continue }
+            let ms = Double(field("date") ?? "0") ?? 0
+            let dur = Int(field("duration") ?? "0") ?? 0
+            entries.append(CallLogEntry(
+                number: number,
+                name: field("name"),
+                kind: kind,
+                date: Date(timeIntervalSince1970: ms / 1000),
+                duration: dur))
+            if entries.count >= limit { break }
+        }
+        return entries
+    }
+
+    /// Places an outgoing call to `number` on the phone via the dialer intent.
+    static func dial(_ serial: String, number: String) async {
+        let cleaned = number.trimmingCharacters(in: .whitespaces)
+        guard !cleaned.isEmpty else { return }
+        _ = await Shell.run(ToolLocator.adb,
+            ["-s", serial, "shell", "am", "start", "-a",
+             "android.intent.action.CALL", "-d", "tel:\(cleaned)"])
+    }
+
+    // MARK: - Contacts
+
+    /// A saved contact (name + a single phone number).
+    struct Contact: Identifiable, Equatable {
+        let id = UUID()
+        var name: String
+        var number: String
+    }
+
+    /// Reads all saved contacts (name + number), sorted by name. De-dupes exact
+    /// name+number repeats that some phones store for formatting variants.
+    static func contacts(_ serial: String) async -> [Contact] {
+        let result = await Shell.run(ToolLocator.adb,
+            ["-s", serial, "shell",
+             "content query --uri content://com.android.contacts/data/phones " +
+             "--projection display_name:data1 --sort 'display_name ASC'"])
+        guard result.exitCode == 0 else { return [] }
+
+        var seen = Set<String>()
+        var out: [Contact] = []
+        for line in result.stdout.split(separator: "\n") where line.contains("Row:") {
+            guard let nameR = line.range(of: "display_name="),
+                  let numR = line.range(of: "data1=") else { continue }
+            let name = line[nameR.upperBound...].prefix { $0 != "," }
+                .trimmingCharacters(in: .whitespaces)
+            let number = line[numR.upperBound...].prefix { $0 != "," }
+                .trimmingCharacters(in: .whitespaces)
+            guard !name.isEmpty, !number.isEmpty else { continue }
+            let key = name + "|" + number.filter(\.isNumber)
+            if seen.insert(key).inserted {
+                out.append(Contact(name: name, number: number))
+            }
+        }
+        return out
+    }
+
+    // MARK: - SMS
+
+    /// One SMS message. `id` is stable across refreshes (thread + timestamp +
+    /// direction) so live polling doesn't churn SwiftUI's diffing or scroll.
+    struct SMS: Identifiable, Equatable {
+        var threadID: String
+        var address: String   // sender/recipient
+        var body: String
+        var date: Date
+        var incoming: Bool    // type 1 = received, 2 = sent
+        var id: String { "\(threadID)-\(Int(date.timeIntervalSince1970 * 1000))-\(incoming ? "i" : "o")" }
+    }
+
+    /// A grouped SMS conversation (most-recent message first within `messages`).
+    struct Conversation: Identifiable, Equatable {
+        var id: String { threadID }
+        var threadID: String
+        var address: String
+        var contactName: String?
+        var lastBody: String
+        var lastDate: Date
+        var messages: [SMS]
+    }
+
+    /// Reads recent SMS (newest first) and groups them into conversations by
+    /// thread. `limit` caps total messages parsed.
+    static func conversations(_ serial: String, limit: Int = 300) async -> [Conversation] {
+        let result = await Shell.run(ToolLocator.adb,
+            ["-s", serial, "shell",
+             "content query --uri content://sms " +
+             "--projection thread_id:address:body:date:type --sort 'date DESC'"])
+        guard result.exitCode == 0 else { return [] }
+
+        var msgs: [SMS] = []
+        for line in result.stdout.split(separator: "\n") where line.contains("Row:") {
+            func field(_ key: String) -> String? {
+                guard let r = line.range(of: "\(key)=") else { return nil }
+                let v = line[r.upperBound...].prefix { $0 != "," }
+                    .trimmingCharacters(in: .whitespaces)
+                return v.isEmpty ? nil : v
+            }
+            guard let thread = field("thread_id"),
+                  let address = field("address") else { continue }
+            let body = field("body") ?? ""
+            let ms = Double(field("date") ?? "0") ?? 0
+            let type = Int(field("type") ?? "1") ?? 1
+            msgs.append(SMS(threadID: thread, address: address, body: body,
+                            date: Date(timeIntervalSince1970: ms / 1000),
+                            incoming: type == 1))
+            if msgs.count >= limit { break }
+        }
+
+        // Group by thread, preserving newest-first order of first appearance.
+        var order: [String] = []
+        var grouped: [String: [SMS]] = [:]
+        for m in msgs {
+            if grouped[m.threadID] == nil { order.append(m.threadID) }
+            grouped[m.threadID, default: []].append(m)
+        }
+        return order.compactMap { tid in
+            guard let list = grouped[tid], let first = list.first else { return nil }
+            return Conversation(threadID: tid, address: first.address,
+                                contactName: nil, lastBody: first.body,
+                                lastDate: first.date, messages: list)
+        }
+    }
+
+    /// Opens the phone's SMS composer prefilled with `number` and `body`. The
+    /// user taps send on the phone — reliable and works without being the default
+    /// SMS app (direct send via `isms` is version-fragile and often blocked).
+    static func composeSMS(_ serial: String, number: String, body: String) async {
+        let n = number.trimmingCharacters(in: .whitespaces)
+        guard !n.isEmpty else { return }
+        _ = await Shell.run(ToolLocator.adb,
+            ["-s", serial, "shell", "am", "start", "-a",
+             "android.intent.action.SENDTO", "-d", "sms:\(n)",
+             "--es", "sms_body", body])
+    }
+
+    /// KeyEvent codes for call control. These are injected as hardware keys, so
+    /// they work without an app — though a few heavily-skinned OEM ROMs intercept
+    /// them, so treat them as best-effort.
+    private enum CallKey {
+        static let call = 5      // KEYCODE_CALL — answers a ringing call
+        static let endCall = 6   // KEYCODE_ENDCALL — declines/hangs up
+    }
+
+    /// Answers the currently ringing call (KEYCODE_CALL).
+    static func answerCall(_ serial: String) async {
+        await keyEvent(serial, keycode: CallKey.call)
+    }
+
+    /// Declines the currently ringing call / hangs up the active one (KEYCODE_ENDCALL).
+    static func declineCall(_ serial: String) async {
+        await keyEvent(serial, keycode: CallKey.endCall)
+    }
+
+    /// Silences the ringer for the current incoming call without rejecting it.
+    /// `cmd audio set-ringer-mode SILENT` mutes the ringtone immediately; the
+    /// call keeps ringing on the network so it can still be answered or will roll
+    /// to voicemail.
+    static func silenceRinger(_ serial: String) async {
+        _ = await setRingerMode(serial, mode: "SILENT")
+    }
+
+    /// Toggles the microphone mute on the active call (KEYCODE_MUTE = 91).
+    static func toggleCallMute(_ serial: String) async {
+        await keyEvent(serial, keycode: 91)
+    }
+
+    /// Reads whether the call microphone is currently muted, from `dumpsys audio`
+    /// (`mic mute ... from system=true`). Returns nil if it can't be determined.
+    static func isMicMuted(_ serial: String) async -> Bool? {
+        let result = await Shell.run(ToolLocator.adb,
+            ["-s", serial, "shell", "dumpsys audio | grep -m1 'mic mute'"])
+        guard result.exitCode == 0,
+              let r = result.stdout.range(of: "from system=") else { return nil }
+        let value = result.stdout[r.upperBound...]
+            .prefix { $0 != "\n" && $0 != "\r" && $0 != " " }
+        return value.contains("true")
     }
 
 }

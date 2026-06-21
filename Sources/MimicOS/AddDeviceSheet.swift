@@ -9,7 +9,11 @@ struct AddDeviceSheet: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
 
-    @State private var step: AddDeviceStep = .choose
+    /// Invoked when the user chooses "Computer" — the sidebar opens the
+    /// add-computer form (and dismisses this sheet).
+    var onAddComputer: () -> Void = {}
+
+    @State private var step: AddDeviceStep = .kind
 
     var body: some View {
         VStack(spacing: 0) {
@@ -17,6 +21,7 @@ struct AddDeviceSheet: View {
             Divider()
             Group {
                 switch step {
+                case .kind:     KindChooserView(step: $step, onAddComputer: onAddComputer)
                 case .choose:   ChooserView(step: $step)
                 case .usb:      USBGuideView()
                 case .hotspot:  HotspotGuideView(step: $step)
@@ -29,15 +34,24 @@ struct AddDeviceSheet: View {
         .frame(minHeight: 440)
     }
 
+    /// Where the "Back" button returns to from each step.
+    private var backTarget: AddDeviceStep? {
+        switch step {
+        case .kind:             return nil
+        case .choose:           return .kind
+        case .usb, .hotspot:    return .choose
+        }
+    }
+
     private var header: some View {
         ZStack {
             // Centered title, independent of the side buttons' widths.
             Text("Add a device").font(.headline)
 
             HStack {
-                if step != .choose {
+                if let backTarget {
                     Button {
-                        step = .choose
+                        step = backTarget
                     } label: {
                         HStack(spacing: 4) {
                             Image(systemName: "chevron.left")
@@ -61,7 +75,36 @@ struct AddDeviceSheet: View {
     }
 }
 
-// MARK: - Step 1: chooser
+// MARK: - Step 0: phone vs computer
+
+private struct KindChooserView: View {
+    @Binding var step: AddDeviceStep
+    let onAddComputer: () -> Void
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Text("What do you want to add?")
+                .font(.title3).bold()
+                .multilineTextAlignment(.center)
+
+            HStack(spacing: 12) {
+                ConnectionCard(
+                    title: "Phone",
+                    systemImage: "iphone",
+                    subtitle: "An Android phone over USB or hotspot — mirror, files, calls, messages."
+                ) { step = .choose }
+
+                ConnectionCard(
+                    title: "Computer",
+                    systemImage: "desktopcomputer",
+                    subtitle: "A Windows (RDP) or Linux/Mac (VNC) machine — screen, files, terminal, wake."
+                ) { onAddComputer() }
+            }
+        }
+    }
+}
+
+// MARK: - Step 1: phone connection chooser
 
 private struct ChooserView: View {
     @Binding var step: AddDeviceStep
@@ -91,7 +134,7 @@ private struct ChooserView: View {
 
 /// The steps of the Add Device flow. File-level so the chooser subview can bind
 /// to it (SwiftUI subviews can't reference a private nested enum across types).
-enum AddDeviceStep { case choose, usb, hotspot }
+enum AddDeviceStep { case kind, choose, usb, hotspot }
 
 private struct ConnectionCard: View {
     let title: String

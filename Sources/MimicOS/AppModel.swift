@@ -15,12 +15,18 @@ final class AppModel {
     /// Tabs in the main detail navbar.
     enum Tab: String, CaseIterable, Identifiable {
         case control = "Control"
+        case caller = "Caller"
+        case contacts = "Contacts"
+        case messages = "Messages"
         case files = "Files"
         case settings = "Settings"
         var id: String { rawValue }
         var systemImage: String {
             switch self {
             case .control: return "rectangle.on.rectangle"
+            case .caller: return "phone"
+            case .contacts: return "person.crop.circle"
+            case .messages: return "message"
             case .files: return "folder"
             case .settings: return "gearshape"
             }
@@ -28,6 +34,59 @@ final class AppModel {
     }
     var selectedTab: Tab = .control
     var openMainWindowAction: (() -> Void)?
+
+    /// What the sidebar has selected, and therefore which detail pane to show.
+    /// Phones and computers live in one combined sidebar, so the selection can be
+    /// either — this drives whether `ControlPanelView` or `PCPanelView` appears.
+    /// It's a thin facade over the underlying `selectedSerial` / `selectedHostID`,
+    /// which the rest of the model still reads.
+    enum Selection: Hashable {
+        case phone(String)   // device serial
+        case computer(UUID)  // RemoteHost id
+    }
+    var selection: Selection? {
+        get {
+            if let id = selectedHostID { return .computer(id) }
+            if let serial = selectedSerial { return .phone(serial) }
+            return nil
+        }
+        set {
+            switch newValue {
+            case .phone(let serial):
+                selectedHostID = nil
+                Task { await select(serial) }
+            case .computer(let id):
+                selectedHostID = id
+            case nil:
+                selectedHostID = nil
+            }
+        }
+    }
+
+    /// True when the current selection is a remote computer.
+    var isComputerSelected: Bool { selectedHostID != nil }
+
+    /// Tabs in the PC detail pane (one selected remote computer).
+    enum PCTab: String, CaseIterable, Identifiable {
+        case screen = "Screen"
+        case files = "Files"
+        case terminal = "Terminal"
+        var id: String { rawValue }
+        var systemImage: String {
+            switch self {
+            case .screen: return "display"
+            case .files: return "folder"
+            case .terminal: return "terminal"
+            }
+        }
+    }
+    var selectedPCTab: PCTab = .screen
+
+    /// id of the remote host selected in the PC sidebar.
+    var selectedHostID: UUID?
+    var selectedHost: RemoteHost? {
+        remoteHosts.first { $0.id == selectedHostID }
+    }
 
     var devices: [Device] = []
     var rawDevices: [Device] = []
@@ -61,6 +120,37 @@ final class AppModel {
     var isSilent: Bool = false
     var isVibrate: Bool = false
     var isDND: Bool = false
+
+    // MARK: - Incoming-call alerts
+    //
+    // A cellular call's voice path lives in the phone's baseband, unreachable by
+    // adb/scrcpy, so this is control-only: detect the ring, then Answer / Decline
+    // / Silence over adb. You talk on the physical phone (or hear it on the Mac if
+    // mirroring is on).
+    // MARK: - Caller tab (call log + contacts + dialer)
+    var callLog: [ADB.CallLogEntry] = []
+    var contacts: [ADB.Contact] = []
+    var isLoadingCallLog = false
+    var isLoadingContacts = false
+    var dialerInput = ""
+    var callerSearch = ""
+    var contactSearch = ""
+
+    // MARK: - Messages tab
+    var conversations: [ADB.Conversation] = []
+    var isLoadingMessages = false
+    var messageSearch = ""
+    var selectedThreadID: String?
+    /// When messaging a contact with no SMS history, holds who to start a new
+    /// conversation with so the Messages tab shows a compose box.
+    var pendingComposeNumber: String?
+    var pendingComposeName: String?
+
+    @ObservationIgnored private let callController = IncomingCallController()
+    /// Serial whose call is currently shown, and the last call state we saw for
+    /// it, so we only react on transitions (ring → answered/ended).
+    @ObservationIgnored private var ringingSerial: String?
+    @ObservationIgnored private var lastCallState: ADB.CallState = .idle
 
     // MARK: - Clipboard sync
     //
@@ -126,7 +216,11 @@ final class AppModel {
         }
         await ADB.startServer()
         await refreshDevices()
+        loadRemoteHosts()
+        setupCallController()
         startBackgroundMonitor()
+        startCallPoller()
+        startMessagePoller()
         // Match the OS login-item state to the saved preference.
         LoginItem.sync(desired: settings.launchAtLogin)
         
@@ -166,6 +260,13 @@ final class AppModel {
         mirrorWindowTitle = nil
         scrcpy.stop()
         headlessScrcpy.stop()
+        remoteDesktop.stop()
+        connectedRemoteHostID = nil
+        callPollTask?.cancel()
+        callPollTask = nil
+        messagePollTask?.cancel()
+        messagePollTask = nil
+        callController.dismiss()
         // Sweep any orphaned scrcpy processes so nothing lingers after quit.
         Scrcpy.killAll()
     }
@@ -231,6 +332,43 @@ final class AppModel {
         guard toolsReady, !isWorking, !isConnecting else { return }
         await refreshDevices()
         await attemptAutoReconnects()
+    }
+
+    // MARK: - Fast call poller
+    //
+    // Call detection runs on its own ~1s loop (separate from the 3–6s device
+    // monitor) so the panel pops up the instant the phone rings, not several
+    // seconds later. The check is cheap: a single grep-filtered `dumpsys telecom`.
+    @ObservationIgnored private var callPollTask: Task<Void, Never>?
+
+    private func startCallPoller() {
+        guard callPollTask == nil else { return }
+        callPollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                guard let self, !Task.isCancelled else { return }
+                await self.pollCallState()
+            }
+        }
+    }
+
+    // MARK: - Live message refresh
+    //
+    // While the Messages tab is open, refresh conversations every few seconds so
+    // texts you send (from the phone) and incoming replies appear without a
+    // manual refresh. Only runs on that tab to keep adb traffic low.
+    @ObservationIgnored private var messagePollTask: Task<Void, Never>?
+
+    private func startMessagePoller() {
+        guard messagePollTask == nil else { return }
+        messagePollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(4))
+                guard let self, !Task.isCancelled else { return }
+                let onMessages = await MainActor.run { self.selectedTab == .messages }
+                if onMessages { await self.refreshMessages(showLoading: false) }
+            }
+        }
     }
 
     /// Tracks transitions to offline for wireless devices and tries to bring back
@@ -374,7 +512,10 @@ final class AppModel {
             self.selectedSerial = nil
             self.info = nil
         }
-        if selectedSerial == nil, let first = found.first(where: { $0.state.isUsable }) {
+        // Auto-select the first usable phone only when nothing is selected — never
+        // steal the selection from a remote computer the user picked.
+        if selectedSerial == nil, selectedHostID == nil,
+           let first = found.first(where: { $0.state.isUsable }) {
             await select(first.serial)
         }
         updateBackgroundClipboardSync()
@@ -441,6 +582,7 @@ final class AppModel {
         if selectedSerial != serial {
             browsePath = "/sdcard/"
         }
+        selectedHostID = nil          // selecting a phone deselects any computer
         selectedSerial = serial
         info = await ADB.info(serial)
         updateBackgroundClipboardSync()
@@ -563,6 +705,7 @@ final class AppModel {
                     self.status = "Mirror stopped"
                 }
                 self.updateBackgroundClipboardSync()
+                self.updatePasswordFieldWatch()
             }
         }
         mirroringSerial = ok ? serial : nil
@@ -571,6 +714,7 @@ final class AppModel {
             : "Failed to start scrcpy"
 
         if ok { beginWindowTracking(title: title, pid: scrcpy.processPID) }
+        updatePasswordFieldWatch()
     }
 
     /// Bumped on every scrcpy (re)start; old exit handlers compare against it.
@@ -601,6 +745,7 @@ final class AppModel {
         scrcpy.stop()
         status = "Mirror stopped"
         updateBackgroundClipboardSync()
+        updatePasswordFieldWatch()
     }
 
     func ensureAccessibilityFreshAndPrompt() async {
@@ -812,6 +957,169 @@ final class AppModel {
         defer { isWorking = false }
         let result = await ADB.installAPK(serial, apkPath: localPath)
         status = result.succeeded ? "APK installed" : "Install failed: \(result.stderr.trimmingCharacters(in: .whitespacesAndNewlines))"
+    }
+
+    // MARK: - Remote Desktop (Windows RDP / Linux VNC)
+    //
+    // Like scrcpy, the client opens its own native window — we don't embed the
+    // remote framebuffer. RDP is driven by FreeRDP's `xfreerdp`; VNC hands off to
+    // the system Screen Sharing app. Hosts the user saves persist on the Mac;
+    // their passwords live in the Keychain.
+
+    @ObservationIgnored private let remoteDesktop = RemoteDesktop()
+
+    /// Saved connections shown in the Remote Desktop tab.
+    var remoteHosts: [RemoteHost] = []
+
+    /// id of the host whose RDP session is currently running (nil if none, or if
+    /// the active session is VNC, which the OS owns).
+    private(set) var connectedRemoteHostID: UUID?
+
+    /// Bumped whenever a remote host's saved password changes, so password-state
+    /// views re-read the Keychain.
+    var remoteSecretsRevision = 0
+
+    /// True if FreeRDP's `xfreerdp` is installed. Not required for RDP — without
+    /// it we hand a `.rdp` file to the user's native RDP client — but its presence
+    /// changes the experience (an owned window we can stop in-app).
+    var freeRDPInstalled: Bool { RemoteDesktop.freeRDPInstalled }
+
+    func loadRemoteHosts() {
+        remoteHosts = RemoteHostStore.all()
+        // Drop a stale selection if its host was removed.
+        if let id = selectedHostID, !remoteHosts.contains(where: { $0.id == id }) {
+            selectedHostID = nil
+        }
+    }
+
+    /// Save (or update) a host. If a non-empty password is supplied, it's stored
+    /// in the Keychain; an empty password leaves any existing one untouched.
+    func saveRemoteHost(_ host: RemoteHost, password: String) {
+        RemoteHostStore.upsert(host)
+        if !password.isEmpty {
+            SecretStore.setRemotePassword(password, hostID: host.idString)
+            remoteSecretsRevision += 1
+        }
+        loadRemoteHosts()
+    }
+
+    func deleteRemoteHost(_ host: RemoteHost) {
+        if connectedRemoteHostID == host.id {
+            remoteDesktop.stop()
+            connectedRemoteHostID = nil
+        }
+        RemoteHostStore.remove(host)
+        remoteSecretsRevision += 1
+        loadRemoteHosts()
+    }
+
+    func hasRemotePassword(_ host: RemoteHost) -> Bool {
+        SecretStore.hasRemotePassword(hostID: host.idString)
+    }
+
+    /// Whether RDP sessions open straight into fullscreen. When off (default),
+    /// they open in a resizable, smart-sized window. Ctrl+Alt+Enter toggles
+    /// fullscreen live regardless.
+    var rdpFullscreen: Bool = false
+
+    /// Map the Mac's ⌘ key to Ctrl inside RDP sessions, so ⌘C/⌘V feel native.
+    var rdpCommandAsCtrl: Bool = true
+
+    /// Opens a saved host: launches a FreeRDP client (RDP) or Screen Sharing
+    /// (VNC). The password, if saved, is read from the Keychain.
+    func connectRemoteHost(_ host: RemoteHost) {
+        let password = SecretStore.remotePassword(hostID: host.idString) ?? ""
+        let connection = RemoteDesktop.Connection(
+            host: host.host,
+            port: host.port,
+            username: host.username,
+            password: password,
+            proto: host.proto,
+            fullscreen: rdpFullscreen,
+            commandAsCtrl: rdpCommandAsCtrl)
+
+        let ok = remoteDesktop.connect(connection) { [weak self] code, errText in
+            Task { @MainActor in
+                guard let self, self.connectedRemoteHostID == host.id else { return }
+                self.connectedRemoteHostID = nil
+                if code != 0 && !errText.isEmpty {
+                    let clean = errText.split(separator: "\n").last.map(String.init) ?? errText
+                    self.status = "\(host.name) disconnected: \(clean.trimmingCharacters(in: .whitespacesAndNewlines))"
+                } else {
+                    self.status = "\(host.name) disconnected"
+                }
+            }
+        }
+
+        if ok {
+            // Only a process we actually own (the FreeRDP client window) can be
+            // stopped from here, so only that marks the host as "connected". VNC
+            // and the .rdp-file handoff are fire-and-forget — the OS owns Screen
+            // Sharing / whatever RDP client opened.
+            connectedRemoteHostID = remoteDesktop.isRunning ? host.id : nil
+            status = "Connecting to \(host.name)…"
+        } else {
+            connectedRemoteHostID = nil
+            status = "Couldn't start \(host.proto == .rdp ? "RDP" : "VNC") session for \(host.name)"
+        }
+    }
+
+    /// Stops the active owned (RDP) session.
+    func disconnectRemoteHost() {
+        remoteDesktop.stop()
+        connectedRemoteHostID = nil
+        status = "Remote session stopped"
+    }
+
+    // MARK: - PC: reachability (ping)
+
+    /// Per-host reachability: nil = unknown/never checked, true = online.
+    var hostReachability: [UUID: Bool] = [:]
+    /// Hosts with an in-flight ping (so the UI can show a spinner).
+    var hostsBeingPinged: Set<UUID> = []
+
+    /// Pings every saved host and records whether it replied.
+    func refreshAllHostReachability() async {
+        for host in remoteHosts { await pingHost(host) }
+    }
+
+    func pingHost(_ host: RemoteHost) async {
+        hostsBeingPinged.insert(host.id)
+        let alive = await RemotePC.ping(host.host)
+        hostsBeingPinged.remove(host.id)
+        hostReachability[host.id] = alive
+    }
+
+    // MARK: - PC: SSH terminal
+
+    /// Opens Terminal.app with an SSH session to the host.
+    func openSSH(_ host: RemoteHost) async {
+        let ok = await RemotePC.openSSH(host: host.host, username: host.username, port: nil)
+        status = ok ? "Opened SSH to \(host.name) in Terminal" : "Couldn't open Terminal for SSH"
+    }
+
+    // MARK: - PC: file transfer
+
+    /// Opens the host's file share in Finder over SMB — the one network protocol
+    /// Finder mounts natively on all three OSes (Windows File Sharing, Linux
+    /// Samba, macOS File Sharing). Finder prompts for credentials. (Finder can't
+    /// mount SFTP, so SMB is the universal path; the host must have SMB sharing
+    /// enabled.)
+    func openFiles(_ host: RemoteHost) async {
+        let ok = await RemotePC.openFileShare(scheme: "smb",
+                                              host: host.host,
+                                              username: host.username)
+        // `open smb://…` succeeds once it hands off to Finder; the actual mount
+        // happens (and may fail) asynchronously inside Finder, so we can't detect
+        // that here. If it errors, it's almost always because SMB sharing isn't
+        // set up on the host — the Files tab's setup guide covers that.
+        if ok {
+            status = host.os == .linux
+                ? "Opening \(host.name) in Finder… (if it can't connect, set up Samba — see the guide below)"
+                : "Opening \(host.name)'s files in Finder…"
+        } else {
+            status = "Couldn't open file share for \(host.name)"
+        }
     }
 
     // MARK: - File browser
@@ -1571,6 +1879,178 @@ final class AppModel {
         status = "Rotated screen"
     }
 
+    // MARK: - Unlock & autofill (Touch ID-gated)
+
+    /// True if this Mac can prompt for Touch ID (else it falls back to the Mac
+    /// password). Drives whether the UI shows a fingerprint affordance.
+    var biometricsAvailable: Bool { Biometrics.isAvailable }
+
+    /// Whether a lock PIN/password is saved for the selected device.
+    var hasSavedLockPIN: Bool {
+        guard let serial = selectedSerial else { return false }
+        return SecretStore.hasLockPIN(serial: serial)
+    }
+
+    /// Saved app-password labels for the selected device (no secrets — labels
+    /// only, so reading this never prompts for Touch ID).
+    var savedAppLabels: [String] {
+        guard let serial = selectedSerial else { return [] }
+        return SecretStore.appLabels(serial: serial)
+    }
+
+    /// Bumped after any secret-store mutation so SwiftUI re-reads `hasSavedLockPIN`
+    /// / `savedAppLabels` (Keychain isn't observable on its own).
+    var secretsRevision = 0
+
+    /// Store (or replace) the lock-screen PIN for the selected device. The value
+    /// goes into the Keychain behind Touch ID — we never keep a plaintext copy.
+    func saveLockPIN(_ pin: String) {
+        guard let serial = selectedSerial else { return }
+        let trimmed = pin.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return }
+        if SecretStore.setLockPIN(trimmed, serial: serial) {
+            status = "Lock PIN saved (Touch ID required to use it)"
+        } else {
+            status = "Couldn't save the lock PIN to the Keychain"
+        }
+        secretsRevision += 1
+    }
+
+    func clearLockPIN() {
+        guard let serial = selectedSerial else { return }
+        SecretStore.clearLockPIN(serial: serial)
+        status = "Saved lock removed"
+        secretsRevision += 1
+    }
+
+    /// One-click unlock: Touch ID → read the saved PIN → wake, dismiss the lock
+    /// curtain, type the PIN, and submit. No secret is touched before the
+    /// fingerprint is verified. (PIN/password only — patterns can't be replayed
+    /// without root.)
+    func unlockPhone() async {
+        guard let serial = selectedSerial,
+              selectedDevice?.state.isUsable == true else {
+            status = "Select a connected device first"
+            return
+        }
+        guard SecretStore.hasLockPIN(serial: serial) else {
+            status = "Set your phone's lock PIN first"
+            return
+        }
+
+        // Gate on Touch ID before any secret is read.
+        guard await Biometrics.authenticate(reason: "unlock your phone") else {
+            status = "Unlock cancelled"
+            return
+        }
+        guard let pin = SecretStore.lockSecret(serial: serial,
+                                               reason: "Unlock your phone") else {
+            status = "Couldn't read the saved PIN"
+            return
+        }
+
+        status = "Unlocking…"
+        await ADB.wakeAndPrepareLockScreen(serial)
+        await ADB.submitLockPIN(serial, pin: pin)
+        status = "Unlock sent"
+    }
+
+    /// Save (or replace) an app password under a label, behind Touch ID.
+    func saveAppPassword(_ password: String, label: String) {
+        guard let serial = selectedSerial else { return }
+        let l = label.trimmingCharacters(in: .whitespaces)
+        let p = password.trimmingCharacters(in: .whitespaces)
+        guard !l.isEmpty, !p.isEmpty else { return }
+        if SecretStore.setAppPassword(p, label: l, serial: serial) {
+            status = "Saved password for “\(l)”"
+        } else {
+            status = "Couldn't save that password"
+        }
+        secretsRevision += 1
+    }
+
+    func clearAppPassword(label: String) {
+        guard let serial = selectedSerial else { return }
+        SecretStore.clearAppPassword(label: label, serial: serial)
+        status = "Removed password for “\(label)”"
+        secretsRevision += 1
+    }
+
+    /// Touch ID → read the saved password → type it into the field currently
+    /// focused on the phone. Does not press Enter, so the user can verify it in
+    /// the mirror before confirming.
+    func autofillAppPassword(label: String) async {
+        guard let serial = selectedSerial,
+              selectedDevice?.state.isUsable == true else {
+            status = "Select a connected device first"
+            return
+        }
+        guard await Biometrics.authenticate(reason: "fill the password for \(label)") else {
+            status = "Autofill cancelled"
+            return
+        }
+        guard let password = SecretStore.appPassword(label: label, serial: serial,
+                                                     reason: "Fill the password for \(label)") else {
+            status = "Couldn't read that password"
+            return
+        }
+        status = "Filling password into the focused field…"
+        await ADB.autofillFocusedField(serial, text: password)
+        status = "Password typed — review it on your phone, then confirm"
+    }
+
+    // MARK: - Auto-autofill (detect password fields while mirroring)
+
+    /// True while a password field is focused on the phone — drives the
+    /// auto-autofill banner. The banner offers the user's saved app passwords.
+    var passwordFieldDetected: Bool = false
+
+    /// The package owning the detected password field, if known (so the banner
+    /// can hint which app it's for).
+    var detectedFieldPackage: String?
+
+    /// User preference: auto-offer autofill when a password field is detected
+    /// during mirroring. On by default; toggled in Settings.
+    var autoDetectPasswordFields: Bool = true {
+        didSet { updatePasswordFieldWatch() }
+    }
+
+    @ObservationIgnored private var passwordWatchTask: Task<Void, Never>?
+
+    /// Starts/stops the focused-field watcher based on whether we're mirroring
+    /// and the preference is on. Called when mirroring starts/stops.
+    func updatePasswordFieldWatch() {
+        passwordWatchTask?.cancel()
+        passwordWatchTask = nil
+        passwordFieldDetected = false
+        detectedFieldPackage = nil
+
+        guard autoDetectPasswordFields, isMirroring, let serial = mirroringSerial,
+              !savedAppLabels.isEmpty else { return }
+
+        passwordWatchTask = Task { [weak self] in
+            while !Task.isCancelled {
+                let field = await ADB.focusedField(serial)
+                let isPw = field?.isPassword ?? false
+                await MainActor.run {
+                    guard let self else { return }
+                    // Only flip on a state change so the banner doesn't re-animate
+                    // every poll while the field stays focused.
+                    if isPw != self.passwordFieldDetected {
+                        self.passwordFieldDetected = isPw
+                        self.detectedFieldPackage = isPw ? field?.packageName : nil
+                    }
+                }
+                try? await Task.sleep(for: .seconds(1))
+            }
+        }
+    }
+
+    /// Dismiss the auto-autofill banner without filling (user chose to ignore it).
+    func dismissPasswordFieldBanner() {
+        passwordFieldDetected = false
+    }
+
     func refreshRingerAndDNDStatus() async {
         guard let serial = selectedSerial,
               selectedDevice?.state.isUsable == true else { return }
@@ -1611,6 +2091,332 @@ final class AppModel {
         status = isDND ? "Do Not Disturb ON" : "Do Not Disturb OFF"
         _ = await ADB.setDND(serial, enabled: targetActive)
         await refreshRingerAndDNDStatus()
+    }
+
+    // MARK: - Incoming-call alerts
+
+    /// Wire the floating call panel's buttons to adb actions. Called once at
+    /// startup.
+    private func setupCallController() {
+        callController.onAnswer = { [weak self] in
+            Task { await self?.answerIncomingCall() }
+        }
+        callController.onDecline = { [weak self] in
+            Task { await self?.declineIncomingCall() }
+        }
+        callController.onSilence = { [weak self] in
+            Task { await self?.silenceIncomingCall() }
+        }
+        callController.onIgnore = { [weak self] in
+            Task { await self?.ignoreIncomingCall() }
+        }
+        callController.onMute = { [weak self] in
+            Task { await self?.toggleCallMute() }
+        }
+    }
+
+    /// One poll of the selected device's call state. Shows the panel for an
+    /// incoming ring OR an outgoing call, keeps it up (relabeled) once connected,
+    /// and dismisses it when the call ends.
+    private func pollCallState() async {
+        guard settings.callAlerts,
+              let serial = selectedSerial,
+              selectedDevice?.state.isUsable == true else {
+            // No usable device or alerts disabled — make sure nothing is stuck up.
+            if ringingSerial != nil { dismissCallPanel() }
+            return
+        }
+
+        guard let status = await ADB.callStatus(serial) else { return }
+        let previous = lastCallState
+        lastCallState = status.state
+
+        switch status.state {
+        case .ringing, .dialing, .active:
+            // If the user tapped Ignore for this exact call, stay hidden until it
+            // ends (so the panel doesn't keep nagging).
+            if let ignored = ignoredCallNumber, ignored == (status.number ?? "") {
+                return
+            }
+            let phase: IncomingCallController.Phase =
+                status.state == .ringing ? .incoming
+                : status.state == .dialing ? .outgoing
+                : .active
+            // (Re)show on a state change so we don't re-pop the same panel every
+            // tick, but do refresh the label as the phase advances.
+            if ringingSerial != serial || previous != status.state {
+                ringingSerial = serial
+                currentCallNumber = status.number
+                // Resolve the caller's contact name (best-effort; falls back to
+                // the number on the card if there's no match).
+                var name: String?
+                if let number = status.number, !number.isEmpty {
+                    name = await ADB.contactName(serial, number: number)
+                }
+                callController.show(name: name,
+                                    number: status.number,
+                                    deviceName: displayName(for: serial),
+                                    phase: phase)
+            }
+        case .idle:
+            // Declined, hung up, or ended → take the panel down and clear the
+            // per-call ignore so the next call shows normally.
+            ignoredCallNumber = nil
+            if ringingSerial != nil { dismissCallPanel() }
+        }
+    }
+
+    /// Number of a call the user chose to Ignore, so the poller won't re-show its
+    /// panel until that call ends. Empty string matches a withheld number.
+    @ObservationIgnored private var ignoredCallNumber: String?
+    /// The number currently shown, so Mute/Ignore can act on the right call.
+    @ObservationIgnored private var currentCallNumber: String?
+
+    /// The ringer mode the phone was in before the user tapped Silence, so we can
+    /// restore it once the call ends. nil means Silence wasn't used this call.
+    @ObservationIgnored private var ringerModeBeforeSilence: Int?
+
+    private func dismissCallPanel() {
+        // If we silenced the ringer just for this call, put the phone back the way
+        // it was (NORMAL/VIBRATE/SILENT) now that the call is over.
+        if let serial = ringingSerial, let mode = ringerModeBeforeSilence {
+            ringerModeBeforeSilence = nil
+            Task { [serial, mode] in
+                await ADB.setRingerMode(serial, mode: Self.ringerModeName(mode))
+                await self.refreshRingerAndDNDStatus()
+            }
+        }
+        callController.dismiss()
+        ringingSerial = nil
+    }
+
+    /// Maps a numeric ringer mode (0/1/2) to the string `set-ringer-mode` wants.
+    private static func ringerModeName(_ mode: Int) -> String {
+        switch mode {
+        case 0: return "SILENT"
+        case 1: return "VIBRATE"
+        default: return "NORMAL"
+        }
+    }
+
+    func answerIncomingCall() async {
+        guard let serial = ringingSerial else { return }
+        await ADB.answerCall(serial)
+        status = "Call answered — audio is on the phone"
+        dismissCallPanel()
+    }
+
+    func declineIncomingCall() async {
+        guard let serial = ringingSerial else { return }
+        await ADB.declineCall(serial)
+        status = "Call declined"
+        dismissCallPanel()
+    }
+
+    func silenceIncomingCall() async {
+        guard let serial = ringingSerial else { return }
+        // Remember the phone's current ringer mode (once) so we can restore it
+        // when the call ends — Silence should mute just this call, not leave the
+        // phone silent afterwards.
+        if ringerModeBeforeSilence == nil {
+            ringerModeBeforeSilence = await ADB.getRingerMode(serial) ?? 2
+        }
+        await ADB.silenceRinger(serial)
+        callController.markSilenced()
+        status = "Ringer silenced for this call"
+        await refreshRingerAndDNDStatus()
+    }
+
+    /// Dismisses the panel for the current call without rejecting it — the call
+    /// keeps ringing on the phone but stops nagging you on the Mac. Also silences
+    /// the ringer (temporarily, restored when the call ends) so it's not annoying.
+    func ignoreIncomingCall() async {
+        guard let serial = ringingSerial else { return }
+        if ringerModeBeforeSilence == nil {
+            ringerModeBeforeSilence = await ADB.getRingerMode(serial) ?? 2
+        }
+        await ADB.silenceRinger(serial)
+        // Remember this call so the poller won't re-show it until it ends.
+        ignoredCallNumber = currentCallNumber ?? ""
+        status = "Call ignored"
+        // Take the panel down but keep the ringer-restore pending; clear ringingSerial
+        // last so dismissCallPanel restores the ringer when the call truly ends —
+        // here we only hide the panel, restore happens on idle.
+        callController.dismiss()
+        await refreshRingerAndDNDStatus()
+    }
+
+    /// Toggles the microphone mute on the active call, then reads back the real
+    /// mic state so the button always reflects what the phone actually did.
+    func toggleCallMute() async {
+        guard let serial = ringingSerial else { return }
+        await ADB.toggleCallMute(serial)
+        // Give the phone a moment to apply, then sync the button to reality.
+        try? await Task.sleep(for: .milliseconds(400))
+        let muted = await ADB.isMicMuted(serial) ?? false
+        callController.setMuted(muted)
+        status = muted ? "Call mic muted" : "Call mic unmuted"
+    }
+
+    // MARK: - Caller tab (call log + dialer)
+
+    /// Filtered call log honoring the search box (matches name or number).
+    var filteredCallLog: [ADB.CallLogEntry] {
+        let q = callerSearch.trimmingCharacters(in: .whitespaces).lowercased()
+        guard !q.isEmpty else { return callLog }
+        return callLog.filter {
+            ($0.name?.lowercased().contains(q) ?? false) || $0.number.lowercased().contains(q)
+        }
+    }
+
+    /// Loads the recent call log AND all contacts for the selected device.
+    func refreshCallLog() async {
+        guard let serial = selectedSerial,
+              selectedDevice?.state.isUsable == true else {
+            callLog = []; contacts = []
+            return
+        }
+        isLoadingCallLog = true
+        defer { isLoadingCallLog = false }
+        async let log = ADB.callLog(serial, limit: 50)
+        async let cts = ADB.contacts(serial)
+        callLog = await log
+        contacts = await cts
+    }
+
+    /// All contacts filtered by the Contacts-tab search box (name or number).
+    var filteredContacts: [ADB.Contact] {
+        let q = contactSearch.trimmingCharacters(in: .whitespaces).lowercased()
+        guard !q.isEmpty else { return contacts }
+        return contacts.filter {
+            $0.name.lowercased().contains(q) ||
+            $0.number.filter(\.isNumber).contains(q.filter(\.isNumber))
+        }
+    }
+
+    /// Loads contacts for the Contacts tab (separate so it can load on its own).
+    func refreshContacts() async {
+        guard let serial = selectedSerial,
+              selectedDevice?.state.isUsable == true else {
+            contacts = []
+            return
+        }
+        isLoadingContacts = true
+        defer { isLoadingContacts = false }
+        contacts = await ADB.contacts(serial)
+    }
+
+    /// Contacts matching whatever is typed in the dialer field (name or number),
+    /// so the user sees who they're about to call. Empty when the field is empty.
+    var dialerMatches: [ADB.Contact] {
+        let raw = dialerInput.trimmingCharacters(in: .whitespaces)
+        guard !raw.isEmpty else { return [] }
+        let q = raw.lowercased()
+        let digits = raw.filter(\.isNumber)
+        return contacts.filter {
+            $0.name.lowercased().contains(q) ||
+            (!digits.isEmpty && $0.number.filter(\.isNumber).contains(digits))
+        }
+    }
+
+    /// Dials a number on the phone (from the dialer field or a call-log row).
+    func dial(_ number: String) async {
+        guard let serial = selectedSerial,
+              selectedDevice?.state.isUsable == true else {
+            status = "Select a connected device first"
+            return
+        }
+        let n = number.trimmingCharacters(in: .whitespaces)
+        guard !n.isEmpty else { return }
+        await ADB.dial(serial, number: n)
+        status = "Calling \(n)…"
+    }
+
+    // MARK: - Messages tab
+
+    /// Loads SMS conversations and resolves contact names for each thread.
+    /// `showLoading` is false for the background live-refresh so the sidebar
+    /// doesn't flash a spinner every few seconds.
+    func refreshMessages(showLoading: Bool = true) async {
+        guard let serial = selectedSerial,
+              selectedDevice?.state.isUsable == true else {
+            conversations = []
+            return
+        }
+        if showLoading { isLoadingMessages = true }
+        defer { if showLoading { isLoadingMessages = false } }
+        var convos = await ADB.conversations(serial)
+        // Make sure contacts are loaded so we can name the threads.
+        if contacts.isEmpty { contacts = await ADB.contacts(serial) }
+        for i in convos.indices {
+            convos[i].contactName = contactName(forNumber: convos[i].address)
+        }
+        // Only reassign if something actually changed, so the UI doesn't redraw
+        // (and the chat doesn't re-scroll) on every identical poll.
+        if convos != conversations { conversations = convos }
+    }
+
+    /// The currently selected conversation in the Messages master-detail view.
+    var selectedConversation: ADB.Conversation? {
+        guard let id = selectedThreadID else { return nil }
+        return conversations.first { $0.threadID == id }
+    }
+
+    /// Conversations filtered by the message search box (name, number, or body).
+    var filteredConversations: [ADB.Conversation] {
+        let q = messageSearch.trimmingCharacters(in: .whitespaces).lowercased()
+        guard !q.isEmpty else { return conversations }
+        return conversations.filter {
+            ($0.contactName?.lowercased().contains(q) ?? false) ||
+            $0.address.lowercased().contains(q) ||
+            $0.messages.contains { $0.body.lowercased().contains(q) }
+        }
+    }
+
+    /// Looks up a saved contact name for a number (local match against the loaded
+    /// contacts; compares trailing digits to tolerate formatting differences).
+    private func contactName(forNumber number: String) -> String? {
+        let target = number.filter(\.isNumber)
+        guard target.count >= 6 else { return nil }
+        let tail = String(target.suffix(10))
+        return contacts.first { $0.number.filter(\.isNumber).hasSuffix(tail) }?.name
+    }
+
+    /// Opens the phone's SMS composer to reply to `number` with `body`.
+    func sendSMS(to number: String, body: String) async {
+        guard let serial = selectedSerial,
+              selectedDevice?.state.isUsable == true else {
+            status = "Select a connected device first"
+            return
+        }
+        await ADB.composeSMS(serial, number: number, body: body)
+        status = "Opened SMS composer on phone"
+    }
+
+    /// Opens the Messages tab focused on the conversation with `number` (from a
+    /// contact's Message button), so the user reads/replies on the Mac rather
+    /// than the action silently happening on the phone. Loads messages if needed
+    /// and pre-selects the matching thread.
+    func openConversation(number: String, name: String?) async {
+        selectedTab = .messages
+        pendingComposeNumber = nil
+        pendingComposeName = nil
+        if conversations.isEmpty { await refreshMessages() }
+        // Find an existing thread for this number (compare trailing digits).
+        let tail = String(number.filter(\.isNumber).suffix(10))
+        if let convo = conversations.first(where: {
+            $0.address.filter(\.isNumber).hasSuffix(tail)
+        }) {
+            messageSearch = ""
+            selectedThreadID = convo.threadID
+        } else {
+            // No history yet — show a compose box to start a new conversation.
+            selectedThreadID = nil
+            messageSearch = ""
+            pendingComposeNumber = number
+            pendingComposeName = name
+            status = "New message to \(name ?? number)"
+        }
     }
 
     // MARK: - Screenshot & screen recording (to the user's capture folder)

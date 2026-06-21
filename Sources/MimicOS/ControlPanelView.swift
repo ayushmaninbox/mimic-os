@@ -35,6 +35,9 @@ struct ControlPanelView: View {
                     Group {
                         switch model.selectedTab {
                         case .control:        ControlTab()
+                        case .caller:         CallerTab()
+                        case .contacts:       ContactsTab()
+                        case .messages:       MessagesTab()
                         case .files:          FilesTab()
                         case .settings:       SettingsTab()
                         }
@@ -51,10 +54,17 @@ struct ControlPanelView: View {
                     }
                 }
                 .overlay(alignment: .top) {
-                    if let name = model.autoReconnectPrompt {
-                        AutoReconnectBanner(deviceName: name)
-                            .padding(.top, 8)
+                    VStack(spacing: 8) {
+                        if let name = model.autoReconnectPrompt {
+                            AutoReconnectBanner(deviceName: name)
+                        }
+                        if model.passwordFieldDetected {
+                            PasswordFieldBanner()
+                        }
                     }
+                    .padding(.top, 8)
+                    .animation(.spring(response: 0.35, dampingFraction: 0.85),
+                               value: model.passwordFieldDetected)
                 }
             }
         } else {
@@ -97,6 +107,70 @@ private struct AutoReconnectBanner: View {
     }
 }
 
+// MARK: - Auto-autofill banner (password field detected while mirroring)
+
+private struct PasswordFieldBanner: View {
+    @Environment(AppModel.self) private var model
+    @State private var showPicker = false
+
+    private var appHint: String {
+        guard let pkg = model.detectedFieldPackage else { return "A password field is focused" }
+        // Show just the readable tail of the package, e.g. "chrome" from
+        // "com.android.chrome".
+        let tail = pkg.split(separator: ".").last.map(String.init) ?? pkg
+        return "Password field in \(tail.capitalized)"
+    }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: model.biometricsAvailable ? "touchid" : "key.fill")
+                .foregroundStyle(.tint)
+                .font(.title3)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(appHint).font(.callout).bold()
+                Text("Autofill a saved password with Touch ID")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+
+            if model.savedAppLabels.count == 1, let only = model.savedAppLabels.first {
+                Button("Autofill") {
+                    Task { await model.autofillAppPassword(label: only) }
+                    model.dismissPasswordFieldBanner()
+                }
+                .buttonStyle(.borderedProminent)
+            } else {
+                Menu("Autofill…") {
+                    ForEach(model.savedAppLabels, id: \.self) { label in
+                        Button(label) {
+                            Task { await model.autofillAppPassword(label: label) }
+                            model.dismissPasswordFieldBanner()
+                        }
+                    }
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+            }
+
+            Button {
+                model.dismissPasswordFieldBanner()
+            } label: {
+                Image(systemName: "xmark")
+            }
+            .buttonStyle(.borderless)
+            .foregroundStyle(.secondary)
+        }
+        .padding(12)
+        .background(.regularMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(.tint.opacity(0.4), lineWidth: 1))
+        .shadow(color: .black.opacity(0.15), radius: 8, y: 4)
+        .padding(.horizontal, 16)
+        .frame(maxWidth: 560)
+        .transition(.move(edge: .top).combined(with: .opacity))
+    }
+}
+
 // MARK: - Top tab navbar
 
 private struct TabNavBar: View {
@@ -131,12 +205,480 @@ private struct ControlTab: View {
                 MirrorSection()
                 Divider()
                 AutomationSection()
+                Divider()
+                UnlockSection()
             }
             .padding(20)
         }
     }
 }
 
+
+// MARK: - Caller tab (dialer + search + recent calls)
+
+private struct CallerTab: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        @Bindable var model = model
+        VStack(alignment: .leading, spacing: 14) {
+            // Dialer row + live contact matches
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 8) {
+                    TextField("Enter a name or number to call", text: $model.dialerInput)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit { Task { await callAndClear(model.dialerInput) } }
+                    Button {
+                        Task { await callAndClear(model.dialerInput) }
+                    } label: {
+                        Label("Call", systemImage: "phone.fill")
+                    }
+                    .buttonStyle(.borderedProminent).tint(.green)
+                    .disabled(model.dialerInput.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+                // Live matches as you type a name/number.
+                if !model.dialerMatches.isEmpty {
+                    VStack(spacing: 0) {
+                        ForEach(model.dialerMatches.prefix(4)) { c in
+                            Button {
+                                Task { await callAndClear(c.number) }
+                            } label: {
+                                HStack {
+                                    Text(c.name).lineLimit(1)
+                                    Spacer()
+                                    Text(c.number).foregroundStyle(.secondary).lineLimit(1)
+                                }
+                                .contentShape(Rectangle())
+                                .padding(.vertical, 4)
+                            }
+                            .buttonStyle(.plain)
+                            Divider()
+                        }
+                    }
+                    .padding(.horizontal, 8)
+                    .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: 8))
+                }
+            }
+
+            // Recent-calls search
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                TextField("Search recent calls", text: $model.callerSearch)
+                    .textFieldStyle(.plain)
+                if !model.callerSearch.isEmpty {
+                    Button { model.callerSearch = "" } label: {
+                        Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                    }.buttonStyle(.plain)
+                }
+                Spacer()
+                Button { Task { await model.refreshCallLog() } } label: {
+                    Image(systemName: "arrow.clockwise")
+                }.buttonStyle(.plain).help("Refresh")
+            }
+            .padding(8)
+            .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 8))
+
+            // Recent calls
+            if model.isLoadingCallLog && model.callLog.isEmpty {
+                Spacer(); HStack { Spacer(); ProgressView(); Spacer() }; Spacer()
+            } else if model.filteredCallLog.isEmpty {
+                Spacer()
+                VStack(spacing: 6) {
+                    Image(systemName: "phone.badge.waveform")
+                        .font(.largeTitle).foregroundStyle(.secondary)
+                    Text(model.callerSearch.isEmpty ? "No recent calls" : "No matches")
+                        .foregroundStyle(.secondary)
+                }.frame(maxWidth: .infinity)
+                Spacer()
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(model.filteredCallLog) { entry in
+                            CallLogRow(entry: entry) { Task { await model.dial(entry.number) } }
+                            Divider()
+                        }
+                    }
+                }
+            }
+        }
+        .padding(20)
+        .task(id: model.selectedSerial) { await model.refreshCallLog() }
+    }
+
+    private func callAndClear(_ number: String) async {
+        await model.dial(number)
+        model.dialerInput = ""
+    }
+}
+
+// MARK: - Contacts tab (all contacts + call/message actions)
+
+private struct ContactsTab: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        @Bindable var model = model
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                TextField("Search contacts", text: $model.contactSearch)
+                    .textFieldStyle(.plain)
+                if !model.contactSearch.isEmpty {
+                    Button { model.contactSearch = "" } label: {
+                        Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                    }.buttonStyle(.plain)
+                }
+                Spacer()
+                Button { Task { await model.refreshContacts() } } label: {
+                    Image(systemName: "arrow.clockwise")
+                }.buttonStyle(.plain).help("Refresh")
+            }
+            .padding(8)
+            .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 8))
+
+            if model.isLoadingContacts && model.contacts.isEmpty {
+                Spacer(); HStack { Spacer(); ProgressView(); Spacer() }; Spacer()
+            } else if model.filteredContacts.isEmpty {
+                Spacer()
+                VStack(spacing: 6) {
+                    Image(systemName: "person.crop.circle.badge.questionmark")
+                        .font(.largeTitle).foregroundStyle(.secondary)
+                    Text(model.contactSearch.isEmpty ? "No contacts" : "No matches")
+                        .foregroundStyle(.secondary)
+                }.frame(maxWidth: .infinity)
+                Spacer()
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(model.filteredContacts) { c in
+                            ContactRow(contact: c)
+                            Divider()
+                        }
+                    }
+                }
+            }
+        }
+        .padding(20)
+        .task(id: model.selectedSerial) { await model.refreshContacts() }
+    }
+}
+
+/// A contact row with Call and Message actions.
+private struct ContactRow: View {
+    @Environment(AppModel.self) private var model
+    let contact: ADB.Contact
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "person.crop.circle.fill")
+                .font(.title2).foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(contact.name).font(.body).lineLimit(1)
+                Text(contact.number).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            }
+            Spacer()
+            Button { Task { await model.openConversation(number: contact.number, name: contact.name) } } label: {
+                Image(systemName: "message.fill").foregroundStyle(.blue)
+            }.buttonStyle(.plain).help("Message \(contact.name)")
+            Button { Task { await model.dial(contact.number) } } label: {
+                Image(systemName: "phone.fill").foregroundStyle(.green)
+            }.buttonStyle(.plain).help("Call \(contact.name)")
+        }
+        .padding(.vertical, 8).contentShape(Rectangle())
+    }
+}
+
+/// A single recent-call row: type icon, name/number, time, and a call button.
+private struct CallLogRow: View {
+    let entry: ADB.CallLogEntry
+    let onCall: () -> Void
+
+    private var icon: (String, Color) {
+        switch entry.kind {
+        case .incoming:  return ("arrow.down.left", .green)
+        case .outgoing:  return ("arrow.up.right", .blue)
+        case .missed:    return ("arrow.down.left", .red)
+        case .rejected:  return ("phone.down", .red)
+        case .voicemail: return ("recordingtape", .orange)
+        case .blocked:   return ("nosign", .red)
+        }
+    }
+
+    private var subtitle: String {
+        let when = entry.date.formatted(date: .abbreviated, time: .shortened)
+        if entry.kind == .missed || entry.kind == .rejected { return when }
+        if entry.duration > 0 {
+            let m = entry.duration / 60, s = entry.duration % 60
+            return "\(when) · \(m):\(String(format: "%02d", s))"
+        }
+        return when
+    }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: icon.0)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(icon.1)
+                .frame(width: 20)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(entry.name ?? entry.number)
+                    .font(.body)
+                    .lineLimit(1)
+                Text(subtitle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer()
+            Button(action: onCall) {
+                Image(systemName: "phone.fill").foregroundStyle(.green)
+            }
+            .buttonStyle(.plain)
+            .help("Call \(entry.number)")
+        }
+        .padding(.vertical, 8)
+        .contentShape(Rectangle())
+    }
+}
+
+// MARK: - Messages tab (chat-app layout: conversation list + chat detail)
+
+private struct MessagesTab: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        HStack(spacing: 0) {
+            ConversationSidebar()
+                .frame(width: 260)
+            Divider()
+            ChatDetail()
+                .frame(maxWidth: .infinity)
+        }
+        .task(id: model.selectedSerial) { await model.refreshMessages() }
+    }
+}
+
+/// Left pane: searchable list of conversations with selection.
+private struct ConversationSidebar: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        @Bindable var model = model
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                TextField("Search", text: $model.messageSearch)
+                    .textFieldStyle(.plain)
+                if !model.messageSearch.isEmpty {
+                    Button { model.messageSearch = "" } label: {
+                        Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                    }.buttonStyle(.plain)
+                }
+                Button { Task { await model.refreshMessages() } } label: {
+                    Image(systemName: "arrow.clockwise")
+                }.buttonStyle(.plain).help("Refresh")
+            }
+            .padding(10)
+            Divider()
+
+            if model.isLoadingMessages && model.conversations.isEmpty {
+                Spacer(); ProgressView(); Spacer()
+            } else if model.filteredConversations.isEmpty {
+                Spacer()
+                VStack(spacing: 6) {
+                    Image(systemName: "message").font(.title).foregroundStyle(.secondary)
+                    Text(model.messageSearch.isEmpty ? "No messages" : "No matches")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(model.filteredConversations) { convo in
+                            ConversationListRow(
+                                convo: convo,
+                                selected: model.selectedThreadID == convo.threadID
+                            ) {
+                                model.selectedThreadID = convo.threadID
+                                model.pendingComposeNumber = nil
+                            }
+                            Divider()
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A single row in the conversation sidebar.
+private struct ConversationListRow: View {
+    let convo: ADB.Conversation
+    let selected: Bool
+    let onTap: () -> Void
+
+    var body: some View {
+        Button(action: onTap) {
+            HStack(spacing: 10) {
+                Image(systemName: "person.crop.circle.fill")
+                    .font(.title2).foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(convo.contactName ?? convo.address)
+                        .font(.subheadline).fontWeight(.medium).lineLimit(1)
+                    Text(convo.lastBody).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
+                Spacer(minLength: 4)
+                Text(convo.lastDate.formatted(date: .numeric, time: .omitted))
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 10).padding(.vertical, 8)
+            .contentShape(Rectangle())
+            .background(selected ? Color.accentColor.opacity(0.18) : .clear)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+/// Right pane: the selected conversation's messages + compose box. Falls back to
+/// a "new message" composer when starting a fresh conversation, or a placeholder
+/// when nothing is selected.
+private struct ChatDetail: View {
+    @Environment(AppModel.self) private var model
+    @State private var draft = ""
+
+    var body: some View {
+        if let number = model.pendingComposeNumber {
+            newConversation(number: number, name: model.pendingComposeName)
+        } else if let convo = model.selectedConversation {
+            conversation(convo)
+        } else {
+            placeholder
+        }
+    }
+
+    private var placeholder: some View {
+        VStack(spacing: 8) {
+            Image(systemName: "bubble.left.and.bubble.right")
+                .font(.system(size: 40)).foregroundStyle(.secondary)
+            Text("Select a conversation").foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func conversation(_ convo: ADB.Conversation) -> some View {
+        VStack(spacing: 0) {
+            // Header
+            HStack(spacing: 10) {
+                Image(systemName: "person.crop.circle.fill")
+                    .font(.title2).foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(convo.contactName ?? convo.address).font(.headline).lineLimit(1)
+                    if convo.contactName != nil {
+                        Text(convo.address).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    }
+                }
+                Spacer()
+                Button { Task { await model.dial(convo.address) } } label: {
+                    Image(systemName: "phone.fill")
+                }.buttonStyle(.plain).help("Call")
+            }
+            .padding(12)
+            Divider()
+
+            // Messages (newest at the bottom, scrolled to end)
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(spacing: 6) {
+                        ForEach(convo.messages.reversed()) { m in
+                            MessageBubble(message: m).id(m.id)
+                        }
+                    }
+                    .padding(12)
+                }
+                .onAppear { scrollToEnd(proxy, convo) }
+                .onChange(of: convo.id) { _, _ in scrollToEnd(proxy, convo) }
+                // Scroll to the newest when a message arrives during live refresh.
+                .onChange(of: convo.messages.count) { _, _ in scrollToEnd(proxy, convo) }
+            }
+
+            composeBar(to: convo.address)
+        }
+    }
+
+    private func newConversation(number: String, name: String?) -> some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                Image(systemName: "square.and.pencil").foregroundStyle(.blue)
+                Text("New message to \(name ?? number)").font(.headline)
+                Spacer()
+                Button {
+                    model.pendingComposeNumber = nil; model.pendingComposeName = nil
+                } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary) }
+                    .buttonStyle(.plain)
+            }
+            .padding(12)
+            Divider()
+            Spacer()
+            Text("No messages yet").foregroundStyle(.secondary)
+            Spacer()
+            composeBar(to: number)
+        }
+    }
+
+    private func composeBar(to number: String) -> some View {
+        VStack(spacing: 2) {
+            Divider()
+            HStack(spacing: 8) {
+                TextField("Type a message…", text: $draft)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit { send(to: number) }
+                Button { send(to: number) } label: {
+                    Image(systemName: "paperplane.fill")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(draft.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+            .padding(10)
+            Text("Send opens it on your phone ready to send — Android blocks non-default SMS apps from sending directly.")
+                .font(.caption2).foregroundStyle(.secondary)
+                .padding(.horizontal, 10).padding(.bottom, 8)
+        }
+    }
+
+    private func send(to number: String) {
+        let body = draft
+        guard !body.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+        Task { await model.sendSMS(to: number, body: body) }
+        draft = ""
+    }
+
+    private func scrollToEnd(_ proxy: ScrollViewProxy, _ convo: ADB.Conversation) {
+        if let last = convo.messages.first {  // messages are newest-first
+            proxy.scrollTo(last.id, anchor: .bottom)
+        }
+    }
+}
+
+/// A single chat bubble (incoming left/gray, outgoing right/blue).
+private struct MessageBubble: View {
+    let message: ADB.SMS
+
+    var body: some View {
+        HStack {
+            if !message.incoming { Spacer(minLength: 40) }
+            VStack(alignment: message.incoming ? .leading : .trailing, spacing: 2) {
+                Text(message.body)
+                    .padding(.horizontal, 12).padding(.vertical, 8)
+                    .background(message.incoming ? Color.gray.opacity(0.22) : Color.accentColor.opacity(0.85),
+                                in: RoundedRectangle(cornerRadius: 14))
+                    .foregroundStyle(message.incoming ? Color.primary : Color.white)
+                Text(message.date.formatted(date: .omitted, time: .shortened))
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+            if message.incoming { Spacer(minLength: 40) }
+        }
+    }
+}
 
 // MARK: - Settings tab (mirror options + clipboard live here too)
 
@@ -173,6 +715,14 @@ private struct SettingsTab: View {
                     Toggle("Sync clipboard in background (even when not mirroring)", isOn: $model.clipboardSyncEnabled)
                         .font(.body)
                     Text("When active, MimicOS automatically syncs copy/paste between this Mac and your phone in the background using a headless session.\n\nNote: If you start screen mirroring, the full scrcpy session takes over clipboard synchronization seamlessly.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Divider()
+                SectionCard(title: "Unlock & Autofill", systemImage: "touchid") {
+                    Toggle("Auto-offer autofill when a password field is detected while mirroring",
+                           isOn: $model.autoDetectPasswordFields)
+                        .font(.body)
+                    Text("While mirroring, MimicOS watches the focused field on your phone. When you tap into a password field, a banner slides in offering to fill one of your saved app passwords with Touch ID. Needs at least one saved password (Control tab). Detection runs app-free via the input-method service — it never reads what you type.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Divider()
@@ -216,6 +766,14 @@ private struct SettingsTab: View {
                             set: { model.settings.alwaysOnTop = $0; model.applyMirrorSettingsLive() }))
                         .font(.body)
                     Text("The sidebar is a floating control strip that sticks to the side of the phone screen (auto-flips left/right based on room) and follows it as you move it. It needs Accessibility access (you'll be prompted). The window's last size & position are remembered for next time. Enabling 'Always on Top' keeps the mirrored window above other apps.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Divider()
+                SectionCard(title: "Calls", systemImage: "phone.badge.waveform") {
+                    Toggle("Show an incoming-call panel on this Mac",
+                           isOn: $settings.callAlerts)
+                        .font(.body)
+                    Text("When your phone rings, a floating panel appears on the Mac with Answer, Decline, and Silence — no mirroring needed. Voice stays on the phone: a cellular call's audio is handled by the phone's modem and can't be routed to the Mac's mic or speakers over USB.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Divider()
@@ -385,6 +943,137 @@ private struct QuickControlButton: View {
         .buttonStyle(.plain)
         .help(help)
         .onHover { hovering = $0 }
+    }
+}
+
+// MARK: - Unlock & autofill (Touch ID-gated)
+
+private struct UnlockSection: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        // Re-read Keychain-backed state whenever a secret changes.
+        let _ = model.secretsRevision
+        SectionCard(title: "Unlock & Autofill", systemImage: "lock.open.fill") {
+            // Phone unlock
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 10) {
+                    Button {
+                        Task { await model.unlockPhone() }
+                    } label: {
+                        Label("Unlock phone", systemImage: model.biometricsAvailable ? "touchid" : "key.fill")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!model.hasSavedLockPIN)
+
+                    if model.hasSavedLockPIN {
+                        Label("PIN saved", systemImage: "checkmark.shield.fill")
+                            .font(.caption)
+                            .foregroundStyle(.green)
+                        Button("Remove") { model.clearLockPIN() }
+                            .buttonStyle(.borderless)
+                            .font(.caption)
+                    }
+                }
+
+                if !model.hasSavedLockPIN {
+                    LockSetupRow()
+                }
+
+                Text(model.biometricsAvailable
+                     ? "Your PIN is stored encrypted in the macOS Keychain — Touch ID is required every time you unlock. Works on PIN/password locks only; the digits are typed over a hardware-keyboard channel."
+                     : "No Touch ID enrolled on this Mac — you'll be asked for your Mac password instead. The PIN is stored encrypted in the Keychain. Works on PIN/password locks only.")
+                    .font(.caption).foregroundStyle(.secondary)
+
+                Label("Pattern locks aren't supported — Android can't replay a continuous unlock gesture without root. Use a PIN or password instead.",
+                      systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Divider().padding(.vertical, 4)
+
+            // App password autofill
+            AppPasswordList()
+        }
+    }
+}
+
+/// One-time setup to record the phone's lock PIN/password. Stored behind Touch ID.
+private struct LockSetupRow: View {
+    @Environment(AppModel.self) private var model
+    @State private var pin = ""
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "iphone.gen3")
+                .foregroundStyle(.secondary)
+            SecureField("Phone lock PIN / password", text: $pin)
+                .textFieldStyle(.roundedBorder)
+                .frame(maxWidth: 240)
+            Button("Save") {
+                model.saveLockPIN(pin)
+                pin = ""
+            }
+            .disabled(pin.trimmingCharacters(in: .whitespaces).isEmpty)
+        }
+    }
+}
+
+/// List + editor for saved app passwords the user can autofill into a focused
+/// field on the phone.
+private struct AppPasswordList: View {
+    @Environment(AppModel.self) private var model
+    @State private var newLabel = ""
+    @State private var newPassword = ""
+
+    var body: some View {
+        let _ = model.secretsRevision
+        VStack(alignment: .leading, spacing: 10) {
+            Label("App passwords", systemImage: "key.horizontal.fill").font(.subheadline).bold()
+
+            ForEach(model.savedAppLabels, id: \.self) { label in
+                HStack(spacing: 10) {
+                    Image(systemName: "app.dashed").foregroundStyle(.secondary)
+                    Text(label).font(.callout)
+                    Spacer()
+                    Button {
+                        Task { await model.autofillAppPassword(label: label) }
+                    } label: {
+                        Label("Autofill", systemImage: model.biometricsAvailable ? "touchid" : "key.fill")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    Button {
+                        model.clearAppPassword(label: label)
+                    } label: {
+                        Image(systemName: "trash")
+                    }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.red)
+                    .controlSize(.small)
+                }
+                .padding(.vertical, 2)
+            }
+
+            HStack(spacing: 8) {
+                TextField("Label (e.g. Email)", text: $newLabel)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(maxWidth: 160)
+                SecureField("Password", text: $newPassword)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(maxWidth: 200)
+                Button("Add") {
+                    model.saveAppPassword(newPassword, label: newLabel)
+                    newLabel = ""; newPassword = ""
+                }
+                .disabled(newLabel.trimmingCharacters(in: .whitespaces).isEmpty
+                          || newPassword.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+
+            Text("Open the app and tap the password field on your phone (or via the mirror) so it has focus, then hit Autofill. Touch ID unlocks the saved password and types it in — it does not press Enter, so you can check it first.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
     }
 }
 
@@ -1439,5 +2128,3 @@ private struct TransferRowView: View {
         ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
     }
 }
-
-
