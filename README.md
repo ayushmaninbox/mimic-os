@@ -172,11 +172,19 @@ cd mimic-os
 swift run
 ```
 
+### Or Install with Homebrew (easiest)
+
+```bash
+brew install --cask ayushmaninbox/mimic-os/mimicos
+```
+
+This installs the latest release and **strips the macOS quarantine flag automatically**, so the app opens with no Gatekeeper *"Apple could not verify…"* prompt — no right-click dance required.
+
 ### Or Download the `.dmg`
 
 Head to [**Releases**](https://github.com/ayushmaninbox/mimic-os/releases) and grab the latest `MimicOS-vX.X.dmg`. Drag to Applications. Done.
 
-> **First launch on an unsigned build:** right-click the app → **Open** → click Open again to bypass Gatekeeper.
+> **First launch on a manually downloaded build:** right-click the app → **Open** → click Open again to bypass Gatekeeper (or use Homebrew above to avoid this entirely).
 
 ---
 
@@ -360,13 +368,23 @@ Build number × 7 taps → Developer mode unlocked → USB debugging toggle
 
 ## 📦 Download & Install
 
-### Option 1: Download the DMG (Recommended)
+### Option 1: Homebrew (Recommended)
+
+```bash
+brew install --cask ayushmaninbox/mimic-os/mimicos
+```
+
+Homebrew downloads the latest release, installs **MimicOS.app** to `/Applications`, and **strips the macOS quarantine flag for you** — so the app opens instantly with no *"Apple could not verify…"* Gatekeeper prompt. To update later: `brew upgrade --cask mimicos`.
+
+> The cask lives in the [**ayushmaninbox/homebrew-mimic-os**](https://github.com/ayushmaninbox/homebrew-mimic-os) tap.
+
+### Option 2: Download the DMG
 
 1. Go to [**Releases**](https://github.com/ayushmaninbox/mimic-os/releases)
 2. Download `MimicOS-v2.0.dmg`
 3. Open the DMG, drag MimicOS to Applications
 4. **Bypassing macOS Gatekeeper (since MimicOS is ad-hoc signed):**
-   Because the app is not signed with an Apple Developer ID, macOS might show a dialog saying *"MimicOS Not Opened — Apple could not verify..."* with only **Done** and **Move to Bin** options. 
+   Because the app is not signed with an Apple Developer ID, macOS might show a dialog saying *"MimicOS Not Opened — Apple could not verify..."* with only **Done** and **Move to Bin** options. *(Installing via Homebrew above avoids this entirely.)*
 
    To bypass this:
    * **Fix 1 (Right-click → Open):** In Finder, open Applications, right-click (or Control-click) `MimicOS`, and select **Open**. Click **Open** on the confirmation dialog. *(Note: On macOS Sequoia 15+, this might be hidden on the first attempt; use Fix 2 or 3 if needed).*
@@ -378,7 +396,7 @@ Build number × 7 taps → Developer mode unlocked → USB debugging toggle
      This strips the internet download quarantine attribute, letting the app open instantly.
 
 
-### Option 2: Build from Source
+### Option 3: Build from Source
 
 ```bash
 git clone https://github.com/ayushmaninbox/mimic-os.git
@@ -387,7 +405,7 @@ cd mimic-os
 swift run                   # Build & run in debug mode
 ```
 
-### Option 3: Build the Release App + DMG
+### Option 4: Build the Release App + DMG
 
 ```bash
 ./Scripts/build-app.sh      # Builds MimicOS.app with bundled tools
