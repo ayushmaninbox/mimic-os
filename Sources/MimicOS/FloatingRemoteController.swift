@@ -237,6 +237,9 @@ private struct RemoteStrip: View {
                     RemoteButton(systemName: "power", help: "Power") {
                         Task { await model.togglePower() }
                     }
+                    RemoteButton(systemName: "lock.open", help: "Unlock phone") {
+                        Task { await model.unlockPhone() }
+                    }
                     RemoteButton(systemName: "speaker.wave.2.fill", help: "Volume up") {
                         Task { await model.volumeUp() }
                     }

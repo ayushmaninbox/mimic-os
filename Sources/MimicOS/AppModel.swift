@@ -290,8 +290,10 @@ final class AppModel {
         messagePollTask?.cancel()
         messagePollTask = nil
         callController.dismiss()
-        // Sweep any orphaned scrcpy processes so nothing lingers after quit.
+        // Sweep any orphaned scrcpy / FreeRDP processes so no mirror or remote
+        // desktop window lingers after quit.
         Scrcpy.killAll()
+        RemoteDesktop.killAll()
     }
 
     // MARK: - Background device monitor (powers auto-reconnect)
@@ -742,7 +744,6 @@ final class AppModel {
                     self.status = "Mirror stopped for \(serial)"
                 }
                 self.updateBackgroundClipboardSync()
-                self.updatePasswordFieldWatch()
             }
         }
         if ok {
@@ -754,7 +755,6 @@ final class AppModel {
         } else {
             status = "Failed to start scrcpy"
         }
-        updatePasswordFieldWatch()
     }
 
 
@@ -785,7 +785,6 @@ final class AppModel {
         scrcpySessions[serial]?.stop()
         status = "Mirror stopped"
         updateBackgroundClipboardSync()
-        updatePasswordFieldWatch()
     }
 
     func ensureAccessibilityFreshAndPrompt() async {
@@ -1008,6 +1007,9 @@ final class AppModel {
 
     @ObservationIgnored private let remoteDesktop = RemoteDesktop()
 
+    /// Drives the universal (app-wide) settings sheet.
+    var showUniversalSettings = false
+
     /// Saved connections shown in the Remote Desktop tab.
     var remoteHosts: [RemoteHost] = []
 
@@ -1083,17 +1085,62 @@ final class AppModel {
         SecretStore.hasRemotePassword(hostID: host.idString)
     }
 
+    /// Set when a connect fails because the saved password was rejected — the PC
+    /// view observes this and shows a password re-entry prompt.
+    var passwordReentryHost: RemoteHost?
+
+    /// True if FreeRDP's output indicates the credentials were rejected (as
+    /// opposed to a network / cert / generic failure).
+    static func isAuthFailure(_ errText: String) -> Bool {
+        let t = errText.lowercased()
+        return t.contains("logon_failure")
+            || t.contains("0x00020014")            // ERRCONNECT_LOGON_FAILURE
+            || t.contains("0x00020009")            // ERRCONNECT_AUTHENTICATION_FAILED
+            || t.contains("account_locked_out")
+            || t.contains("authentication failure")
+            || t.contains("invalid credentials")
+            || (t.contains("logon") && t.contains("fail"))
+    }
+
+    /// Save a corrected password for the host (replacing the rejected one) and
+    /// reconnect. Called from the password re-entry prompt.
+    func retryWithNewPassword(_ host: RemoteHost, password: String) {
+        SecretStore.setRemotePassword(password, hostID: host.idString)
+        remoteSecretsRevision += 1
+        passwordReentryHost = nil
+        connectRemoteHost(host)   // already authorized by the user just typing it
+    }
+
+    /// User-initiated connect. If a password is saved for this host, require Touch
+    /// ID first (so the user types the password once, at setup, and just uses a
+    /// fingerprint afterwards), then connect. Auto-reconnect uses
+    /// `connectRemoteHost` directly and is never gated.
+    func userConnectRemoteHost(_ host: RemoteHost) async {
+        // RDP needs a password. If none is saved, ask for it (our own prompt)
+        // rather than launching FreeRDP with an empty one, which makes FreeRDP pop
+        // its own "Credentials required" dialog.
+        if host.proto == .rdp,
+           (SecretStore.remotePassword(hostID: host.idString) ?? "").isEmpty {
+            passwordReentryHost = host
+            status = "Enter the password for \(host.name)"
+            return
+        }
+
+        if SecretStore.hasRemotePassword(hostID: host.idString) {
+            let ok = await Biometrics.authenticate(reason: "connect to \(host.name)")
+            guard ok else {
+                status = "Touch ID cancelled — \(host.name) not connected"
+                return
+            }
+        }
+        connectRemoteHost(host)
+    }
+
     /// Opens a saved host: launches a FreeRDP client (RDP) or Screen Sharing
     /// (VNC). The password, if saved, is read from the Keychain.
     func connectRemoteHost(_ host: RemoteHost) {
         droppedHostIDs.remove(host.id)
-        
-        if host.runInBackground {
-            connectedRemoteHostID = host.id
-            status = "Connected to \(host.name) (Background Mode)"
-            return
-        }
-        
+
         let password = SecretStore.remotePassword(hostID: host.idString) ?? ""
         let connection = RemoteDesktop.Connection(
             host: host.host,
@@ -1108,14 +1155,24 @@ final class AppModel {
             Task { @MainActor in
                 guard let self, self.connectedRemoteHostID == host.id else { return }
                 self.connectedRemoteHostID = nil
-                
-                if code != 0 {
-                    self.droppedHostIDs.insert(host.id)
-                }
-                
-                if code != 0 && !errText.isEmpty {
+
+                // The FreeRDP window exited. Whether the user closed it (red
+                // button) or it crashed, we do NOT mark it for auto-reconnect
+                // here — closing the window means the session is over. Auto-
+                // reconnect only fires when the *machine* drops off the network
+                // while connected (detected by ping in refreshAllHostReachability),
+                // so closing the window can't trigger a reconnect loop.
+                self.droppedHostIDs.remove(host.id)
+
+                // If FreeRDP rejected the credentials, the saved password is wrong
+                // — ask the user for the correct one (don't just unlock the bad one
+                // again with Touch ID next time).
+                if Self.isAuthFailure(errText) {
+                    self.passwordReentryHost = host
+                    self.status = "Wrong password for \(host.name) — enter the correct one"
+                } else if code != 0 && !errText.isEmpty {
                     let clean = errText.split(separator: "\n").last.map(String.init) ?? errText
-                    self.status = "\(host.name) disconnected unexpectedly: \(clean.trimmingCharacters(in: .whitespacesAndNewlines))"
+                    self.status = "\(host.name) disconnected: \(clean.trimmingCharacters(in: .whitespacesAndNewlines))"
                 } else {
                     self.status = "\(host.name) disconnected"
                 }
@@ -2063,15 +2120,8 @@ final class AppModel {
         return SecretStore.hasLockPIN(serial: serial)
     }
 
-    /// Saved app-password labels for the selected device (no secrets — labels
-    /// only, so reading this never prompts for Touch ID).
-    var savedAppLabels: [String] {
-        guard let serial = selectedSerial else { return [] }
-        return SecretStore.appLabels(serial: serial)
-    }
-
     /// Bumped after any secret-store mutation so SwiftUI re-reads `hasSavedLockPIN`
-    /// / `savedAppLabels` (Keychain isn't observable on its own).
+    /// (Keychain isn't observable on its own).
     var secretsRevision = 0
 
     /// Store (or replace) the lock-screen PIN for the selected device. The value
@@ -2125,102 +2175,6 @@ final class AppModel {
         await ADB.wakeAndPrepareLockScreen(serial)
         await ADB.submitLockPIN(serial, pin: pin)
         status = "Unlock sent"
-    }
-
-    /// Save (or replace) an app password under a label, behind Touch ID.
-    func saveAppPassword(_ password: String, label: String) {
-        guard let serial = selectedSerial else { return }
-        let l = label.trimmingCharacters(in: .whitespaces)
-        let p = password.trimmingCharacters(in: .whitespaces)
-        guard !l.isEmpty, !p.isEmpty else { return }
-        if SecretStore.setAppPassword(p, label: l, serial: serial) {
-            status = "Saved password for “\(l)”"
-        } else {
-            status = "Couldn't save that password"
-        }
-        secretsRevision += 1
-    }
-
-    func clearAppPassword(label: String) {
-        guard let serial = selectedSerial else { return }
-        SecretStore.clearAppPassword(label: label, serial: serial)
-        status = "Removed password for “\(label)”"
-        secretsRevision += 1
-    }
-
-    /// Touch ID → read the saved password → type it into the field currently
-    /// focused on the phone. Does not press Enter, so the user can verify it in
-    /// the mirror before confirming.
-    func autofillAppPassword(label: String) async {
-        guard let serial = selectedSerial,
-              selectedDevice?.state.isUsable == true else {
-            status = "Select a connected device first"
-            return
-        }
-        guard await Biometrics.authenticate(reason: "fill the password for \(label)") else {
-            status = "Autofill cancelled"
-            return
-        }
-        guard let password = SecretStore.appPassword(label: label, serial: serial,
-                                                     reason: "Fill the password for \(label)") else {
-            status = "Couldn't read that password"
-            return
-        }
-        status = "Filling password into the focused field…"
-        await ADB.autofillFocusedField(serial, text: password)
-        status = "Password typed — review it on your phone, then confirm"
-    }
-
-    // MARK: - Auto-autofill (detect password fields while mirroring)
-
-    /// True while a password field is focused on the phone — drives the
-    /// auto-autofill banner. The banner offers the user's saved app passwords.
-    var passwordFieldDetected: Bool = false
-
-    /// The package owning the detected password field, if known (so the banner
-    /// can hint which app it's for).
-    var detectedFieldPackage: String?
-
-    /// User preference: auto-offer autofill when a password field is detected
-    /// during mirroring. On by default; toggled in Settings.
-    var autoDetectPasswordFields: Bool = true {
-        didSet { updatePasswordFieldWatch() }
-    }
-
-    @ObservationIgnored private var passwordWatchTask: Task<Void, Never>?
-
-    /// Starts/stops the focused-field watcher based on whether we're mirroring
-    /// and the preference is on. Called when mirroring starts/stops.
-    func updatePasswordFieldWatch() {
-        passwordWatchTask?.cancel()
-        passwordWatchTask = nil
-        passwordFieldDetected = false
-        detectedFieldPackage = nil
-
-        guard autoDetectPasswordFields, isMirroring, let serial = mirroringSerial,
-              !savedAppLabels.isEmpty else { return }
-
-        passwordWatchTask = Task { [weak self] in
-            while !Task.isCancelled {
-                let field = await ADB.focusedField(serial)
-                let isPw = field?.isPassword ?? false
-                await MainActor.run {
-                    guard let self else { return }
-                    // Only flip on a state change so the banner doesn't re-animate
-                    // every poll while the field stays focused.
-                    if isPw != self.passwordFieldDetected {
-                        self.passwordFieldDetected = isPw
-                        self.detectedFieldPackage = isPw ? field?.packageName : nil
-                    }
-                }
-                try? await Task.sleep(for: .seconds(1))
-            }
-        }
-    }
-
-    /// Dismiss the auto-autofill banner without filling (user chose to ignore it).
-    func dismissPasswordFieldBanner() {
-        passwordFieldDetected = false
     }
 
     func refreshRingerAndDNDStatus() async {
@@ -2588,116 +2542,6 @@ final class AppModel {
             pendingComposeNumber = number
             pendingComposeName = name
             status = "New message to \(name ?? number)"
-        }
-    }
-
-    // MARK: - Remote PC Screen Capture & Recording (over SSH)
-    
-    var remoteRecordingPIDs: [UUID: String] = [:]
-
-    func captureRemotePCScreenshot(host: RemoteHost) async {
-        status = "Taking screenshot on \(host.name)..."
-        
-        let portArgSSH = host.port.map { ["-p", "\($0)"] } ?? []
-        let target = host.username.isEmpty ? host.host : "\(host.username)@\(host.host)"
-        
-        var remoteCmd = ""
-        switch host.os {
-        case .mac:
-            remoteCmd = "screencapture -x /tmp/mimicos_screenshot.png"
-        case .linux:
-            remoteCmd = "DISPLAY=:0 gnome-screenshot -f /tmp/mimicos_screenshot.png || DISPLAY=:0 scrot /tmp/mimicos_screenshot.png || DISPLAY=:0 import -window root /tmp/mimicos_screenshot.png"
-        case .windows:
-            remoteCmd = "powershell -Command \"[Reflection.Assembly]::LoadWithPartialName('System.Drawing'); [Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms'); \\$bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds; \\$bmp = New-Object Drawing.Bitmap \\$bounds.Width, \\$bounds.Height; \\$graphics = [Drawing.Graphics]::FromImage(\\$bmp); \\$graphics.CopyFromScreen(\\$bounds.Location, [Drawing.Point]::Empty, \\$bounds.Size); \\$bmp.Save('C:\\\\Windows\\\\Temp\\\\mimicos_screenshot.png', [Drawing.Imaging.ImageFormat]::Png); \\$graphics.Dispose(); \\$bmp.Dispose();\""
-        }
-        
-        let sshCmd = "/usr/bin/ssh"
-        let sshArgs = portArgSSH + ["-o", "BatchMode=yes", target, remoteCmd]
-        
-        let sshResult = await Shell.run(sshCmd, sshArgs)
-        guard sshResult.exitCode == 0 else {
-            status = "Failed to take remote screenshot. Verify SSH Key Auth & Remote SSH server."
-            return
-        }
-        
-        let remotePath = (host.os == .windows) ? "C:\\Windows\\Temp\\mimicos_screenshot.png" : "/tmp/mimicos_screenshot.png"
-        let localDestFolder = settings.ensureCaptureFolderExists()
-        let filename = "PCScreenshot-\(Self.timestamp()).png"
-        let localPath = localDestFolder.appendingPathComponent(filename).path
-        
-        let scpArgs = portArgSSH + ["-o", "BatchMode=yes", "\(target):\"\(remotePath)\"", localPath]
-        let scpResult = await Shell.run("/usr/bin/scp", scpArgs)
-        
-        guard scpResult.exitCode == 0 else {
-            status = "Failed to download remote screenshot"
-            return
-        }
-        
-        let cleanCmd = (host.os == .windows) ? "del C:\\Windows\\Temp\\mimicos_screenshot.png" : "rm /tmp/mimicos_screenshot.png"
-        _ = await Shell.run(sshCmd, portArgSSH + ["-o", "BatchMode=yes", target, cleanCmd])
-        
-        status = "Screenshot saved to \(filename)"
-        
-        if let image = NSImage(contentsOfFile: localPath) {
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.writeObjects([image])
-            status = "Screenshot copied to Mac clipboard"
-            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: localPath)])
-        }
-    }
-
-    func toggleRemotePCRecording(host: RemoteHost) async {
-        let id = host.id
-        let target = host.username.isEmpty ? host.host : "\(host.username)@\(host.host)"
-        let portArgSSH = host.port.map { ["-p", "\($0)"] } ?? []
-        
-        if let pid = remoteRecordingPIDs[id] {
-            status = "Stopping recording on \(host.name)..."
-            
-            let killCmd = (host.os == .windows) ? "taskkill /F /PID \(pid)" : "kill -INT \(pid) || kill \(pid)"
-            _ = await Shell.run("/usr/bin/ssh", portArgSSH + ["-o", "BatchMode=yes", target, killCmd])
-            
-            try? await Task.sleep(nanoseconds: 1_500_000_000)
-            
-            let remotePath = (host.os == .windows) ? "C:\\Windows\\Temp\\mimicos_recording.mp4" : "/tmp/mimicos_recording.mp4"
-            let localDestFolder = settings.ensureCaptureFolderExists()
-            let filename = "PCRecording-\(Self.timestamp()).mp4"
-            let localPath = localDestFolder.appendingPathComponent(filename).path
-            
-            let scpResult = await Shell.run("/usr/bin/scp", portArgSSH + ["-o", "BatchMode=yes", "\(target):\"\(remotePath)\"", localPath])
-            
-            let cleanCmd = (host.os == .windows) ? "del C:\\Windows\\Temp\\mimicos_recording.mp4" : "rm /tmp/mimicos_recording.mp4"
-            _ = await Shell.run("/usr/bin/ssh", portArgSSH + ["-o", "BatchMode=yes", target, cleanCmd])
-            
-            remoteRecordingPIDs.removeValue(forKey: id)
-            
-            if scpResult.exitCode == 0 {
-                status = "Screen recording saved to \(filename)"
-                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: localPath)])
-            } else {
-                status = "Failed to download remote screen recording"
-            }
-        } else {
-            status = "Starting screen recording on \(host.name)..."
-            
-            var recordCmd = ""
-            switch host.os {
-            case .mac:
-                recordCmd = "nohup screencapture -v /tmp/mimicos_recording.mp4 > /dev/null 2>&1 & echo $!"
-            case .linux:
-                recordCmd = "nohup ffmpeg -y -f x11grab -video_size 1920x1080 -i :0.0 -c:v libx264 -pix_fmt yuv420p /tmp/mimicos_recording.mp4 > /dev/null 2>&1 & echo $!"
-            case .windows:
-                recordCmd = "powershell -Command \"Start-Process ffmpeg -ArgumentList '-y -f gdigrab -framerate 30 -i desktop -c:v libx264 -pix_fmt yuv420p C:\\Windows\\Temp\\mimicos_recording.mp4' -WindowStyle Hidden -PassThru | Select-Object -ExpandProperty Id\""
-            }
-            
-            let result = await Shell.run("/usr/bin/ssh", portArgSSH + ["-o", "BatchMode=yes", target, recordCmd])
-            let pid = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-            if result.exitCode == 0 && !pid.isEmpty && Int(pid) != nil {
-                remoteRecordingPIDs[id] = pid
-                status = "Recording screen on \(host.name)..."
-            } else {
-                status = "Failed to start recording. Ensure ffmpeg/screencapture is set up on remote machine."
-            }
         }
     }
 

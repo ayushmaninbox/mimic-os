@@ -269,11 +269,33 @@ final class RemoteDesktop {
 
     // MARK: - Teardown
 
-    /// Terminates an owned RDP client process. No-op for VNC.
+    /// Terminates an owned RDP client process. No-op for VNC. Sends SIGTERM, then
+    /// SIGKILL shortly after if the client is still alive (the SDL FreeRDP client
+    /// doesn't always exit promptly on SIGTERM).
     func stop() {
-        if let process, process.isRunning {
-            process.terminate()
+        guard let process, process.isRunning else { self.process = nil; return }
+        process.terminate()   // SIGTERM
+        // Give it a brief moment; if still running, force-kill so no orphan window
+        // lingers (e.g. after app quit).
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.4) {
+            if process.isRunning {
+                kill(process.processIdentifier, SIGKILL)
+            }
         }
-        process = nil
+        self.process = nil
     }
+
+    /// Sweeps any orphaned FreeRDP client processes. Called on app quit so a
+    /// mirror window can't outlive the app even if `stop()` missed it.
+    static func killAll() {
+        for name in freeRDPClientNames {
+            let kill = Process()
+            kill.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+            kill.arguments = ["-x", name]
+            try? kill.run()
+            kill.waitUntilExit()
+        }
+    }
+
+    deinit { stop() }
 }

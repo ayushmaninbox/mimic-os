@@ -51,12 +51,14 @@ struct RemoteHost: Identifiable, Codable, Hashable {
     var runInBackground: Bool = false
     var rdpCommandAsCtrl: Bool = true
     var redirectClipboard: Bool = true
-    var allowRemoteScreenshots: Bool = true
+    /// Turn the remote computer's physical display off while screen sharing, to
+    /// save its battery (best effort — Linux: `xset dpms force off`).
+    var turnScreenOffWhileSharing: Bool = false
 
     init(id: UUID = UUID(), name: String, host: String, port: Int? = nil,
          username: String, os: RemoteOS = .windows, proto: RemoteDesktop.Kind,
          destFolder: String = "~/Downloads/MimicOS", autoReconnect: Bool = true, runInBackground: Bool = false,
-         rdpCommandAsCtrl: Bool = true, redirectClipboard: Bool = true, allowRemoteScreenshots: Bool = true) {
+         rdpCommandAsCtrl: Bool = true, redirectClipboard: Bool = true, turnScreenOffWhileSharing: Bool = false) {
         self.id = id
         self.name = name
         self.host = host
@@ -69,14 +71,15 @@ struct RemoteHost: Identifiable, Codable, Hashable {
         self.runInBackground = runInBackground
         self.rdpCommandAsCtrl = rdpCommandAsCtrl
         self.redirectClipboard = redirectClipboard
-        self.allowRemoteScreenshots = allowRemoteScreenshots
+        self.turnScreenOffWhileSharing = turnScreenOffWhileSharing
     }
 
     // Custom decoding so hosts saved before `os` existed still load (defaulting
     // to Windows) instead of failing the whole list decode. Any keys from
-    // removed fields (e.g. an old `macAddress`) are ignored.
+    // removed fields (e.g. an old `macAddress` / `allowRemoteScreenshots`) are
+    // ignored.
     private enum CodingKeys: String, CodingKey {
-        case id, name, host, port, username, os, proto, destFolder, autoReconnect, runInBackground, rdpCommandAsCtrl, redirectClipboard, allowRemoteScreenshots
+        case id, name, host, port, username, os, proto, destFolder, autoReconnect, runInBackground, rdpCommandAsCtrl, redirectClipboard, turnScreenOffWhileSharing
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -92,7 +95,7 @@ struct RemoteHost: Identifiable, Codable, Hashable {
         runInBackground = try c.decodeIfPresent(Bool.self, forKey: .runInBackground) ?? false
         rdpCommandAsCtrl = try c.decodeIfPresent(Bool.self, forKey: .rdpCommandAsCtrl) ?? true
         redirectClipboard = try c.decodeIfPresent(Bool.self, forKey: .redirectClipboard) ?? true
-        allowRemoteScreenshots = try c.decodeIfPresent(Bool.self, forKey: .allowRemoteScreenshots) ?? true
+        turnScreenOffWhileSharing = try c.decodeIfPresent(Bool.self, forKey: .turnScreenOffWhileSharing) ?? false
     }
 
     /// What to show as the connection target, e.g. "user@192.168.1.50".

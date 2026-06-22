@@ -229,55 +229,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// Pops up a menu under the status item listing the active devices and PCs, so the
-    /// user picks which one receives the dropped files.
+    /// Pops up a menu under the status item listing the active devices and PCs, so
+    /// the user picks which one receives the dropped files. Each row is a rich
+    /// SwiftUI view (icon + name + subtitle) hosted in the native menu, so it
+    /// looks like the rest of MimicOS while keeping the menu's reliable behaviour.
     private func presentDropTargetPicker(devices: [Device], computers: [RemoteHost], paths: [String]) {
         let menu = NSMenu()
 
-        let header = NSMenuItem(
-            title: paths.count == 1 ? "Send 1 file to…" : "Send \(paths.count) files to…",
-            action: nil, keyEquivalent: "")
+        // Title row.
+        let header = NSMenuItem()
+        let title = paths.count == 1 ? "Send 1 file to…" : "Send \(paths.count) files to…"
+        header.view = hostedMenuRow(DropPickerHeader(title: title), height: 30)
         header.isEnabled = false
         menu.addItem(header)
-        menu.addItem(NSMenuItem.separator())
+
+        func addSection(_ name: String) {
+            let s = NSMenuItem()
+            s.view = hostedMenuRow(DropPickerSectionHeader(title: name), height: 22)
+            s.isEnabled = false
+            menu.addItem(s)
+        }
 
         if !devices.isEmpty {
-            let phoneHeader = NSMenuItem(title: "Phones", action: nil, keyEquivalent: "")
-            phoneHeader.isEnabled = false
-            menu.addItem(phoneHeader)
-            
+            addSection("Phones")
             for device in devices {
-                let item = NSMenuItem(title: device.displayName, action: #selector(dropTargetChosen(_:)), keyEquivalent: "")
+                let item = NSMenuItem()
                 item.target = self
-                item.image = NSImage(systemSymbolName: "iphone.gen3", accessibilityDescription: "")
+                item.action = #selector(dropTargetChosen(_:))
                 item.representedObject = DropTarget(serial: device.serial, isPC: false, id: nil, paths: paths)
+                item.view = hostedMenuRow(
+                    DropTargetRow(icon: "iphone.gen3", name: device.displayName,
+                                  subtitle: device.isWireless ? "Wireless" : "USB", item: item),
+                    height: 40)
                 menu.addItem(item)
             }
         }
 
         if !computers.isEmpty {
-            if !devices.isEmpty {
-                menu.addItem(NSMenuItem.separator())
-            }
-            let pcHeader = NSMenuItem(title: "Computers", action: nil, keyEquivalent: "")
-            pcHeader.isEnabled = false
-            menu.addItem(pcHeader)
-            
+            addSection("Computers")
             for host in computers {
-                let item = NSMenuItem(title: host.name, action: #selector(dropTargetChosen(_:)), keyEquivalent: "")
+                let item = NSMenuItem()
                 item.target = self
-                item.image = NSImage(systemSymbolName: host.os.systemImage, accessibilityDescription: "")
+                item.action = #selector(dropTargetChosen(_:))
                 item.representedObject = DropTarget(serial: nil, isPC: true, id: host.id, paths: paths)
+                item.view = hostedMenuRow(
+                    DropTargetRow(icon: host.os.systemImage, name: host.name,
+                                  subtitle: host.subtitle, item: item),
+                    height: 40)
                 menu.addItem(item)
             }
         }
 
-        // Show the menu anchored to the status item.
         if let button = statusItem?.button {
             menu.popUp(positioning: nil,
                        at: NSPoint(x: 0, y: button.bounds.height + 4),
                        in: button)
         }
+    }
+
+    /// Wraps a SwiftUI row in a fixed-size hosting view for use as `NSMenuItem.view`.
+    private func hostedMenuRow<V: View>(_ view: V, height: CGFloat) -> NSView {
+        let hosting = NSHostingView(rootView: view)
+        hosting.frame = NSRect(x: 0, y: 0, width: 260, height: height)
+        hosting.autoresizingMask = [.width]
+        return hosting
     }
 
     /// Box carrying a drop's target serial/id + file paths through `representedObject`.
@@ -308,39 +323,223 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: - NSMenuDelegate
 
-    /// Builds the menu's single SwiftUI-hosted item. The hosting view sizes itself
-    /// from the SwiftUI content's fitting size (Auto Layout), and AppKit lays the
-    /// menu out around it — no manual window-frame juggling, which was the source
-    /// of the clipping/jank.
+    /// Builds a native macOS menu: each connected phone and each computer is a
+    /// real `NSMenuItem` that opens a proper submenu on hover. Native menus size
+    /// and scroll themselves — no custom SwiftUI hosting / height juggling, which
+    /// was the source of the clipping and sizing bugs.
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
         guard let model = model else { return }
 
-        let menuItem = NSMenuItem()
-        // `onHeightChanged` is unused now — the hosting view self-sizes.
-        let menuBarView = MenuBarView(model: model) { _ in }
+        let devices = model.usableDevices
+        let computers = model.remoteHosts
 
-        let hostingView = NSHostingView(rootView: menuBarView)
-        // Let the hosting view grow/shrink to the SwiftUI content automatically
-        // (e.g. when a device row expands). This is the supported self-sizing
-        // path on macOS 13+, and AppKit re-lays-out the menu around it — no
-        // manual window-frame mutation (which caused the clipping/jank).
-        hostingView.sizingOptions = [.intrinsicContentSize]
-        hostingView.translatesAutoresizingMaskIntoConstraints = false
-        // Seed a sensible initial frame so the first display isn't zero-sized.
-        hostingView.frame = NSRect(x: 0, y: 0, width: 260,
-                                   height: max(hostingView.fittingSize.height, 80))
+        if devices.isEmpty && computers.isEmpty {
+            let empty = NSMenuItem(title: "No devices connected", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            empty.image = NSImage(systemSymbolName: "cable.connector.slash", accessibilityDescription: nil)
+            menu.addItem(empty)
+        }
 
-        menuItem.view = hostingView
-        menu.addItem(menuItem)
+        // Phones
+        for device in devices {
+            let item = NSMenuItem(title: device.displayName, action: nil, keyEquivalent: "")
+            item.image = NSImage(systemSymbolName: "iphone.gen3", accessibilityDescription: nil)
+            item.submenu = buildPhoneSubmenu(for: device, model: model)
+            menu.addItem(item)
+        }
+
+        // Computers
+        for host in computers {
+            let connected = model.connectedRemoteHostID == host.id
+            let reachable = model.hostReachability[host.id] ?? false
+            let online = connected || reachable
+
+            let item = NSMenuItem(title: host.name, action: nil, keyEquivalent: "")
+            let img = NSImage(systemSymbolName: host.os.systemImage, accessibilityDescription: nil)
+            // Tint the icon green when connected/online, like the sidebar.
+            if online, let tinted = img?.withSymbolConfiguration(.init(paletteColors: [.systemGreen])) {
+                item.image = tinted
+            } else {
+                item.image = img
+            }
+            if online {
+                item.submenu = buildComputerSubmenu(for: host, connected: connected, model: model)
+            } else {
+                // Offline: no submenu, dimmed, shows status.
+                item.isEnabled = false
+                item.title = "\(host.name)  (offline)"
+            }
+            menu.addItem(item)
+        }
+
+        menu.addItem(NSMenuItem.separator())
+
+        let open = NSMenuItem(title: "Open MimicOS", action: #selector(openMimicOS), keyEquivalent: "o")
+        open.target = self
+        open.image = NSImage(systemSymbolName: "laptopcomputer", accessibilityDescription: nil)
+        menu.addItem(open)
+
+        let settings = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
+        settings.target = self
+        settings.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: nil)
+        menu.addItem(settings)
+
+        menu.addItem(NSMenuItem.separator())
+
+        let quit = NSMenuItem(title: "Quit MimicOS", action: #selector(quitApp), keyEquivalent: "q")
+        quit.target = self
+        quit.image = NSImage(systemSymbolName: "power", accessibilityDescription: nil)
+        menu.addItem(quit)
+    }
+
+    private func buildPhoneSubmenu(for device: Device, model: AppModel) -> NSMenu {
+        let submenu = NSMenu()
+        let serial = device.serial
+        let isSelected = model.selectedSerial == serial
+
+        // Mirroring first — it's the primary action.
+        let mirroring = model.mirroringSerials.contains(serial)
+        let mir = NSMenuItem(title: mirroring ? "Stop Mirroring" : "Start Mirroring", action: #selector(toggleMirroring(_:)), keyEquivalent: "")
+        mir.target = self; mir.representedObject = serial
+        mir.image = NSImage(systemSymbolName: mirroring ? "stop.circle" : "play.circle", accessibilityDescription: nil)
+        submenu.addItem(mir)
+
+        let shot = NSMenuItem(title: "Take Screenshot", action: #selector(takeScreenshot(_:)), keyEquivalent: "")
+        shot.target = self; shot.representedObject = serial
+        shot.image = NSImage(systemSymbolName: "camera", accessibilityDescription: nil)
+        submenu.addItem(shot)
+
+        let recording = isSelected && model.isRecording
+        let rec = NSMenuItem(title: recording ? "Stop Recording" : "Record Screen", action: #selector(toggleRecording(_:)), keyEquivalent: "")
+        rec.target = self; rec.representedObject = serial
+        rec.image = NSImage(systemSymbolName: recording ? "stop.circle" : "record.circle", accessibilityDescription: nil)
+        submenu.addItem(rec)
+
+        let sidebar = model.settings.showSidebar
+        let side = NSMenuItem(title: sidebar ? "Hide Control Sidebar" : "Show Control Sidebar", action: #selector(toggleSidebar), keyEquivalent: "")
+        side.target = self
+        side.image = NSImage(systemSymbolName: "sidebar.right", accessibilityDescription: nil)
+        submenu.addItem(side)
+
+        submenu.addItem(NSMenuItem.separator())
+
+        let settings = NSMenuItem(title: "Device Settings…", action: #selector(openDeviceSettings(_:)), keyEquivalent: "")
+        settings.target = self; settings.representedObject = serial
+        settings.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: nil)
+        submenu.addItem(settings)
+
+        return submenu
+    }
+
+    private func buildComputerSubmenu(for host: RemoteHost, connected: Bool, model: AppModel) -> NSMenu {
+        let submenu = NSMenu()
+        let id = host.idString
+
+        let screen = NSMenuItem(title: connected ? "Disconnect Screen" : "Start Screen Sharing", action: #selector(toggleComputerScreen(_:)), keyEquivalent: "")
+        screen.target = self; screen.representedObject = id
+        screen.image = NSImage(systemSymbolName: connected ? "wifi.slash" : "display", accessibilityDescription: nil)
+        submenu.addItem(screen)
+
+        let files = NSMenuItem(title: "Open Files in Finder", action: #selector(openComputerFiles(_:)), keyEquivalent: "")
+        files.target = self; files.representedObject = id
+        files.image = NSImage(systemSymbolName: "folder", accessibilityDescription: nil)
+        submenu.addItem(files)
+
+        let term = NSMenuItem(title: "Open SSH Terminal", action: #selector(openComputerTerminal(_:)), keyEquivalent: "")
+        term.target = self; term.representedObject = id
+        term.image = NSImage(systemSymbolName: "terminal", accessibilityDescription: nil)
+        submenu.addItem(term)
+
+        submenu.addItem(NSMenuItem.separator())
+
+        let settings = NSMenuItem(title: "Computer Settings…", action: #selector(openComputerSettings(_:)), keyEquivalent: "")
+        settings.target = self; settings.representedObject = id
+        settings.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: nil)
+        submenu.addItem(settings)
+
+        return submenu
     }
 
     // MARK: - Menu Actions
-    //
-    // The menu content is the SwiftUI `MenuBarView`, whose rows call into the
-    // model directly. The only AppKit action still needed is the drop-target
-    // picker (`dropTargetChosen`, above), which can't be SwiftUI because it's a
-    // transient popup menu shown at drop time.
+
+    private func host(from sender: NSMenuItem) -> RemoteHost? {
+        guard let model = model,
+              let idString = sender.representedObject as? String,
+              let uuid = UUID(uuidString: idString) else { return nil }
+        return model.remoteHosts.first { $0.id == uuid }
+    }
+
+    @objc private func takeScreenshot(_ sender: NSMenuItem) {
+        guard let model = model, let serial = sender.representedObject as? String else { return }
+        Task { await model.menuBarScreenshot(serial: serial) }
+    }
+
+    @objc private func toggleRecording(_ sender: NSMenuItem) {
+        guard let model = model, let serial = sender.representedObject as? String else { return }
+        Task { await model.menuBarToggleRecording(serial: serial) }
+    }
+
+    @objc private func toggleMirroring(_ sender: NSMenuItem) {
+        guard let model = model, let serial = sender.representedObject as? String else { return }
+        Task { await model.menuBarToggleMirror(serial: serial) }
+    }
+
+    @objc private func toggleSidebar() {
+        guard let model = model else { return }
+        model.setSidebarVisible(!model.settings.showSidebar)
+    }
+
+    @objc private func toggleComputerScreen(_ sender: NSMenuItem) {
+        guard let model = model, let host = host(from: sender) else { return }
+        if model.connectedRemoteHostID == host.id {
+            model.disconnectRemoteHost()
+        } else {
+            model.selection = .computer(host.id)
+            Task { await model.userConnectRemoteHost(host) }
+        }
+    }
+
+    @objc private func openComputerFiles(_ sender: NSMenuItem) {
+        guard let model = model, let host = host(from: sender) else { return }
+        model.selection = .computer(host.id)
+        Task { await model.openFiles(host) }
+    }
+
+    @objc private func openComputerTerminal(_ sender: NSMenuItem) {
+        guard let model = model, let host = host(from: sender) else { return }
+        model.selection = .computer(host.id)
+        Task { await model.openSSH(host) }
+    }
+
+    @objc private func openDeviceSettings(_ sender: NSMenuItem) {
+        guard let model = model, let serial = sender.representedObject as? String else { return }
+        Task {
+            await model.select(serial)
+            model.openSection(.settings)
+        }
+    }
+
+    @objc private func openComputerSettings(_ sender: NSMenuItem) {
+        guard let model = model, let host = host(from: sender) else { return }
+        model.selection = .computer(host.id)
+        model.selectedPCTab = .settings
+        model.openMainWindowAction?()
+    }
+
+    @objc private func openMimicOS() {
+        model?.openMainWindowAction?()
+    }
+
+    @objc private func openSettings() {
+        // The menu-bar "Settings" opens the universal (app-wide) settings.
+        model?.showUniversalSettings = true
+        model?.openMainWindowAction?()
+    }
+
+    @objc private func quitApp() {
+        NSApp.terminate(nil)
+    }
 }
 
 // MARK: - Supporting Views and Classes
@@ -495,10 +694,10 @@ struct PortalView: View {
         .background(cardBackground)
         .overlay(cardBorder)
         .shadow(
-            color: Color.black.opacity(active ? 0.34 : 0.28),
-            radius: active ? 24 : 16,
+            color: Color.black.opacity(0.18),
+            radius: 10,
             x: 0,
-            y: 10
+            y: 4
         )
         // Transparent margin inside the panel so the rounded border and the
         // drop shadow have room to render instead of being clipped at the
@@ -564,95 +763,62 @@ struct PortalView: View {
 
                 Image(systemName: active ? "arrow.down.circle.fill" : "tray.and.arrow.down.fill")
                     .font(.system(size: 24, weight: .semibold))
-                    .foregroundStyle(
-                        LinearGradient(colors: monoColors, startPoint: .top, endPoint: .bottom)
-                    )
-                    .shadow(color: .black.opacity(0.35), radius: 4, y: 1)
+                    .foregroundStyle(active ? Color.accentColor : Color.primary)
                     .scaleEffect(active ? (pulseActive ? 1.12 : 1.0) : 1.0)
                     .offset(y: active ? (pulseActive ? 3 : -1) : (isAnimating ? 2 : -2))
             }
 
             VStack(spacing: 4) {
                 Text(active ? "Release to Transfer" : "Drop Files Here")
-                    .font(.system(size: 16, weight: .bold, design: .rounded))
-                    .foregroundColor(.white)
-                    .shadow(color: .black.opacity(0.4), radius: 4, y: 1)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.primary)
 
-                Text(active ? "Copying straight to your phone" : "to copy directly to your phone")
-                    .font(.system(size: 11.5, weight: .medium, design: .rounded))
-                    .foregroundColor(.white.opacity(0.85))
-                    .shadow(color: .black.opacity(0.35), radius: 3, y: 1)
+                Text(active ? "Copying to your device" : "to copy to your device")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
             }
         }
         .frame(maxWidth: .infinity)
-        .padding(.vertical, 16)
+        .padding(.vertical, 14)
+        .padding(.horizontal, 10)
         .background(
-            // Inner "glass within glass" panel: a faint frosted inset that adds
-            // depth without going opaque.
-            RoundedRectangle(cornerRadius: 22, style: .continuous)
-                .fill(.ultraThinMaterial)
-                .opacity(active ? 0.9 : 0.6)
+            // A subtle dashed drop-target inset that reads against the menu
+            // material without competing with it.
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(active ? Color.accentColor.opacity(0.08) : Color.primary.opacity(0.03))
                 .overlay(
-                    RoundedRectangle(cornerRadius: 22, style: .continuous)
-                        .fill(Color.white.opacity(active ? 0.1 : 0.04))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
                         .strokeBorder(
-                            Color.white.opacity(active ? 0.9 : 0.45),
-                            style: StrokeStyle(lineWidth: active ? 2 : 1.4, dash: active ? [] : [6, 5])
+                            active ? Color.accentColor.opacity(0.7) : Color.secondary.opacity(0.4),
+                            style: StrokeStyle(lineWidth: active ? 1.5 : 1, dash: active ? [] : [5, 4])
                         )
                 )
         )
     }
 
-    // MARK: - Card chrome
+    // MARK: - Card chrome (matches the native status-bar menu look)
 
-    /// Liquid-glass card surface: a frosted translucent material you can see
-    /// through, a faint light tint, a glossy specular highlight across the top,
-    /// and a bright rim — the Apple "glassmorphism" look.
+    /// Corner radius tuned to macOS menus.
+    private static let cornerRadius: CGFloat = 11
+
+    /// The same translucent material macOS uses for its menus, with a subtle
+    /// accent wash on drag-over.
     private var cardBackground: some View {
         ZStack {
-            // Frosted, blurred backdrop. `.underWindowBackground` reads as light
-            // translucent glass rather than the dark slab `.hudWindow` gives.
-            VisualEffectView(material: .underWindowBackground, blendingMode: .behindWindow)
-
-            // Very light diagonal tint so the glass has body without going
-            // opaque — the wallpaper still glows through.
-            LinearGradient(
-                colors: [
-                    Color.white.opacity(active ? 0.22 : 0.16),
-                    Color.white.opacity(active ? 0.10 : 0.06)
-                ],
-                startPoint: .topLeading, endPoint: .bottomTrailing
-            )
-
-            // Glossy specular sweep across the upper third — the "wet glass"
-            // sheen that catches the light.
-            LinearGradient(
-                colors: [Color.white.opacity(active ? 0.4 : 0.28), .clear],
-                startPoint: .top, endPoint: .center
-            )
-            .blendMode(.plusLighter)
+            VisualEffectView(material: .menu, blendingMode: .behindWindow)
+            if active {
+                Color.accentColor.opacity(0.14)
+            }
         }
-        .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: PortalView.cornerRadius, style: .continuous))
     }
 
-    /// Two-pass rim: a soft outer stroke plus a bright inner highlight on the
-    /// top edge, so light appears to wrap the glass.
+    /// A thin hairline border like a menu's edge — accent-tinted on drag-over.
     private var cardBorder: some View {
-        RoundedRectangle(cornerRadius: 28, style: .continuous)
-            .strokeBorder(
-                LinearGradient(
-                    colors: active
-                        ? [.white.opacity(0.95), .white.opacity(0.4), .white.opacity(0.6)]
-                        : [.white.opacity(0.7), .white.opacity(0.15), .white.opacity(0.35)],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                ),
-                lineWidth: active ? 1.6 : 1.2
-            )
+        RoundedRectangle(cornerRadius: PortalView.cornerRadius, style: .continuous)
+            .strokeBorder(active ? Color.accentColor.opacity(0.6) : Color.primary.opacity(0.12),
+                          lineWidth: active ? 1.5 : 0.75)
     }
 }
 
@@ -712,316 +878,80 @@ class DragDropOverlayView: NSView {
     }
 }
 
-struct HeightPreferenceKey: PreferenceKey {
-    static let defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = nextValue()
+// MARK: - Drop-target picker rows (styled SwiftUI inside the native menu)
+
+private struct DropPickerHeader: View {
+    let title: String
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "tray.and.arrow.down.fill")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.secondary)
+            Text(title).font(.system(size: 13, weight: .semibold))
+            Spacer()
+        }
+        .padding(.horizontal, 14)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
     }
 }
 
-struct MenuBarView: View {
-    let model: AppModel
-    let onHeightChanged: (CGFloat) -> Void
-    
-    @State private var expandedSerials: Set<String> = []
-    @State private var expandedPCIDs: Set<UUID> = []
-    
+private struct DropPickerSectionHeader: View {
+    let title: String
     var body: some View {
-        VStack(spacing: 0) {
-            VStack(spacing: 4) {
-                let active = model.usableDevices
-                let computers = model.remoteHosts
-                
-                if active.isEmpty && computers.isEmpty {
-                    VStack(spacing: 6) {
-                        Image(systemName: "cable.connector.slash")
-                            .font(.system(size: 20))
-                            .foregroundStyle(.secondary)
-                        Text("No devices connected")
-                            .font(.system(size: 13, weight: .semibold))
-                        Text("Connect a phone or add a computer in settings")
-                            .font(.system(size: 11))
-                            .foregroundStyle(.secondary)
-                            .multilineTextAlignment(.center)
-                    }
-                    .padding(.vertical, 20)
-                    .frame(maxWidth: .infinity)
-                } else {
-                    // Phones
-                    ForEach(active) { device in
-                        let isExpanded = expandedSerials.contains(device.serial)
-                        let isMirroring = model.mirroringSerials.contains(device.serial)
-                        
-                        VStack(spacing: 0) {
-                            MenuBarRow(
-                                title: device.displayName,
-                                icon: "iphone",
-                                isOnline: true,
-                                isExpanded: isExpanded,
-                                isMirroring: isMirroring
-                            ) {
-                                withAnimation(.easeInOut(duration: 0.15)) {
-                                    if isExpanded {
-                                        expandedSerials.remove(device.serial)
-                                    } else {
-                                        expandedSerials.insert(device.serial)
-                                    }
-                                }
-                            }
-                            
-                            if isExpanded {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    MenuBarOptionRow(title: "Take Screenshot", icon: "camera") {
-                                        Task {
-                                            await model.menuBarScreenshot(serial: device.serial)
-                                            dismissMenu()
-                                        }
-                                    }
-                                    
-                                    let recording = device.serial == model.selectedSerial && model.isRecording
-                                    MenuBarOptionRow(
-                                        title: recording ? "Stop Recording" : "Record Screen",
-                                        icon: recording ? "stop.circle" : "record.circle"
-                                    ) {
-                                        Task {
-                                            await model.menuBarToggleRecording(serial: device.serial)
-                                            dismissMenu()
-                                        }
-                                    }
-                                    
-                                    MenuBarOptionRow(
-                                        title: isMirroring ? "Stop Mirroring" : "Start Mirroring",
-                                        icon: isMirroring ? "stop.circle" : "play.circle"
-                                    ) {
-                                        Task {
-                                            await model.menuBarToggleMirror(serial: device.serial)
-                                            dismissMenu()
-                                        }
-                                    }
-                                    
-                                    let sidebar = model.settings.showSidebar
-                                    MenuBarOptionRow(
-                                        title: sidebar ? "Hide Control Sidebar" : "Show Control Sidebar",
-                                        icon: "sidebar.right"
-                                    ) {
-                                        model.setSidebarVisible(!sidebar)
-                                        dismissMenu()
-                                    }
-                                }
-                                .padding(.leading, 26)
-                                .padding(.vertical, 4)
-                            }
-                        }
-                    }
-                    
-                    // Computers
-                    ForEach(computers) { host in
-                        let isConnected = model.connectedRemoteHostID == host.id
-                        let reachable = model.hostReachability[host.id] ?? false
-                        let isOnline = isConnected || reachable
-                        let isExpanded = expandedPCIDs.contains(host.id) && isOnline
-                        
-                        VStack(spacing: 0) {
-                            MenuBarRow(
-                                title: host.name,
-                                icon: host.os.systemImage,
-                                isOnline: isOnline,
-                                isExpanded: isExpanded,
-                                isConnected: isConnected
-                            ) {
-                                withAnimation(.easeInOut(duration: 0.15)) {
-                                    if isExpanded {
-                                        expandedPCIDs.remove(host.id)
-                                    } else {
-                                        expandedPCIDs.insert(host.id)
-                                    }
-                                }
-                            }
-                            
-                            if isExpanded {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    MenuBarOptionRow(
-                                        title: isConnected ? "Disconnect Screen" : "Start Screen Sharing",
-                                        icon: isConnected ? "wifi.slash" : "display"
-                                    ) {
-                                        if isConnected {
-                                            model.disconnectRemoteHost()
-                                        } else {
-                                            model.selection = .computer(host.id)
-                                            model.connectRemoteHost(host)
-                                        }
-                                        dismissMenu()
-                                    }
-                                    
-                                    MenuBarOptionRow(title: "Open Files in Finder", icon: "folder") {
-                                        model.selection = .computer(host.id)
-                                        Task {
-                                            await model.openFiles(host)
-                                            dismissMenu()
-                                        }
-                                    }
-                                    
-                                    MenuBarOptionRow(title: "Open SSH Terminal", icon: "terminal") {
-                                        model.selection = .computer(host.id)
-                                        Task {
-                                            await model.openSSH(host)
-                                            dismissMenu()
-                                        }
-                                    }
-                                }
-                                .padding(.leading, 26)
-                                .padding(.vertical, 4)
-                            }
-                        }
-                    }
-                }
+        Text(title.uppercased())
+            .font(.system(size: 10, weight: .bold))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 14)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+    }
+}
+
+/// A rich row for a drop target: icon, name, subtitle, with a hover highlight.
+/// Clicking it fires the owning menu item's action and dismisses the menu.
+private struct DropTargetRow: View {
+    let icon: String
+    let name: String
+    let subtitle: String
+    weak var item: NSMenuItem?
+
+    @State private var hovering = false
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: icon)
+                .font(.system(size: 16))
+                .foregroundStyle(hovering ? Color.white : Color.secondary)
+                .frame(width: 22)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(name)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(hovering ? Color.white : Color.primary)
+                    .lineLimit(1)
+                Text(subtitle)
+                    .font(.system(size: 10))
+                    .foregroundStyle(hovering ? Color.white.opacity(0.8) : Color.secondary)
+                    .lineLimit(1)
             }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 6)
-            
-            Divider()
-            
-            HStack(spacing: 16) {
-                Button {
-                    model.openMainWindowAction?()
-                    dismissMenu()
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "laptopcomputer")
-                        Text("Open MimicOS")
-                    }
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
-                
-                Spacer()
-                
-                Button {
-                    model.openSection(.settings)
-                    dismissMenu()
-                } label: {
-                    Image(systemName: "gearshape")
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
-                .help("Settings")
-                
-                Button {
-                    NSApp.terminate(nil)
-                } label: {
-                    Image(systemName: "power")
-                        .font(.system(size: 12, weight: .bold))
-                        .foregroundStyle(.red.opacity(0.8))
-                }
-                .buttonStyle(.plain)
-                .help("Quit MimicOS")
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .background(Color.white.opacity(0.01))
+            Spacer()
+            Image(systemName: "arrow.down.circle.fill")
+                .font(.system(size: 13))
+                .foregroundStyle(hovering ? Color.white : Color.secondary.opacity(0.5))
         }
-        .frame(width: 260)
+        .padding(.horizontal, 12)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
         .background(
-            GeometryReader { geo in
-                Color.clear
-                    .preference(key: HeightPreferenceKey.self, value: geo.size.height)
-            }
+            RoundedRectangle(cornerRadius: 6)
+                .fill(hovering ? Color.accentColor : Color.clear)
+                .padding(.horizontal, 5)
         )
-        .onPreferenceChange(HeightPreferenceKey.self) { newHeight in
-            onHeightChanged(newHeight)
-        }
-    }
-    
-    private func dismissMenu() {
-        NSApp.sendAction(#selector(NSMenu.cancelTracking), to: nil, from: nil)
-    }
-}
-
-struct MenuBarOptionRow: View {
-    let title: String
-    let icon: String
-    let action: () -> Void
-    
-    @State private var isHovered = false
-    
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 8) {
-                Image(systemName: icon)
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 14)
-                Text(title)
-                    .font(.system(size: 12))
-                    .foregroundStyle(.primary.opacity(0.9))
-                Spacer()
-            }
-            .padding(.vertical, 4)
-            .padding(.horizontal, 8)
-            .background(
-                RoundedRectangle(cornerRadius: 4)
-                    .fill(isHovered ? Color.primary.opacity(0.08) : Color.clear)
-            )
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .onHover { hover in
-            isHovered = hover
+        .contentShape(Rectangle())
+        .onHover { hovering = $0 }
+        .onTapGesture {
+            guard let item, let action = item.action, let target = item.target else { return }
+            // Close the menu, then perform the item's action.
+            item.menu?.cancelTracking()
+            NSApp.sendAction(action, to: target, from: item)
         }
     }
 }
 
-struct MenuBarRow: View {
-    let title: String
-    let icon: String
-    let isOnline: Bool
-    let isExpanded: Bool
-    var isMirroring: Bool = false
-    var isConnected: Bool = false
-    let action: () -> Void
-    
-    @State private var isHovered = false
-    
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 10) {
-                Image(systemName: icon)
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(isMirroring || isConnected ? .green : (isOnline ? .primary : .secondary))
-                    .frame(width: 18)
-                
-                Text(title)
-                    .font(.system(size: 13, weight: .regular))
-                    .foregroundStyle(isOnline ? .primary : .secondary)
-                
-                Spacer()
-                
-                if isOnline {
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 9, weight: .bold))
-                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
-                        .foregroundStyle(.secondary.opacity(0.7))
-                } else {
-                    Text("Offline")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.secondary.opacity(0.6))
-                }
-            }
-            .padding(.vertical, 6)
-            .padding(.horizontal, 8)
-            .background(
-                RoundedRectangle(cornerRadius: 6)
-                    .fill(isHovered && isOnline ? Color.primary.opacity(0.08) : Color.clear)
-            )
-        }
-        .buttonStyle(.plain)
-        .disabled(!isOnline)
-        .onHover { hover in
-            if isOnline {
-                isHovered = hover
-            }
-        }
-    }
-}

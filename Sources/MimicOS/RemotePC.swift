@@ -41,6 +41,32 @@ enum RemotePC {
         return result.succeeded
     }
 
+    // MARK: - SSH command execution (non-interactive)
+
+    /// Whether `sshpass` is installed (lets us pass a password to ssh/scp
+    /// non-interactively). Without it, SSH commands rely on key-based auth.
+    static var sshpassAvailable: Bool { ToolLocator.isAvailable("sshpass") }
+
+    /// Runs a command over SSH on the remote host and returns the result. Uses
+    /// `sshpass` with the given password when available; otherwise relies on SSH
+    /// keys (BatchMode, so it fails fast instead of hanging on a prompt).
+    static func runSSH(host: String, username: String, port: Int?, password: String,
+                       command: String) async -> ProcessResult {
+        let target = username.isEmpty ? host : "\(username)@\(host)"
+        var sshArgs = ["-o", "StrictHostKeyChecking=no",
+                       "-o", "UserKnownHostsFile=/dev/null"]
+        if let port { sshArgs += ["-p", "\(port)"] }
+        sshArgs += [target, command]
+
+        if sshpassAvailable, !password.isEmpty {
+            return await Shell.run(ToolLocator.path(for: "sshpass"),
+                                   ["-p", password, "ssh"] + sshArgs)
+        } else {
+            // No sshpass: force key-based, fail fast if no key is set up.
+            return await Shell.run("/usr/bin/ssh", ["-o", "BatchMode=yes"] + sshArgs)
+        }
+    }
+
     // MARK: - File transfer hand-off
 
     /// Opens the PC's file share in Finder. For Windows hosts this is an SMB

@@ -6,6 +6,7 @@ struct ContentView: View {
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
+        @Bindable var model = model
         VStack(spacing: 0) {
             NavigationSplitView {
                 SidebarView()
@@ -21,6 +22,21 @@ struct ContentView: View {
             }
             Divider()
             StatusBar()
+        }
+        // App-wide settings button in the window's title bar.
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    model.showUniversalSettings = true
+                } label: {
+                    Image(systemName: "gearshape")
+                }
+                .help("App settings")
+            }
+        }
+        .sheet(isPresented: $model.showUniversalSettings) {
+            UniversalSettingsView()
+                .environment(model)
         }
         .onAppear {
             #if os(macOS)

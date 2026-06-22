@@ -58,13 +58,8 @@ struct ControlPanelView: View {
                         if let name = model.autoReconnectPrompt {
                             AutoReconnectBanner(deviceName: name)
                         }
-                        if model.passwordFieldDetected {
-                            PasswordFieldBanner()
-                        }
                     }
                     .padding(.top, 8)
-                    .animation(.spring(response: 0.35, dampingFraction: 0.85),
-                               value: model.passwordFieldDetected)
                 }
             }
         } else {
@@ -104,70 +99,6 @@ private struct AutoReconnectBanner: View {
         .shadow(color: .black.opacity(0.15), radius: 8, y: 4)
         .padding(.horizontal, 16)
         .frame(maxWidth: 560)
-    }
-}
-
-// MARK: - Auto-autofill banner (password field detected while mirroring)
-
-private struct PasswordFieldBanner: View {
-    @Environment(AppModel.self) private var model
-    @State private var showPicker = false
-
-    private var appHint: String {
-        guard let pkg = model.detectedFieldPackage else { return "A password field is focused" }
-        // Show just the readable tail of the package, e.g. "chrome" from
-        // "com.android.chrome".
-        let tail = pkg.split(separator: ".").last.map(String.init) ?? pkg
-        return "Password field in \(tail.capitalized)"
-    }
-
-    var body: some View {
-        HStack(spacing: 12) {
-            Image(systemName: model.biometricsAvailable ? "touchid" : "key.fill")
-                .foregroundStyle(.tint)
-                .font(.title3)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(appHint).font(.callout).bold()
-                Text("Autofill a saved password with Touch ID")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-            Spacer()
-
-            if model.savedAppLabels.count == 1, let only = model.savedAppLabels.first {
-                Button("Autofill") {
-                    Task { await model.autofillAppPassword(label: only) }
-                    model.dismissPasswordFieldBanner()
-                }
-                .buttonStyle(.borderedProminent)
-            } else {
-                Menu("Autofill…") {
-                    ForEach(model.savedAppLabels, id: \.self) { label in
-                        Button(label) {
-                            Task { await model.autofillAppPassword(label: label) }
-                            model.dismissPasswordFieldBanner()
-                        }
-                    }
-                }
-                .menuStyle(.borderlessButton)
-                .fixedSize()
-            }
-
-            Button {
-                model.dismissPasswordFieldBanner()
-            } label: {
-                Image(systemName: "xmark")
-            }
-            .buttonStyle(.borderless)
-            .foregroundStyle(.secondary)
-        }
-        .padding(12)
-        .background(.regularMaterial)
-        .clipShape(RoundedRectangle(cornerRadius: 12))
-        .overlay(RoundedRectangle(cornerRadius: 12).stroke(.tint.opacity(0.4), lineWidth: 1))
-        .shadow(color: .black.opacity(0.15), radius: 8, y: 4)
-        .padding(.horizontal, 16)
-        .frame(maxWidth: 560)
-        .transition(.move(edge: .top).combined(with: .opacity))
     }
 }
 
@@ -718,22 +649,12 @@ private struct SettingsTab: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Divider()
-                SectionCard(title: "Unlock & Autofill", systemImage: "touchid") {
-                    Toggle("Auto-offer autofill when a password field is detected while mirroring",
-                           isOn: $model.autoDetectPasswordFields)
-                        .font(.body)
-                    Text("While mirroring, MimicOS watches the focused field on your phone. When you tap into a password field, a banner slides in offering to fill one of your saved app passwords with Touch ID. Needs at least one saved password (Control tab). Detection runs app-free via the input-method service — it never reads what you type.")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-                Divider()
                 SectionCard(title: "Screenshots", systemImage: "camera.on.rectangle") {
                     Toggle("Copy phone screenshots to this Mac's clipboard", isOn: $model.copyPhoneScreenshotsToMac)
                         .font(.body)
                     Text("When you take a screenshot on the phone, MimicOS detects it and places the image on your Mac's clipboard so you can paste it straight into any app.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
-                Divider()
-                CaptureFolderSection()
                 Divider()
                 SectionCard(title: "Phone transfer destination", systemImage: "folder.badge.gearshape") {
                     HStack(spacing: 10) {
@@ -774,50 +695,6 @@ private struct SettingsTab: View {
                            isOn: $settings.callAlerts)
                         .font(.body)
                     Text("When your phone rings, a floating panel appears on the Mac with Answer, Decline, and Silence — no mirroring needed. Voice stays on the phone: a cellular call's audio is handled by the phone's modem and can't be routed to the Mac's mic or speakers over USB.")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-                Divider()
-                SectionCard(title: "Application settings", systemImage: "gearshape") {
-                    Toggle("Launch MimicOS at login (relaunch after a restart)",
-                           isOn: Binding(
-                            get: { model.settings.launchAtLogin },
-                            set: { model.setLaunchAtLogin($0) }))
-                        .font(.body)
-                    
-                    Toggle("Keep MimicOS running in the menu bar when the window is closed",
-                           isOn: Binding(
-                            get: { settings.runInBackground },
-                            set: { val in
-                                settings.runInBackground = val
-                                if let delegate = NSApp.delegate as? AppDelegate {
-                                    delegate.syncActivationPolicy()
-                                }
-                            }))
-                        .font(.body)
-
-                    Toggle("Hide MimicOS icon in the Dock",
-                           isOn: Binding(
-                            get: { settings.hideInDock },
-                            set: { val in
-                                if val && settings.hideInMenuBar {
-                                    settings.hideInMenuBar = false
-                                }
-                                settings.hideInDock = val
-                            }))
-                        .font(.body)
-
-                    Toggle("Hide MimicOS status menu item in the Menu Bar",
-                           isOn: Binding(
-                            get: { settings.hideInMenuBar },
-                            set: { val in
-                                if val && settings.hideInDock {
-                                    settings.hideInDock = false
-                                }
-                                settings.hideInMenuBar = val
-                            }))
-                        .font(.body)
-
-                    Text("MimicOS stays in the menu bar so it can keep your device connected and let you capture screenshots/recordings without reopening the window. Enabling 'Hide in Dock' keeps the Dock clean. Enabling 'Hide in Menu Bar' removes the status item. At least one must be visible to access settings.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
@@ -915,6 +792,13 @@ private struct AutomationSection: View {
                 QuickControlButton(systemName: "power", help: "Power (toggle screen)") {
                     Task { await model.togglePower() }
                 }
+                QuickControlButton(
+                    systemName: model.biometricsAvailable ? "lock.open" : "lock.open.fill",
+                    help: model.hasSavedLockPIN ? "Unlock phone (Touch ID)" : "Unlock — save a PIN first (Settings)",
+                    tint: .green
+                ) {
+                    Task { await model.unlockPhone() }
+                }
 
                 Divider().frame(height: 24)
 
@@ -985,7 +869,7 @@ private struct UnlockSection: View {
     var body: some View {
         // Re-read Keychain-backed state whenever a secret changes.
         let _ = model.secretsRevision
-        SectionCard(title: "Unlock & Autofill", systemImage: "lock.open.fill") {
+        SectionCard(title: "Unlock", systemImage: "lock.open.fill") {
             // Phone unlock
             VStack(alignment: .leading, spacing: 10) {
                 HStack(spacing: 10) {
@@ -1021,11 +905,6 @@ private struct UnlockSection: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-
-            Divider().padding(.vertical, 4)
-
-            // App password autofill
-            AppPasswordList()
         }
     }
 }
@@ -1051,62 +930,6 @@ private struct LockSetupRow: View {
     }
 }
 
-/// List + editor for saved app passwords the user can autofill into a focused
-/// field on the phone.
-private struct AppPasswordList: View {
-    @Environment(AppModel.self) private var model
-    @State private var newLabel = ""
-    @State private var newPassword = ""
-
-    var body: some View {
-        let _ = model.secretsRevision
-        VStack(alignment: .leading, spacing: 10) {
-            Label("App passwords", systemImage: "key.horizontal.fill").font(.subheadline).bold()
-
-            ForEach(model.savedAppLabels, id: \.self) { label in
-                HStack(spacing: 10) {
-                    Image(systemName: "app.dashed").foregroundStyle(.secondary)
-                    Text(label).font(.callout)
-                    Spacer()
-                    Button {
-                        Task { await model.autofillAppPassword(label: label) }
-                    } label: {
-                        Label("Autofill", systemImage: model.biometricsAvailable ? "touchid" : "key.fill")
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    Button {
-                        model.clearAppPassword(label: label)
-                    } label: {
-                        Image(systemName: "trash")
-                    }
-                    .buttonStyle(.borderless)
-                    .foregroundStyle(.red)
-                    .controlSize(.small)
-                }
-                .padding(.vertical, 2)
-            }
-
-            HStack(spacing: 8) {
-                TextField("Label (e.g. Email)", text: $newLabel)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(maxWidth: 160)
-                SecureField("Password", text: $newPassword)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(maxWidth: 200)
-                Button("Add") {
-                    model.saveAppPassword(newPassword, label: newLabel)
-                    newLabel = ""; newPassword = ""
-                }
-                .disabled(newLabel.trimmingCharacters(in: .whitespaces).isEmpty
-                          || newPassword.trimmingCharacters(in: .whitespaces).isEmpty)
-            }
-
-            Text("Open the app and tap the password field on your phone (or via the mirror) so it has focus, then hit Autofill. Touch ID unlocks the saved password and types it in — it does not press Enter, so you can check it first.")
-                .font(.caption).foregroundStyle(.secondary)
-        }
-    }
-}
 
 // MARK: - Files tab (Finder-style browser)
 
