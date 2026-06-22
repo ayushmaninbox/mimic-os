@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import AppKit
 
 /// App-wide preferences persisted on the Mac via `UserDefaults`. Distinct from
 /// `DeviceStore`, which holds per-phone bookkeeping; this is for global toggles
@@ -14,6 +15,8 @@ final class AppSettings {
     private static let alwaysOnTopKey = "MimicOS.alwaysOnTop"
     private static let callAlertsKey = "MimicOS.callAlerts"
     private static let phoneDestFolderKey = "MimicOS.phoneDestFolder"
+    private static let hideInDockKey = "MimicOS.hideInDock"
+    private static let hideInMenuBarKey = "MimicOS.hideInMenuBar"
 
     private var defaults: UserDefaults { .standard }
 
@@ -68,6 +71,30 @@ final class AppSettings {
         didSet { defaults.set(phoneDestFolder, forKey: Self.phoneDestFolderKey) }
     }
 
+    /// Hide MimicOS icon in the Dock
+    var hideInDock: Bool {
+        didSet {
+            defaults.set(hideInDock, forKey: Self.hideInDockKey)
+            Task { @MainActor in
+                if let delegate = NSApp.delegate as? AppDelegate {
+                    delegate.syncActivationPolicy()
+                }
+            }
+        }
+    }
+
+    /// Hide MimicOS status menu item in the Menu Bar
+    var hideInMenuBar: Bool {
+        didSet {
+            defaults.set(hideInMenuBar, forKey: Self.hideInMenuBarKey)
+            Task { @MainActor in
+                if let delegate = NSApp.delegate as? AppDelegate {
+                    delegate.syncStatusItemVisibility()
+                }
+            }
+        }
+    }
+
     private static let phoneWindowFrameKey = "MimicOS.phoneWindowFrame"
 
     /// Persist the scrcpy mirror window's last frame (top-left origin, points)
@@ -99,6 +126,8 @@ final class AppSettings {
         alwaysOnTop = store.object(forKey: Self.alwaysOnTopKey) as? Bool ?? false
         callAlerts = store.object(forKey: Self.callAlertsKey) as? Bool ?? true
         phoneDestFolder = store.string(forKey: Self.phoneDestFolderKey) ?? "/sdcard/Download/MimicOS"
+        hideInDock = store.bool(forKey: Self.hideInDockKey)
+        hideInMenuBar = store.bool(forKey: Self.hideInMenuBarKey)
 
         // Resolve the saved capture folder, falling back to ~/Downloads/MimicOS.
         let fallback = FileManager.default

@@ -777,16 +777,47 @@ private struct SettingsTab: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Divider()
-                SectionCard(title: "Background", systemImage: "menubar.arrow.up.rectangle") {
-                    Toggle("Keep MimicOS running in the menu bar when the window is closed",
-                           isOn: $settings.runInBackground)
-                        .font(.body)
+                SectionCard(title: "Application settings", systemImage: "gearshape") {
                     Toggle("Launch MimicOS at login (relaunch after a restart)",
                            isOn: Binding(
                             get: { model.settings.launchAtLogin },
                             set: { model.setLaunchAtLogin($0) }))
                         .font(.body)
-                    Text("MimicOS stays in the menu bar so it can keep your device connected and let you capture screenshots/recordings without reopening the window. It idles at near-zero CPU. Launch-at-login brings it back automatically after a reboot.")
+                    
+                    Toggle("Keep MimicOS running in the menu bar when the window is closed",
+                           isOn: Binding(
+                            get: { settings.runInBackground },
+                            set: { val in
+                                settings.runInBackground = val
+                                if let delegate = NSApp.delegate as? AppDelegate {
+                                    delegate.syncActivationPolicy()
+                                }
+                            }))
+                        .font(.body)
+
+                    Toggle("Hide MimicOS icon in the Dock",
+                           isOn: Binding(
+                            get: { settings.hideInDock },
+                            set: { val in
+                                if val && settings.hideInMenuBar {
+                                    settings.hideInMenuBar = false
+                                }
+                                settings.hideInDock = val
+                            }))
+                        .font(.body)
+
+                    Toggle("Hide MimicOS status menu item in the Menu Bar",
+                           isOn: Binding(
+                            get: { settings.hideInMenuBar },
+                            set: { val in
+                                if val && settings.hideInDock {
+                                    settings.hideInDock = false
+                                }
+                                settings.hideInMenuBar = val
+                            }))
+                        .font(.body)
+
+                    Text("MimicOS stays in the menu bar so it can keep your device connected and let you capture screenshots/recordings without reopening the window. Enabling 'Hide in Dock' keeps the Dock clean. Enabling 'Hide in Menu Bar' removes the status item. At least one must be visible to access settings.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }

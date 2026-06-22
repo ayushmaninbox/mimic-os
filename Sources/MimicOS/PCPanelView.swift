@@ -11,14 +11,13 @@ struct HostEditorState: Identifiable {
 /// to a Windows or Linux/Mac machine over the network — no phone involved.
 struct PCPanelView: View {
     @Environment(AppModel.self) private var model
-    @State private var editingState: HostEditorState?
 
     var body: some View {
         @Bindable var model = model
         if let host = model.selectedHost {
             VStack(spacing: 0) {
                 PCDetailHeader(host: host) {
-                    editingState = HostEditorState(host: host)
+                    model.selectedPCTab = .settings
                 }
                 Divider()
                 PCTabNavBar(selection: $model.selectedPCTab)
@@ -28,17 +27,10 @@ struct PCPanelView: View {
                     case .screen:   PCScreenTab(host: host)
                     case .files:    PCFilesTab(host: host)
                     case .terminal: PCTerminalTab(host: host)
+                    case .settings: PCSettingsTab(host: host)
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
-            .sheet(item: $editingState) { state in
-                RemoteHostEditor(host: state.host) { updated, password in
-                    model.saveRemoteHost(updated, password: password)
-                    editingState = nil
-                } onCancel: {
-                    editingState = nil
-                }
             }
         } else {
             ContentUnavailableView {
@@ -213,15 +205,8 @@ private struct PCScreenTab: View {
                     }
 
                     if host.proto == .rdp {
-                        Toggle("Open in fullscreen", isOn: Bindable(model).rdpFullscreen)
-                            .toggleStyle(.checkbox)
                         Label("In the RDP window, press ⌃⌥⏎ (Ctrl+Alt+Enter) to toggle fullscreen. Windowed mode scales the remote screen to fit — drag the window edges to resize.",
                               systemImage: "rectangle.expand.vertical")
-                            .font(.caption).foregroundStyle(.secondary)
-
-                        Toggle("Use ⌘ (Command) as Ctrl in the session", isOn: Bindable(model).rdpCommandAsCtrl)
-                            .toggleStyle(.checkbox)
-                        Text("Maps the Mac's Command key to Ctrl inside RDP, so ⌘C / ⌘V / ⌘Tab work like Mac shortcuts. Turn off to use Command as the Windows key instead.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
 
@@ -416,6 +401,8 @@ struct RemoteHostEditor: View {
     @State private var proto: RemoteDesktop.Kind
     @State private var hadStoredPassword: Bool
     @State private var destFolder: String
+    @State private var autoReconnect: Bool
+    @State private var runInBackground: Bool
 
     init(host: RemoteHost?,
          onSave: @escaping (RemoteHost, String) -> Void,
@@ -435,6 +422,8 @@ struct RemoteHostEditor: View {
         _proto = State(initialValue: host?.proto ?? .rdp)
         _hadStoredPassword = State(initialValue: host.map { SecretStore.hasRemotePassword(hostID: $0.idString) } ?? false)
         _destFolder = State(initialValue: host?.destFolder ?? "~/Downloads/MimicOS")
+        _autoReconnect = State(initialValue: host?.autoReconnect ?? true)
+        _runInBackground = State(initialValue: host?.runInBackground ?? false)
     }
 
     private var isValid: Bool {
@@ -504,6 +493,9 @@ struct RemoteHostEditor: View {
                             text: $password,
                             prompt: Text("Required"))
                 TextField("MimicOS Target Folder", text: $destFolder, prompt: Text("~/Downloads/MimicOS"))
+                
+                Toggle("Auto-reconnect when online", isOn: $autoReconnect)
+                Toggle("Run screen sharing in background (no display)", isOn: $runInBackground)
             }
             .formStyle(.grouped)
 
@@ -532,6 +524,191 @@ struct RemoteHostEditor: View {
         result.os = os
         result.proto = proto
         result.destFolder = destFolder.trimmingCharacters(in: .whitespaces).isEmpty ? "~/Downloads/MimicOS" : destFolder.trimmingCharacters(in: .whitespaces)
+        result.autoReconnect = autoReconnect
+        result.runInBackground = runInBackground
         onSave(result, password)
+    }
+}
+
+// MARK: - PCSettingsTab
+
+private struct PCSettingsTab: View {
+    @Environment(AppModel.self) private var model
+    let host: RemoteHost
+
+    @State private var name: String
+    @State private var hostAddress: String
+    @State private var portText: String
+    @State private var username: String
+    @State private var password: String
+    @State private var destFolder: String
+    @State private var autoReconnect: Bool
+    @State private var runInBackground: Bool
+    @State private var rdpCommandAsCtrl: Bool
+    @State private var redirectClipboard: Bool
+    @State private var allowRemoteScreenshots: Bool
+    @State private var isSaving = false
+
+    init(host: RemoteHost) {
+        self.host = host
+        _name = State(initialValue: host.name)
+        _hostAddress = State(initialValue: host.host)
+        _portText = State(initialValue: host.port.map(String.init) ?? "")
+        _username = State(initialValue: host.username)
+        
+        let savedPassword = SecretStore.remotePassword(hostID: host.idString) ?? ""
+        _password = State(initialValue: savedPassword)
+        
+        _destFolder = State(initialValue: host.destFolder)
+        _autoReconnect = State(initialValue: host.autoReconnect)
+        _runInBackground = State(initialValue: host.runInBackground)
+        _rdpCommandAsCtrl = State(initialValue: host.rdpCommandAsCtrl)
+        _redirectClipboard = State(initialValue: host.redirectClipboard)
+        _allowRemoteScreenshots = State(initialValue: host.allowRemoteScreenshots)
+    }
+
+    private var isValid: Bool {
+        !name.trimmingCharacters(in: .whitespaces).isEmpty
+            && !hostAddress.trimmingCharacters(in: .whitespaces).isEmpty
+            && !password.isEmpty
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                PCSectionCard(title: "Connection Credentials", systemImage: "key.fill") {
+                    Form {
+                        TextField("Connection Name", text: $name, prompt: Text(host.os == .windows ? "Work PC" : "Home Server"))
+                        TextField("Host / IP Address", text: $hostAddress, prompt: Text("192.168.1.50"))
+                        TextField("Port", text: $portText, prompt: Text("Default: \(host.proto.defaultPort)"))
+                        TextField("Username", text: $username, prompt: Text("Required"))
+                        SecureField("Password", text: $password, prompt: Text("Required"))
+                        TextField("MimicOS Target Folder", text: $destFolder, prompt: Text("~/Downloads/MimicOS"))
+                    }
+                    .formStyle(.grouped)
+                    
+                    HStack {
+                        Spacer()
+                        Button(action: saveCredentials) {
+                            Text("Save Credentials")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!isValid || isSaving)
+                    }
+                    .padding(.top, 4)
+                }
+
+                Divider()
+
+                PCSectionCard(title: "Connection Options", systemImage: "network") {
+                    Toggle("Auto-reconnect when online", isOn: Binding(
+                        get: { autoReconnect },
+                        set: { val in
+                            autoReconnect = val
+                            saveOption { $0.autoReconnect = val }
+                        }))
+                        .toggleStyle(.checkbox)
+
+                    Toggle("Run screen sharing in background (no display window)", isOn: Binding(
+                        get: { runInBackground },
+                        set: { val in
+                            runInBackground = val
+                            saveOption { $0.runInBackground = val }
+                        }))
+                        .toggleStyle(.checkbox)
+
+                    if host.proto == .rdp {
+                        Toggle("Use ⌘ (Command) as Ctrl in the session", isOn: Binding(
+                            get: { rdpCommandAsCtrl },
+                            set: { val in
+                                rdpCommandAsCtrl = val
+                                saveOption { $0.rdpCommandAsCtrl = val }
+                            }))
+                            .toggleStyle(.checkbox)
+
+                        Toggle("Redirect clipboard (Sync copy/paste with PC)", isOn: Binding(
+                            get: { redirectClipboard },
+                            set: { val in
+                                redirectClipboard = val
+                                saveOption { $0.redirectClipboard = val }
+                            }))
+                            .toggleStyle(.checkbox)
+                    }
+                }
+
+                Divider()
+
+                PCSectionCard(title: "Remote SSH Screen Capture & Recording", systemImage: "camera") {
+                    Toggle("Allow remote screen captures via SSH", isOn: Binding(
+                        get: { allowRemoteScreenshots },
+                        set: { val in
+                            allowRemoteScreenshots = val
+                            saveOption { $0.allowRemoteScreenshots = val }
+                        }))
+                        .toggleStyle(.checkbox)
+
+                    if allowRemoteScreenshots {
+                        HStack(spacing: 12) {
+                            Button(action: {
+                                Task {
+                                    await model.captureRemotePCScreenshot(host: host)
+                                }
+                            }) {
+                                Label("Take Screenshot", systemImage: "camera.fill")
+                            }
+                            .buttonStyle(.bordered)
+
+                            let isRecording = model.remoteRecordingPIDs[host.id] != nil
+                            Button(action: {
+                                Task {
+                                    await model.toggleRemotePCRecording(host: host)
+                                }
+                            }) {
+                                Label(isRecording ? "Stop Recording" : "Record Screen",
+                                      systemImage: isRecording ? "stop.circle.fill" : "record.circle")
+                                    .foregroundStyle(isRecording ? Color.red : Color.primary)
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                        .padding(.top, 4)
+
+                        Text("Screenshots and screen recordings will be saved to your configured Mac capture folder: \(model.settings.captureFolder.path). Screenshots are also copied to your Mac clipboard.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .padding(20)
+        }
+        .onChange(of: host) { _, newHost in
+            name = newHost.name
+            hostAddress = newHost.host
+            portText = newHost.port.map(String.init) ?? ""
+            username = newHost.username
+            password = SecretStore.remotePassword(hostID: newHost.idString) ?? ""
+            destFolder = newHost.destFolder
+            autoReconnect = newHost.autoReconnect
+            runInBackground = newHost.runInBackground
+            rdpCommandAsCtrl = newHost.rdpCommandAsCtrl
+            redirectClipboard = newHost.redirectClipboard
+            allowRemoteScreenshots = newHost.allowRemoteScreenshots
+        }
+    }
+
+    private func saveCredentials() {
+        var updated = host
+        updated.name = name.trimmingCharacters(in: .whitespaces)
+        updated.host = hostAddress.trimmingCharacters(in: .whitespaces)
+        updated.port = Int(portText.trimmingCharacters(in: .whitespaces))
+        updated.username = username.trimmingCharacters(in: .whitespaces)
+        updated.destFolder = destFolder.trimmingCharacters(in: .whitespaces).isEmpty ? "~/Downloads/MimicOS" : destFolder.trimmingCharacters(in: .whitespaces)
+        model.saveRemoteHost(updated, password: password)
+        model.status = "Saved credentials for \(updated.name)"
+    }
+
+    private func saveOption(_ edit: (inout RemoteHost) -> Void) {
+        var updated = host
+        edit(&updated)
+        let savedPassword = SecretStore.remotePassword(hostID: host.idString) ?? ""
+        model.saveRemoteHost(updated, password: savedPassword)
     }
 }

@@ -71,12 +71,14 @@ final class AppModel {
         case screen = "Screen"
         case files = "Files"
         case terminal = "Terminal"
+        case settings = "Settings"
         var id: String { rawValue }
         var systemImage: String {
             switch self {
             case .screen: return "display"
             case .files: return "folder"
             case .terminal: return "terminal"
+            case .settings: return "gearshape"
             }
         }
     }
@@ -209,6 +211,8 @@ final class AppModel {
         return nil
     }
     var isMirroring: Bool { mirroringSerial != nil }
+
+    @ObservationIgnored private var droppedHostIDs: Set<UUID> = []
 
     /// Drives the "Add Device" sheet opened by the + button.
     var showAddDevice: Bool = false
@@ -351,6 +355,7 @@ final class AppModel {
         guard toolsReady, !isWorking, !isConnecting else { return }
         await refreshDevices()
         await attemptAutoReconnects()
+        await attemptPCAutoReconnects()
     }
 
     // MARK: - Fast call poller
@@ -1078,17 +1083,17 @@ final class AppModel {
         SecretStore.hasRemotePassword(hostID: host.idString)
     }
 
-    /// Whether RDP sessions open straight into fullscreen. When off (default),
-    /// they open in a resizable, smart-sized window. Ctrl+Alt+Enter toggles
-    /// fullscreen live regardless.
-    var rdpFullscreen: Bool = false
-
-    /// Map the Mac's ⌘ key to Ctrl inside RDP sessions, so ⌘C/⌘V feel native.
-    var rdpCommandAsCtrl: Bool = true
-
     /// Opens a saved host: launches a FreeRDP client (RDP) or Screen Sharing
     /// (VNC). The password, if saved, is read from the Keychain.
     func connectRemoteHost(_ host: RemoteHost) {
+        droppedHostIDs.remove(host.id)
+        
+        if host.runInBackground {
+            connectedRemoteHostID = host.id
+            status = "Connected to \(host.name) (Background Mode)"
+            return
+        }
+        
         let password = SecretStore.remotePassword(hostID: host.idString) ?? ""
         let connection = RemoteDesktop.Connection(
             host: host.host,
@@ -1096,16 +1101,21 @@ final class AppModel {
             username: host.username,
             password: password,
             proto: host.proto,
-            fullscreen: rdpFullscreen,
-            commandAsCtrl: rdpCommandAsCtrl)
+            commandAsCtrl: host.rdpCommandAsCtrl,
+            redirectClipboard: host.redirectClipboard)
 
         let ok = remoteDesktop.connect(connection) { [weak self] code, errText in
             Task { @MainActor in
                 guard let self, self.connectedRemoteHostID == host.id else { return }
                 self.connectedRemoteHostID = nil
+                
+                if code != 0 {
+                    self.droppedHostIDs.insert(host.id)
+                }
+                
                 if code != 0 && !errText.isEmpty {
                     let clean = errText.split(separator: "\n").last.map(String.init) ?? errText
-                    self.status = "\(host.name) disconnected: \(clean.trimmingCharacters(in: .whitespacesAndNewlines))"
+                    self.status = "\(host.name) disconnected unexpectedly: \(clean.trimmingCharacters(in: .whitespacesAndNewlines))"
                 } else {
                     self.status = "\(host.name) disconnected"
                 }
@@ -1127,6 +1137,9 @@ final class AppModel {
 
     /// Stops the active owned (RDP) session.
     func disconnectRemoteHost() {
+        if let hostID = connectedRemoteHostID {
+            droppedHostIDs.remove(hostID)
+        }
         remoteDesktop.stop()
         connectedRemoteHostID = nil
         status = "Remote session stopped"
@@ -1145,6 +1158,28 @@ final class AppModel {
             for host in remoteHosts {
                 group.addTask {
                     await self.pingHost(host)
+                    await MainActor.run {
+                        if self.connectedRemoteHostID == host.id && self.hostReachability[host.id] == false {
+                            self.connectedRemoteHostID = nil
+                            self.droppedHostIDs.insert(host.id)
+                            self.status = "\(host.name) went offline"
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func attemptPCAutoReconnects() async {
+        for host in remoteHosts {
+            guard host.autoReconnect else { continue }
+            if droppedHostIDs.contains(host.id) {
+                let alive = await RemotePC.ping(host.host)
+                hostReachability[host.id] = alive
+                if alive {
+                    droppedHostIDs.remove(host.id)
+                    connectRemoteHost(host)
+                    status = "Auto-reconnected computer \(host.name)"
                 }
             }
         }
@@ -1189,7 +1224,7 @@ final class AppModel {
         }
     }
 
-    /// Copy files to remote PC using scp
+    /// Copy files to remote PC using scp (optimized for speed)
     func transferFilesToPC(_ filePaths: [String], toHost host: RemoteHost) async {
         let username = host.username
         let hostname = host.host
@@ -1204,15 +1239,13 @@ final class AppModel {
         let mkdirArgs = portArgSSH + [target, "mkdir -p \"\(dest)\""]
         _ = await Shell.run(mkdirCmd, mkdirArgs)
         
-        var succeeded = true
-        for path in filePaths {
-            let scpCmd = "/usr/bin/scp"
-            let scpArgs = portArg + ["-r", path, "\(target):\"\(dest)\""]
-            let result = await Shell.run(scpCmd, scpArgs)
-            if result.exitCode != 0 {
-                succeeded = false
-            }
-        }
+        // Single command, optimized cipher, no compression, recursive
+        var scpArgs = portArg + ["-o", "Compression=no", "-c", "aes128-gcm@openssh.com", "-r"]
+        scpArgs.append(contentsOf: filePaths)
+        scpArgs.append("\(target):\"\(dest)\"")
+        
+        let result = await Shell.run("/usr/bin/scp", scpArgs)
+        let succeeded = (result.exitCode == 0)
         
         if succeeded {
             status = "Successfully transferred \(filePaths.count) files to \(host.name): \(dest)"
@@ -2555,6 +2588,116 @@ final class AppModel {
             pendingComposeNumber = number
             pendingComposeName = name
             status = "New message to \(name ?? number)"
+        }
+    }
+
+    // MARK: - Remote PC Screen Capture & Recording (over SSH)
+    
+    var remoteRecordingPIDs: [UUID: String] = [:]
+
+    func captureRemotePCScreenshot(host: RemoteHost) async {
+        status = "Taking screenshot on \(host.name)..."
+        
+        let portArgSSH = host.port.map { ["-p", "\($0)"] } ?? []
+        let target = host.username.isEmpty ? host.host : "\(host.username)@\(host.host)"
+        
+        var remoteCmd = ""
+        switch host.os {
+        case .mac:
+            remoteCmd = "screencapture -x /tmp/mimicos_screenshot.png"
+        case .linux:
+            remoteCmd = "DISPLAY=:0 gnome-screenshot -f /tmp/mimicos_screenshot.png || DISPLAY=:0 scrot /tmp/mimicos_screenshot.png || DISPLAY=:0 import -window root /tmp/mimicos_screenshot.png"
+        case .windows:
+            remoteCmd = "powershell -Command \"[Reflection.Assembly]::LoadWithPartialName('System.Drawing'); [Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms'); \\$bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds; \\$bmp = New-Object Drawing.Bitmap \\$bounds.Width, \\$bounds.Height; \\$graphics = [Drawing.Graphics]::FromImage(\\$bmp); \\$graphics.CopyFromScreen(\\$bounds.Location, [Drawing.Point]::Empty, \\$bounds.Size); \\$bmp.Save('C:\\\\Windows\\\\Temp\\\\mimicos_screenshot.png', [Drawing.Imaging.ImageFormat]::Png); \\$graphics.Dispose(); \\$bmp.Dispose();\""
+        }
+        
+        let sshCmd = "/usr/bin/ssh"
+        let sshArgs = portArgSSH + ["-o", "BatchMode=yes", target, remoteCmd]
+        
+        let sshResult = await Shell.run(sshCmd, sshArgs)
+        guard sshResult.exitCode == 0 else {
+            status = "Failed to take remote screenshot. Verify SSH Key Auth & Remote SSH server."
+            return
+        }
+        
+        let remotePath = (host.os == .windows) ? "C:\\Windows\\Temp\\mimicos_screenshot.png" : "/tmp/mimicos_screenshot.png"
+        let localDestFolder = settings.ensureCaptureFolderExists()
+        let filename = "PCScreenshot-\(Self.timestamp()).png"
+        let localPath = localDestFolder.appendingPathComponent(filename).path
+        
+        let scpArgs = portArgSSH + ["-o", "BatchMode=yes", "\(target):\"\(remotePath)\"", localPath]
+        let scpResult = await Shell.run("/usr/bin/scp", scpArgs)
+        
+        guard scpResult.exitCode == 0 else {
+            status = "Failed to download remote screenshot"
+            return
+        }
+        
+        let cleanCmd = (host.os == .windows) ? "del C:\\Windows\\Temp\\mimicos_screenshot.png" : "rm /tmp/mimicos_screenshot.png"
+        _ = await Shell.run(sshCmd, portArgSSH + ["-o", "BatchMode=yes", target, cleanCmd])
+        
+        status = "Screenshot saved to \(filename)"
+        
+        if let image = NSImage(contentsOfFile: localPath) {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.writeObjects([image])
+            status = "Screenshot copied to Mac clipboard"
+            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: localPath)])
+        }
+    }
+
+    func toggleRemotePCRecording(host: RemoteHost) async {
+        let id = host.id
+        let target = host.username.isEmpty ? host.host : "\(host.username)@\(host.host)"
+        let portArgSSH = host.port.map { ["-p", "\($0)"] } ?? []
+        
+        if let pid = remoteRecordingPIDs[id] {
+            status = "Stopping recording on \(host.name)..."
+            
+            let killCmd = (host.os == .windows) ? "taskkill /F /PID \(pid)" : "kill -INT \(pid) || kill \(pid)"
+            _ = await Shell.run("/usr/bin/ssh", portArgSSH + ["-o", "BatchMode=yes", target, killCmd])
+            
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            
+            let remotePath = (host.os == .windows) ? "C:\\Windows\\Temp\\mimicos_recording.mp4" : "/tmp/mimicos_recording.mp4"
+            let localDestFolder = settings.ensureCaptureFolderExists()
+            let filename = "PCRecording-\(Self.timestamp()).mp4"
+            let localPath = localDestFolder.appendingPathComponent(filename).path
+            
+            let scpResult = await Shell.run("/usr/bin/scp", portArgSSH + ["-o", "BatchMode=yes", "\(target):\"\(remotePath)\"", localPath])
+            
+            let cleanCmd = (host.os == .windows) ? "del C:\\Windows\\Temp\\mimicos_recording.mp4" : "rm /tmp/mimicos_recording.mp4"
+            _ = await Shell.run("/usr/bin/ssh", portArgSSH + ["-o", "BatchMode=yes", target, cleanCmd])
+            
+            remoteRecordingPIDs.removeValue(forKey: id)
+            
+            if scpResult.exitCode == 0 {
+                status = "Screen recording saved to \(filename)"
+                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: localPath)])
+            } else {
+                status = "Failed to download remote screen recording"
+            }
+        } else {
+            status = "Starting screen recording on \(host.name)..."
+            
+            var recordCmd = ""
+            switch host.os {
+            case .mac:
+                recordCmd = "nohup screencapture -v /tmp/mimicos_recording.mp4 > /dev/null 2>&1 & echo $!"
+            case .linux:
+                recordCmd = "nohup ffmpeg -y -f x11grab -video_size 1920x1080 -i :0.0 -c:v libx264 -pix_fmt yuv420p /tmp/mimicos_recording.mp4 > /dev/null 2>&1 & echo $!"
+            case .windows:
+                recordCmd = "powershell -Command \"Start-Process ffmpeg -ArgumentList '-y -f gdigrab -framerate 30 -i desktop -c:v libx264 -pix_fmt yuv420p C:\\Windows\\Temp\\mimicos_recording.mp4' -WindowStyle Hidden -PassThru | Select-Object -ExpandProperty Id\""
+            }
+            
+            let result = await Shell.run("/usr/bin/ssh", portArgSSH + ["-o", "BatchMode=yes", target, recordCmd])
+            let pid = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+            if result.exitCode == 0 && !pid.isEmpty && Int(pid) != nil {
+                remoteRecordingPIDs[id] = pid
+                status = "Recording screen on \(host.name)..."
+            } else {
+                status = "Failed to start recording. Ensure ffmpeg/screencapture is set up on remote machine."
+            }
         }
     }
 

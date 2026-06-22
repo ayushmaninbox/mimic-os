@@ -24,16 +24,18 @@ struct ContentView: View {
         }
         .onAppear {
             #if os(macOS)
-            // The window is showing, so make sure we're a regular foreground app
-            // (the AppDelegate may have dropped us to .accessory in the menu bar).
-            NSApp.setActivationPolicy(.regular)
+            if let delegate = NSApp.delegate as? AppDelegate {
+                delegate.syncActivationPolicy()
+            }
             NSApp.activate(ignoringOtherApps: true)
             #endif
         }
         .task {
             model.openMainWindowAction = {
                 openWindow(id: "main")
-                NSApp.setActivationPolicy(.regular)
+                if let delegate = NSApp.delegate as? AppDelegate {
+                    delegate.syncActivationPolicy()
+                }
                 NSApp.activate(ignoringOtherApps: true)
             }
         }
@@ -167,7 +169,8 @@ struct SidebarView: View {
     @ViewBuilder
     private func hostMenu(_ host: RemoteHost) -> some View {
         Button {
-            editorState = HostEditorState(host: host)
+            model.selection = .computer(host.id)
+            model.selectedPCTab = .settings
         } label: { Label("Edit…", systemImage: "pencil") }
         Button {
             Task { await model.pingHost(host) }

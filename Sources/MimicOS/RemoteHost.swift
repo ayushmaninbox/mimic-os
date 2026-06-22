@@ -49,10 +49,14 @@ struct RemoteHost: Identifiable, Codable, Hashable {
     var destFolder: String = "~/Downloads/MimicOS"
     var autoReconnect: Bool = true
     var runInBackground: Bool = false
+    var rdpCommandAsCtrl: Bool = true
+    var redirectClipboard: Bool = true
+    var allowRemoteScreenshots: Bool = true
 
     init(id: UUID = UUID(), name: String, host: String, port: Int? = nil,
          username: String, os: RemoteOS = .windows, proto: RemoteDesktop.Kind,
-         destFolder: String = "~/Downloads/MimicOS", autoReconnect: Bool = true, runInBackground: Bool = false) {
+         destFolder: String = "~/Downloads/MimicOS", autoReconnect: Bool = true, runInBackground: Bool = false,
+         rdpCommandAsCtrl: Bool = true, redirectClipboard: Bool = true, allowRemoteScreenshots: Bool = true) {
         self.id = id
         self.name = name
         self.host = host
@@ -63,13 +67,16 @@ struct RemoteHost: Identifiable, Codable, Hashable {
         self.destFolder = destFolder
         self.autoReconnect = autoReconnect
         self.runInBackground = runInBackground
+        self.rdpCommandAsCtrl = rdpCommandAsCtrl
+        self.redirectClipboard = redirectClipboard
+        self.allowRemoteScreenshots = allowRemoteScreenshots
     }
 
     // Custom decoding so hosts saved before `os` existed still load (defaulting
     // to Windows) instead of failing the whole list decode. Any keys from
     // removed fields (e.g. an old `macAddress`) are ignored.
     private enum CodingKeys: String, CodingKey {
-        case id, name, host, port, username, os, proto, destFolder, autoReconnect, runInBackground
+        case id, name, host, port, username, os, proto, destFolder, autoReconnect, runInBackground, rdpCommandAsCtrl, redirectClipboard, allowRemoteScreenshots
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -83,6 +90,9 @@ struct RemoteHost: Identifiable, Codable, Hashable {
         destFolder = try c.decodeIfPresent(String.self, forKey: .destFolder) ?? "~/Downloads/MimicOS"
         autoReconnect = try c.decodeIfPresent(Bool.self, forKey: .autoReconnect) ?? true
         runInBackground = try c.decodeIfPresent(Bool.self, forKey: .runInBackground) ?? false
+        rdpCommandAsCtrl = try c.decodeIfPresent(Bool.self, forKey: .rdpCommandAsCtrl) ?? true
+        redirectClipboard = try c.decodeIfPresent(Bool.self, forKey: .redirectClipboard) ?? true
+        allowRemoteScreenshots = try c.decodeIfPresent(Bool.self, forKey: .allowRemoteScreenshots) ?? true
     }
 
     /// What to show as the connection target, e.g. "user@192.168.1.50".

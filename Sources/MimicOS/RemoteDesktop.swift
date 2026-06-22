@@ -38,13 +38,11 @@ final class RemoteDesktop {
         var username: String
         var password: String
         var proto: Kind
-        /// Open RDP straight into fullscreen. When false, opens in a resizable
-        /// window that scales the remote desktop to fit (smart-sizing), so nothing
-        /// gets clipped. Either way, Ctrl+Alt+Enter toggles fullscreen live.
-        var fullscreen: Bool = false
         /// Make the Mac's ⌘ (Command) key act as Ctrl inside the RDP session, so
         /// ⌘C/⌘V/⌘Tab work like on the Mac (RDP only).
         var commandAsCtrl: Bool = true
+        /// Enable clipboard redirection
+        var redirectClipboard: Bool = true
     }
 
     /// FreeRDP client binaries we can drive, in priority order. The SDL clients
@@ -111,10 +109,10 @@ final class RemoteDesktop {
         let host = c.port.map { "\(c.host):\($0)" } ?? c.host
         var lines = [
             "full address:s:\(host)",
-            "screen mode id:i:\(c.fullscreen ? 2 : 1)",   // 2 = fullscreen, 1 = window
+            "screen mode id:i:1",   // 1 = window
             "dynamic resolution:i:1",
             "smart sizing:i:1",
-            "redirectclipboard:i:1",
+            "redirectclipboard:i:\(c.redirectClipboard ? 1 : 0)",
             "audiomode:i:1",                      // play audio on the remote machine
             "authentication level:i:0",           // don't fail on cert mismatch
         ]
@@ -157,18 +155,12 @@ final class RemoteDesktop {
         if !c.username.isEmpty { args.append("/u:\(c.username)") }
         if !c.password.isEmpty { args.append("/p:\(c.password)") }
 
-        if c.fullscreen {
-            // Avoid native macOS space-switching which causes black screens under XQuartz/SDL.
-            // Launch as a borderless window matching full screen size instead.
-            args.append(contentsOf: ["-decorations", "/size:100%", "/smart-sizing", "/gdi:sw"])
-        } else {
-            // Open in a generous resizable window and scale the remote desktop to
-            // fit it (smart-sizing) so nothing is clipped and dragging resizes the
-            // view. Without this the SDL window opens at the server's resolution
-            // and gets cut off with no way to fit it. Ctrl+Alt+Enter still toggles
-            // true fullscreen.
-            args.append(contentsOf: ["/size:1440x900", "/smart-sizing"])
-        }
+        // Open in a generous resizable window and scale the remote desktop to
+        // fit it (smart-sizing) so nothing is clipped and dragging resizes the
+        // view. Without this the SDL window opens at the server's resolution
+        // and gets cut off with no way to fit it. Ctrl+Alt+Enter still toggles
+        // true fullscreen.
+        args.append(contentsOf: ["/size:1440x900", "/smart-sizing"])
         // Trust an unknown/self-signed cert and don't block on the prompt — most
         // home/lab Windows / xrdp boxes use a self-signed RDP certificate.
         args.append("/cert:ignore")
@@ -180,7 +172,7 @@ final class RemoteDesktop {
             args.append("/kbd:remap:0x15b=0x1d")
         }
         // Sane defaults for a smooth desktop over a LAN.
-        args.append(contentsOf: ["+clipboard", "/gfx", "/network:auto"])
+        args.append(contentsOf: [c.redirectClipboard ? "+clipboard" : "-clipboard", "/gfx", "/network:auto"])
 
         let process = Process()
         if clientPath.contains("/") {
