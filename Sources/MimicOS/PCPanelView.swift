@@ -205,34 +205,20 @@ private struct PCTabNavBar: View {
 private struct PCScreenTab: View {
     @Environment(AppModel.self) private var model
     let host: RemoteHost
+    @State private var confirmReset = false
 
     private var isConnected: Bool { model.connectedRemoteHostID == host.id }
+    private var isLinux: Bool { host.os == .linux }
+    private var setUpBefore: Bool { model.hasLinuxSetup(host) }
 
     var body: some View {
-        let isSetupConfirmed = Binding<Bool>(
-            get: { model.isSetupConfirmed(for: host, tab: .screen) },
-            set: { model.setSetupConfirmed($0, for: host, tab: .screen) }
-        )
-
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                if host.os == .linux {
-                    PCSectionCard(title: "Set up the Linux side", systemImage: "wrench.and.screwdriver") {
-                        if host.proto == .rdp {
-                            LinuxSetup.remoteDesktop(host)
-                        } else {
-                            LinuxSetup.vnc(host)
-                        }
-                    }
+                if isLinux {
+                    linuxSetupCard
                 }
 
                 PCSectionCard(title: "Screen sharing", systemImage: "display") {
-                    if host.os == .linux && !isConnected {
-                        Toggle("I have completed the Linux Remote Desktop setup steps above", isOn: isSetupConfirmed)
-                            .toggleStyle(.checkbox)
-                            .padding(.bottom, 4)
-                    }
-
                     HStack(spacing: 10) {
                         if isConnected {
                             Button("Disconnect", role: .destructive) {
@@ -246,7 +232,9 @@ private struct PCScreenTab: View {
                                 Label("Start screen sharing", systemImage: "play.fill")
                             }
                             .buttonStyle(.borderedProminent)
-                            .disabled(host.os == .linux && !isSetupConfirmed.wrappedValue)
+                            // On Linux, gate the first connect on setup having run;
+                            // afterwards it's always available.
+                            .disabled(isLinux && !setUpBefore)
                         }
                     }
 
@@ -268,6 +256,79 @@ private struct PCScreenTab: View {
         }
     }
 
+    /// The one-click setup card: configures gnome-remote-desktop over SSH, shows a
+    /// live console, and (after the first setup) an always-visible Reset button.
+    private var linuxSetupCard: some View {
+        PCSectionCard(title: "Set up the Linux side", systemImage: "wand.and.stars") {
+            Text("One click configures GNOME Remote Desktop on the Ubuntu machine over SSH so RDP shows your real desktop. Uses the saved login password.")
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if !RemotePC.sshpassAvailable {
+                sshpassNote
+            } else {
+                HStack(spacing: 10) {
+                    if model.isSettingUpLinux {
+                        ProgressView().controlSize(.small)
+                        Text("Working…").font(.caption).foregroundStyle(.secondary)
+                    } else {
+                        Button {
+                            Task { await model.setupLinux(host) }
+                        } label: {
+                            Label(setUpBefore ? "Re-run setup" : "Set up everything (one click)",
+                                  systemImage: "wand.and.stars")
+                        }
+                        .buttonStyle(.borderedProminent)
+
+                        if setUpBefore {
+                            Button(role: .destructive) {
+                                confirmReset = true
+                            } label: {
+                                Label("Reset connection", systemImage: "arrow.triangle.2.circlepath")
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                    }
+                }
+            }
+
+            // Live setup/reset progress (in-app, not a Mac terminal).
+            if model.isSettingUpLinux || !model.setupLog.isEmpty {
+                ConsoleLogView(lines: model.setupLog, running: model.isSettingUpLinux, title: "Linux setup")
+            } else if isConnected && !model.remoteTerminalLog.isEmpty {
+                ConsoleLogView(lines: model.remoteTerminalLog, running: model.isStreamingRemoteTerminal, title: "Linux status")
+            }
+        }
+        .confirmationDialog("Reset \(host.name)'s connection?",
+                            isPresented: $confirmReset, titleVisibility: .visible) {
+            Button("Reset & reconfigure", role: .destructive) {
+                Task { await model.setupLinux(host, reset: true) }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Clears the existing GNOME Remote Desktop credentials/config (and disables xrdp if present), then sets it up again from scratch.")
+        }
+    }
+
+    private var sshpassNote: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label("One-click setup needs `sshpass`", systemImage: "exclamationmark.triangle")
+                .font(.caption).bold().foregroundStyle(.orange)
+            HStack {
+                Text("brew install sshpass")
+                    .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                Spacer()
+                Button {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString("brew install sshpass", forType: .string)
+                } label: { Image(systemName: "doc.on.doc") }
+                .buttonStyle(.borderless).help("Copy command")
+            }
+            .padding(8)
+            .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 6))
+        }
+    }
+
     private var screenHint: String {
         if host.proto == .vnc {
             return "Opens \(host.name) over VNC in the built-in Screen Sharing app. The remote machine needs a VNC server / Screen Sharing enabled."
@@ -276,6 +337,61 @@ private struct PCScreenTab: View {
             return "Opens \(host.name) over RDP in a native FreeRDP window you can resize and close. The remote screen appears in its own window."
         }
         return "Opens \(host.name) over RDP. Install FreeRDP below for a built-in window; otherwise MimicOS hands the connection to any RDP client you have installed."
+    }
+}
+
+/// A small terminal-style view that shows live command output, auto-scrolling to
+/// the newest line. Used for the one-click setup console and the status readout.
+private struct ConsoleLogView: View {
+    let lines: [String]
+    let running: Bool
+    var title: String = "Output"
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 6) {
+                Image(systemName: "terminal.fill").font(.caption2)
+                Text(title).font(.caption2).bold()
+                Spacer()
+                if running { ProgressView().controlSize(.small) }
+            }
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 8).padding(.vertical, 5)
+            .background(.quaternary.opacity(0.5))
+
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 1) {
+                        ForEach(Array(lines.enumerated()), id: \.offset) { idx, line in
+                            Text(line)
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundStyle(color(for: line))
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .id(idx)
+                        }
+                    }
+                    .padding(8)
+                }
+                .frame(height: 180)
+                .onChange(of: lines.count) { _, count in
+                    withAnimation { proxy.scrollTo(count - 1, anchor: .bottom) }
+                }
+            }
+        }
+        .background(Color(white: 0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.quaternary))
+        .padding(.top, 4)
+    }
+
+    private func color(for line: String) -> Color {
+        let l = line.lowercased()
+        if line.contains("✓") || line.contains("_OK") { return .green }
+        if line.contains("✗") || l.contains("error") || l.contains("fail") { return .red }
+        if line.contains("⚠") { return .orange }
+        if line.hasPrefix(">>>") || line.hasPrefix("$") { return .cyan }
+        return Color(white: 0.85)
     }
 }
 

@@ -1031,6 +1031,7 @@ final class AppModel {
 
     func loadRemoteHosts() {
         remoteHosts = RemoteHostStore.all()
+        loadLinuxSetupFlags()
         // Drop a stale selection if its host was removed.
         if let id = selectedHostID, !remoteHosts.contains(where: { $0.id == id }) {
             selectedHostID = nil
@@ -1186,6 +1187,7 @@ final class AppModel {
             // Sharing / whatever RDP client opened.
             connectedRemoteHostID = remoteDesktop.isRunning ? host.id : nil
             status = "Connecting to \(host.name)…"
+            if host.os == .linux { streamConnectStatus(host) }
         } else {
             connectedRemoteHostID = nil
             status = "Couldn't start \(host.proto == .rdp ? "RDP" : "VNC") session for \(host.name)"
@@ -1200,6 +1202,196 @@ final class AppModel {
         remoteDesktop.stop()
         connectedRemoteHostID = nil
         status = "Remote session stopped"
+    }
+
+    // MARK: - PC: one-click Linux setup (gnome-remote-desktop over SSH)
+
+    /// True while `setupLinux` is running, so the UI can disable the button and
+    /// show a spinner.
+    var isSettingUpLinux = false
+
+    /// Live, line-by-line console output of the last/in-flight setup, shown in a
+    /// small terminal view so the user can watch it run.
+    var setupLog: [String] = []
+
+    /// Hosts that have completed a one-click setup at least once — drives whether
+    /// the always-on "Reset connection" control appears. Persisted in UserDefaults.
+    var linuxSetUpHostIDs: Set<UUID> = []
+
+    /// Live status readout streamed from the box on connect (Screen tab preview).
+    var remoteTerminalLog: [String] = []
+    var isStreamingRemoteTerminal = false
+
+    private func appendSetupLog(_ line: String) {
+        let clean = line.trimmingCharacters(in: CharacterSet(charactersIn: "\r"))
+        setupLog.append(clean)
+        if setupLog.count > 500 { setupLog.removeFirst(setupLog.count - 500) }
+    }
+
+    private func appendRemoteTerminalLog(_ line: String) {
+        let clean = line.trimmingCharacters(in: CharacterSet(charactersIn: "\r"))
+        guard !clean.isEmpty else { return }
+        remoteTerminalLog.append(clean)
+        if remoteTerminalLog.count > 200 { remoteTerminalLog.removeFirst(remoteTerminalLog.count - 200) }
+    }
+
+    func hasLinuxSetup(_ host: RemoteHost) -> Bool { linuxSetUpHostIDs.contains(host.id) }
+
+    private func loadLinuxSetupFlags() {
+        let ids = UserDefaults.standard.stringArray(forKey: "MimicOS.linuxSetUpHostIDs") ?? []
+        linuxSetUpHostIDs = Set(ids.compactMap(UUID.init))
+    }
+    private func markLinuxSetUp(_ host: RemoteHost) {
+        linuxSetUpHostIDs.insert(host.id)
+        UserDefaults.standard.set(linuxSetUpHostIDs.map(\.uuidString), forKey: "MimicOS.linuxSetUpHostIDs")
+    }
+
+    /// Configures (or, with `reset: true`, tears down and re-configures)
+    /// gnome-remote-desktop on an Ubuntu host over SSH, so RDP shares the user's
+    /// real desktop. Streams progress into `setupLog`, then verifies port 3389 is
+    /// actually listening before marking the host set up.
+    ///
+    /// Why gnome-remote-desktop and not xrdp: on modern Ubuntu (23.10+/GNOME), the
+    /// built-in gnome-remote-desktop already owns RDP port 3389 — xrdp can't even
+    /// bind it (EADDRINUSE) — and it mirrors the *live* Wayland desktop, which xrdp
+    /// can't do. We disable xrdp if present, then drive `grdctl`.
+    ///
+    /// Needs `sshpass` on the Mac and the saved login password (also the RDP
+    /// password grdctl stores). SSH uses port 22; the host's saved port is its RDP
+    /// port, not SSH.
+    func setupLinux(_ host: RemoteHost, reset: Bool = false) async {
+        guard host.os == .linux else { return }
+        guard RemotePC.sshpassAvailable else {
+            status = "One-click setup needs sshpass — run `brew install sshpass`, then try again."
+            return
+        }
+        let password = SecretStore.remotePassword(hostID: host.idString) ?? ""
+        guard !password.isEmpty else {
+            passwordReentryHost = host
+            status = "Enter the Linux login password first — it's needed to set up Remote Desktop."
+            return
+        }
+        guard !host.username.isEmpty else {
+            status = "Add the Linux username to this computer first (Settings tab)."
+            return
+        }
+
+        isSettingUpLinux = true
+        setupLog = []
+        defer { isSettingUpLinux = false }
+
+        appendSetupLog("$ Connecting to \(host.username)@\(host.host):\(RemotePC.sshPort)…")
+        status = reset
+            ? "Resetting Remote Desktop on \(host.name)…"
+            : "Setting up Remote Desktop on \(host.name)…"
+
+        // The login password is the first stdin line (consumed by `read PW`), then
+        // reused for `sudo -S` and as the RDP credential grdctl stores. Single
+        // quotes around "$PW" keep any special characters literal.
+        let resetBlock = reset ? """
+        echo ">>> Resetting — clearing existing Remote Desktop config…"
+        grdctl rdp disable 2>/dev/null || true
+        grdctl rdp clear-credentials 2>/dev/null || true
+        echo "$PW" | sudo -S -p '' systemctl disable --now xrdp 2>/dev/null || true
+
+        """ : ""
+
+        let script = """
+        read -r PW
+        set -u
+        \(resetBlock)echo ">>> Checking the desktop environment…"
+        if ! command -v grdctl >/dev/null 2>&1; then
+          echo ">>> Installing gnome-remote-desktop…"
+          echo "$PW" | sudo -S -p '' DEBIAN_FRONTEND=noninteractive apt-get update -y
+          echo "$PW" | sudo -S -p '' DEBIAN_FRONTEND=noninteractive apt-get install -y gnome-remote-desktop
+        fi
+
+        echo ">>> Freeing RDP port 3389 (disabling xrdp if installed)…"
+        echo "$PW" | sudo -S -p '' systemctl disable --now xrdp 2>/dev/null || true
+
+        echo ">>> Configuring GNOME Remote Desktop (RDP)…"
+        grdctl rdp set-credentials "\(host.username)" "$PW"
+        grdctl rdp disable-view-only || true
+        grdctl rdp enable
+
+        echo ">>> Enabling the Remote Desktop service…"
+        systemctl --user enable --now gnome-remote-desktop.service 2>/dev/null || true
+        # Make sure it keeps serving when you're logged in; allow the port through ufw.
+        echo "$PW" | sudo -S -p '' ufw allow 3389/tcp 2>/dev/null || true
+        echo "$PW" | sudo -S -p '' ufw allow 22/tcp 2>/dev/null || true
+
+        echo ">>> Verifying it's listening on 3389…"
+        sleep 2
+        if (command -v ss >/dev/null && ss -tln | grep -q ':3389') || (command -v grdctl >/dev/null && grdctl status 2>/dev/null | grep -qi 'Status:.*enabled'); then
+          echo "MIMICOS_RDP_OK"
+          grdctl status 2>/dev/null | sed 's/^/    /' || true
+        else
+          echo "MIMICOS_RDP_NOTUP — current status:"
+          grdctl status 2>/dev/null | sed 's/^/    /' || true
+        fi
+        echo "MIMICOS_SETUP_DONE"
+        """
+
+        var sawDone = false
+        let code = await RemotePC.runUserScriptStreaming(
+            host: host.host, username: host.username, port: RemotePC.sshPort,
+            password: password, script: script) { [weak self] line in
+                guard let self else { return }
+                // Swallow the sudo password prompt echo if any leaks through.
+                if line.contains("[sudo]") { return }
+                self.appendSetupLog(line)
+                if line.contains("MIMICOS_SETUP_DONE") { sawDone = true }
+            }
+
+        appendSetupLog(">>> Checking that the Mac can reach Remote Desktop…")
+        let rdpPort = host.port ?? RemoteDesktop.Kind.rdp.defaultPort
+        let reachable = await RemotePC.isPortOpen(host.host, port: rdpPort)
+
+        if reachable {
+            markLinuxSetUp(host)
+            appendSetupLog("✓ Done — GNOME Remote Desktop is serving your live desktop on port \(rdpPort). Hit Start screen sharing.")
+            status = "\(host.name) is set up. Screen sharing now shows your real Linux desktop over RDP."
+            await pingHost(host)
+        } else if code == 0 && sawDone {
+            // The box reports configured but the Mac can't reach the port. The
+            // user-session service only serves while you're logged in at the Linux
+            // console — the usual cause. Mark it set up so the Reset button shows.
+            markLinuxSetUp(host)
+            appendSetupLog("⚠︎ Configured, but the Mac can't reach port \(rdpPort) yet.")
+            appendSetupLog("   GNOME Remote Desktop only accepts connections while you're logged in at the Linux screen. Log in there, then try Start screen sharing.")
+            status = "\(host.name): configured — make sure you're logged in at the Linux screen, then connect."
+        } else {
+            appendSetupLog("✗ Setup didn't finish (exit \(code)). See the log above.")
+            status = "Setup didn't finish on \(host.name) — check the setup log."
+        }
+    }
+
+    /// On connecting to a Linux host, stream a short status readout from the box
+    /// into the Screen tab's in-app preview. No Mac Terminal window opens.
+    private func streamConnectStatus(_ host: RemoteHost) {
+        let password = SecretStore.remotePassword(hostID: host.idString) ?? ""
+        guard !password.isEmpty, !host.username.isEmpty, RemotePC.sshpassAvailable else { return }
+        remoteTerminalLog = []
+        isStreamingRemoteTerminal = true
+        let statusCommand = """
+        echo "=== $(hostname) ==="; echo "user: $(whoami)"; uptime; \
+        echo "--- remote desktop ---"; grdctl status 2>/dev/null | grep -iE 'status|port|view-only' || echo "grdctl: n/a"
+        """
+        Task { [weak self] in
+            let code = await RemotePC.runUserScriptStreaming(
+                host: host.host, username: host.username, port: RemotePC.sshPort,
+                password: password, script: "read -r PW\n" + statusCommand) { [weak self] line in
+                    if line.contains("[sudo]") { return }
+                    self?.appendRemoteTerminalLog(line)
+                }
+            await MainActor.run {
+                guard let self else { return }
+                if code != 0 && self.remoteTerminalLog.isEmpty {
+                    self.appendRemoteTerminalLog("✗ Couldn't read status over SSH (exit \(code)).")
+                }
+                self.isStreamingRemoteTerminal = false
+            }
+        }
     }
 
     // MARK: - PC: reachability (ping)

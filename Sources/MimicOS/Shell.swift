@@ -162,6 +162,59 @@ enum Shell {
         }
     }
 
+    /// Runs a process and streams each line of its combined output to `onLine` as
+    /// it arrives (rather than returning everything at the end), so a live console
+    /// can show progress. Optionally writes `stdin` to the process first. Returns
+    /// the exit code. stdout and stderr are merged so order is preserved.
+    static func runStreaming(_ launchPath: String, _ arguments: [String],
+                             stdin: String? = nil,
+                             onLine: @escaping @MainActor (String) -> Void) async -> Int32 {
+        await withCheckedContinuation { continuation in
+            let process = Process()
+            if launchPath.contains("/") {
+                process.executableURL = URL(fileURLWithPath: launchPath)
+                process.arguments = arguments
+            } else {
+                process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+                process.arguments = [launchPath] + arguments
+            }
+            process.environment = ToolLocator.toolEnvironment()
+
+            let outPipe = Pipe()
+            process.standardOutput = outPipe
+            process.standardError = outPipe   // merge so order is preserved
+            let inPipe = Pipe()
+            if stdin != nil { process.standardInput = inPipe }
+
+            let outHandle = outPipe.fileHandleForReading
+            let reader = Task.detached {
+                do {
+                    for try await line in outHandle.bytes.lines {
+                        await MainActor.run { onLine(line) }
+                    }
+                } catch { /* pipe closed on exit */ }
+            }
+
+            process.terminationHandler = { proc in
+                Task {
+                    _ = await reader.value          // drain any remaining lines
+                    continuation.resume(returning: proc.terminationStatus)
+                }
+            }
+
+            do {
+                try process.run()
+                if let stdin, let data = stdin.data(using: .utf8) {
+                    inPipe.fileHandleForWriting.write(data)
+                    try? inPipe.fileHandleForWriting.close()
+                }
+            } catch {
+                reader.cancel()
+                continuation.resume(returning: -1)
+            }
+        }
+    }
+
     /// Launches a long-running process (e.g. scrcpy) and returns the handle
     /// immediately so the caller can terminate it later. Output is inherited.
     @discardableResult

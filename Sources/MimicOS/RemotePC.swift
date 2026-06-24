@@ -67,6 +67,56 @@ enum RemotePC {
         }
     }
 
+    /// The SSH port. gnome-remote-desktop / RDP use 3389; SSH is always 22.
+    static let sshPort = 22
+
+    /// Checks whether a TCP port on `host` is open (accepting connections), with a
+    /// short timeout. Used to verify gnome-remote-desktop is actually listening on
+    /// 3389 after setup, rather than trusting the script's self-report. Uses
+    /// `nc -z` (preinstalled on macOS).
+    static func isPortOpen(_ host: String, port: Int, timeout: Int = 3) async -> Bool {
+        let result = await Shell.run("/usr/bin/nc", ["-z", "-G", "\(timeout)", host, "\(port)"])
+        return result.exitCode == 0
+    }
+
+    /// Runs a shell script on the remote host **as the logged-in user** (not root),
+    /// streaming each output line to `onLine` for a live console. The script can
+    /// still elevate individual commands with `sudo -S` — the login password is fed
+    /// as the first stdin line, so the first `sudo -S` reads it without a prompt.
+    /// Returns the exit code. Needs `sshpass`.
+    ///
+    /// No PTY (`-tt`) is used: the password travels purely on a plain stdin pipe, so
+    /// it can never echo into the captured output. Output still streams reasonably
+    /// because the script's `echo` lines flush on their own.
+    static func runUserScriptStreaming(host: String, username: String, port: Int?,
+                                       password: String, script: String,
+                                       onLine: @escaping @MainActor (String) -> Void) async -> Int32 {
+        guard sshpassAvailable else {
+            await MainActor.run { onLine("error: sshpass not installed — run `brew install sshpass`.") }
+            return 127
+        }
+        let target = username.isEmpty ? host : "\(username)@\(host)"
+        var sshArgs = ["-o", "StrictHostKeyChecking=no",
+                       "-o", "UserKnownHostsFile=/dev/null",
+                       "-o", "ConnectTimeout=10"]
+        if let port { sshArgs += ["-p", "\(port)"] }
+        // The script is base64-encoded and decoded into a process-substitution FILE
+        // that bash executes (`bash <(… | base64 -d)`). That keeps the script off
+        // stdin, so stdin is free for the *only* thing we send there — the login
+        // password — which the script captures with one `read -r PW` and then feeds
+        // to each `sudo -S` via a here-string. (If the script came in on stdin via
+        // `bash -s`, bash would run the password line as the script's first
+        // command.) base64 also sidesteps every shell-quoting hazard.
+        let b64 = Data(script.utf8).base64EncodedString()
+        // Force bash for the outer shell too — process substitution `<()` isn't
+        // available under dash/sh, which is the default login shell on Debian.
+        let remote = "bash -c 'bash <(echo \(b64) | base64 -d)'"
+        let stdin = password + "\n"
+        return await Shell.runStreaming(ToolLocator.path(for: "sshpass"),
+                                        ["-p", password, "ssh"] + sshArgs + [target, remote],
+                                        stdin: stdin, onLine: onLine)
+    }
+
     // MARK: - File transfer hand-off
 
     /// Opens the PC's file share in Finder. For Windows hosts this is an SMB
