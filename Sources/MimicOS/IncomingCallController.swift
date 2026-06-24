@@ -27,6 +27,9 @@ final class IncomingCallController {
     var onSilence: (() -> Void)?
     var onIgnore: (() -> Void)?
     var onMute: (() -> Void)?
+    /// Hides the panel without affecting the call (the call keeps running on the
+    /// phone). Wired to the close (✕) button on an active call.
+    var onClose: (() -> Void)?
 
     /// Current call values, kept so a Silence tap can re-render the same call.
     private var name: String?
@@ -39,8 +42,9 @@ final class IncomingCallController {
     /// Shows (or updates) the panel for a call. `name` is the resolved contact
     /// name (if any), `number` the raw number. `deviceName` labels which phone.
     func show(name: String?, number: String?, deviceName: String, phase: Phase) {
+        let phaseChanged = self.phase != phase
         // Reset transient toggles when a new call appears or the phase changes.
-        if self.number != number || self.phase != phase {
+        if self.number != number || phaseChanged {
             self.silenced = false
             self.muted = false
         }
@@ -49,9 +53,13 @@ final class IncomingCallController {
         self.deviceName = deviceName
         self.phase = phase
 
-        if panel == nil { buildPanel() }
+        let isNew = panel == nil
+        if isNew { buildPanel() }
         applyRootView()
-        positionTopRight()
+        // Pin to the top-right only when the panel first appears or the call
+        // advances to a new phase. Once it's an active call, leave it wherever
+        // the user dragged it (don't yank it back every refresh).
+        if isNew || phaseChanged { positionTopRight() }
         panel?.orderFrontRegardless()
     }
 
@@ -93,7 +101,8 @@ final class IncomingCallController {
             decline: { [weak self] in self?.onDecline?() },
             silence: { [weak self] in self?.onSilence?() },
             ignore: { [weak self] in self?.onIgnore?() },
-            mute: { [weak self] in self?.onMute?() }
+            mute: { [weak self] in self?.onMute?() },
+            close: { [weak self] in self?.onClose?() }
         )
         hosting?.rootView = card
     }
@@ -102,7 +111,7 @@ final class IncomingCallController {
         let placeholder = CallCard(title: "", subtitle: "", glyph: "phone.fill",
                                    phase: .incoming, silenced: false, muted: false,
                                    answer: {}, decline: {}, silence: {},
-                                   ignore: {}, mute: {})
+                                   ignore: {}, mute: {}, close: {})
         let host = NSHostingView(rootView: placeholder)
         // Wide enough for four uniform buttons (Decline/Silence/Ignore/Answer).
         let size = NSSize(width: 380, height: 168)
@@ -118,6 +127,9 @@ final class IncomingCallController {
         p.backgroundColor = .clear
         p.isOpaque = false
         p.hasShadow = true
+        // Let the user drag the panel anywhere by grabbing the card itself
+        // (it's borderless, so there's no title bar to drag).
+        p.isMovableByWindowBackground = true
         // Show above full-screen apps and on every Space, like an alert.
         p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         host.frame = NSRect(origin: .zero, size: size)
@@ -136,12 +148,25 @@ final class IncomingCallController {
     }
 
     private func subtitleText() -> String {
-        if silenced { return "Silenced · \(deviceName)" }
-        switch phase {
-        case .incoming: return "Incoming call · \(deviceName)"
-        case .outgoing: return "Calling… · \(deviceName)"
-        case .active:   return "On call · \(deviceName)"
+        // The status (what the call is doing) plus the device it's on.
+        let status: String
+        if silenced {
+            status = "Silenced"
+        } else {
+            switch phase {
+            case .incoming: status = "Incoming call"
+            case .outgoing: status = "Calling…"
+            case .active:   status = "On call"
+            }
         }
+        // Always surface the raw number on the subtitle line — but only when the
+        // title is showing a contact name (otherwise the title is already the
+        // number and repeating it is noise).
+        if let num = number, !num.isEmpty,
+           let n = name, !n.isEmpty {
+            return "\(num) · \(status) · \(deviceName)"
+        }
+        return "\(status) · \(deviceName)"
     }
 
     private func glyph(for phase: Phase) -> String {
@@ -183,6 +208,7 @@ struct CallCard: View {
     let silence: () -> Void
     let ignore: () -> Void
     let mute: () -> Void
+    let close: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -202,6 +228,19 @@ struct CallCard: View {
                         .lineLimit(1)
                 }
                 Spacer()
+                // On an active call, let the user dismiss the panel without
+                // ending the call — it keeps running on the phone.
+                if phase == .active {
+                    Button(action: close) {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundStyle(.white.opacity(0.6))
+                            .frame(width: 22, height: 22)
+                            .background(.white.opacity(0.08), in: Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("Hide this panel (the call stays active on your phone)")
+                }
             }
 
             HStack(spacing: 10) {

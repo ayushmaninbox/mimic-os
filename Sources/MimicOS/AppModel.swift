@@ -143,10 +143,6 @@ final class AppModel {
     var isLoadingMessages = false
     var messageSearch = ""
     var selectedThreadID: String?
-    /// When messaging a contact with no SMS history, holds who to start a new
-    /// conversation with so the Messages tab shows a compose box.
-    var pendingComposeNumber: String?
-    var pendingComposeName: String?
 
     @ObservationIgnored private let callController = IncomingCallController()
     /// Serial whose call is currently shown, and the last call state we saw for
@@ -2431,7 +2427,23 @@ final class AppModel {
         callController.onMute = { [weak self] in
             Task { await self?.toggleCallMute() }
         }
+        callController.onClose = { [weak self] in
+            self?.hideCallPanel()
+        }
     }
+
+    /// Hides the call panel at the user's request (the ✕ on an active call)
+    /// without touching the call itself — it stays connected on the phone. Keeps
+    /// the panel suppressed for the rest of this call so the poller won't re-pop
+    /// it on the next state refresh.
+    private func hideCallPanel() {
+        panelHiddenForCall = currentCallNumber ?? ""
+        callController.dismiss()
+    }
+
+    /// Number of the active call whose panel the user dismissed with ✕, so the
+    /// poller stays quiet until that call ends. nil means nothing is suppressed.
+    @ObservationIgnored private var panelHiddenForCall: String?
 
     /// One poll of the selected device's call state. Shows the panel for an
     /// incoming ring OR an outgoing call, keeps it up (relabeled) once connected,
@@ -2456,6 +2468,11 @@ final class AppModel {
             if let ignored = ignoredCallNumber, ignored == (status.number ?? "") {
                 return
             }
+            // If the user dismissed the active-call panel with ✕, keep it hidden
+            // for the rest of this call (the call itself is unaffected).
+            if let hidden = panelHiddenForCall, hidden == (status.number ?? "") {
+                return
+            }
             let phase: IncomingCallController.Phase =
                 status.state == .ringing ? .incoming
                 : status.state == .dialing ? .outgoing
@@ -2478,8 +2495,9 @@ final class AppModel {
             }
         case .idle:
             // Declined, hung up, or ended → take the panel down and clear the
-            // per-call ignore so the next call shows normally.
+            // per-call ignore/hide so the next call shows normally.
             ignoredCallNumber = nil
+            panelHiddenForCall = nil
             if ringingSerial != nil { dismissCallPanel() }
         }
     }
@@ -2700,40 +2718,23 @@ final class AppModel {
         return contacts.first { $0.number.filter(\.isNumber).hasSuffix(tail) }?.name
     }
 
-    /// Opens the phone's SMS composer to reply to `number` with `body`.
-    func sendSMS(to number: String, body: String) async {
-        guard let serial = selectedSerial,
-              selectedDevice?.state.isUsable == true else {
-            status = "Select a connected device first"
-            return
-        }
-        await ADB.composeSMS(serial, number: number, body: body)
-        status = "Opened SMS composer on phone"
-    }
-
-    /// Opens the Messages tab focused on the conversation with `number` (from a
-    /// contact's Message button), so the user reads/replies on the Mac rather
-    /// than the action silently happening on the phone. Loads messages if needed
-    /// and pre-selects the matching thread.
+    /// Opens the Messages tab focused on the existing conversation with `number`
+    /// (from a contact's View-messages button) so the user can read the thread on
+    /// the Mac. View-only — texting is disabled, so there's nothing to do when no
+    /// history exists beyond saying so.
     func openConversation(number: String, name: String?) async {
         selectedTab = .messages
-        pendingComposeNumber = nil
-        pendingComposeName = nil
         if conversations.isEmpty { await refreshMessages() }
         // Find an existing thread for this number (compare trailing digits).
         let tail = String(number.filter(\.isNumber).suffix(10))
+        messageSearch = ""
         if let convo = conversations.first(where: {
             $0.address.filter(\.isNumber).hasSuffix(tail)
         }) {
-            messageSearch = ""
             selectedThreadID = convo.threadID
         } else {
-            // No history yet — show a compose box to start a new conversation.
             selectedThreadID = nil
-            messageSearch = ""
-            pendingComposeNumber = number
-            pendingComposeName = name
-            status = "New message to \(name ?? number)"
+            status = "No messages with \(name ?? number)"
         }
     }
 

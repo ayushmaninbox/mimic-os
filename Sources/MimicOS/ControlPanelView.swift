@@ -294,7 +294,7 @@ private struct ContactsTab: View {
     }
 }
 
-/// A contact row with Call and Message actions.
+/// A contact row with Call and View-messages actions.
 private struct ContactRow: View {
     @Environment(AppModel.self) private var model
     let contact: ADB.Contact
@@ -310,7 +310,7 @@ private struct ContactRow: View {
             Spacer()
             Button { Task { await model.openConversation(number: contact.number, name: contact.name) } } label: {
                 Image(systemName: "message.fill").foregroundStyle(.blue)
-            }.buttonStyle(.plain).help("Message \(contact.name)")
+            }.buttonStyle(.plain).help("View messages with \(contact.name)")
             Button { Task { await model.dial(contact.number) } } label: {
                 Image(systemName: "phone.fill").foregroundStyle(.green)
             }.buttonStyle(.plain).help("Call \(contact.name)")
@@ -431,7 +431,6 @@ private struct ConversationSidebar: View {
                                 selected: model.selectedThreadID == convo.threadID
                             ) {
                                 model.selectedThreadID = convo.threadID
-                                model.pendingComposeNumber = nil
                             }
                             Divider()
                         }
@@ -470,17 +469,14 @@ private struct ConversationListRow: View {
     }
 }
 
-/// Right pane: the selected conversation's messages + compose box. Falls back to
-/// a "new message" composer when starting a fresh conversation, or a placeholder
-/// when nothing is selected.
+/// Right pane: the selected conversation's messages, read-only. Texting is
+/// intentionally disabled — there's no compose box anywhere — so SMS can be
+/// viewed but never sent from the Mac.
 private struct ChatDetail: View {
     @Environment(AppModel.self) private var model
-    @State private var draft = ""
 
     var body: some View {
-        if let number = model.pendingComposeNumber {
-            newConversation(number: number, name: model.pendingComposeName)
-        } else if let convo = model.selectedConversation {
+        if let convo = model.selectedConversation {
             conversation(convo)
         } else {
             placeholder
@@ -532,55 +528,16 @@ private struct ChatDetail: View {
                 .onChange(of: convo.messages.count) { _, _ in scrollToEnd(proxy, convo) }
             }
 
-            composeBar(to: convo.address)
-        }
-    }
-
-    private func newConversation(number: String, name: String?) -> some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 10) {
-                Image(systemName: "square.and.pencil").foregroundStyle(.blue)
-                Text("New message to \(name ?? number)").font(.headline)
-                Spacer()
-                Button {
-                    model.pendingComposeNumber = nil; model.pendingComposeName = nil
-                } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary) }
-                    .buttonStyle(.plain)
-            }
-            .padding(12)
+            // Read-only notice in place of a compose box — texting is disabled.
             Divider()
-            Spacer()
-            Text("No messages yet").foregroundStyle(.secondary)
-            Spacer()
-            composeBar(to: number)
-        }
-    }
-
-    private func composeBar(to number: String) -> some View {
-        VStack(spacing: 2) {
-            Divider()
-            HStack(spacing: 8) {
-                TextField("Type a message…", text: $draft)
-                    .textFieldStyle(.roundedBorder)
-                    .onSubmit { send(to: number) }
-                Button { send(to: number) } label: {
-                    Image(systemName: "paperplane.fill")
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(draft.trimmingCharacters(in: .whitespaces).isEmpty)
+            HStack(spacing: 6) {
+                Image(systemName: "eye")
+                Text("View only — texting is disabled")
             }
-            .padding(10)
-            Text("Send opens it on your phone ready to send — Android blocks non-default SMS apps from sending directly.")
-                .font(.caption2).foregroundStyle(.secondary)
-                .padding(.horizontal, 10).padding(.bottom, 8)
+            .font(.caption2).foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 8)
         }
-    }
-
-    private func send(to number: String) {
-        let body = draft
-        guard !body.trimmingCharacters(in: .whitespaces).isEmpty else { return }
-        Task { await model.sendSMS(to: number, body: body) }
-        draft = ""
     }
 
     private func scrollToEnd(_ proxy: ScrollViewProxy, _ convo: ADB.Conversation) {

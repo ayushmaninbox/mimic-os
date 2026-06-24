@@ -627,7 +627,8 @@ enum ADB {
 
     // MARK: - Telephony (incoming-call detection & control)
 
-    /// Direction/phase of the current call, derived from `dumpsys telecom`.
+    /// Direction/phase of the current call, derived from `dumpsys
+    /// telephony.registry`.
     enum CallState {
         case idle       // no call
         case ringing    // incoming call ringing (not yet answered)
@@ -643,50 +644,81 @@ enum ADB {
         var number: String?
     }
 
-    /// Reads the current call from `dumpsys telecom`. This is far richer than
-    /// `telephony.registry`: it reports incoming vs. outgoing, the connected/
-    /// ringing/dialing phase, AND the phone number (which modern Android hides
-    /// from `telephony.registry`). Works with no app on the phone and no mirror.
-    /// Returns `nil` if the device isn't reachable or has no telecom service.
+    /// Reads the current call from `dumpsys telephony.registry`. We deliberately
+    /// do NOT use `dumpsys telecom`: on many OEM builds (e.g. the Jio/Android
+    /// build this app targets) telecom emits no `Call id=` summary line at all,
+    /// and worse, it *redacts* the number to `tel:*************` for privacy. The
+    /// telephony registry instead exposes the raw, unredacted number in
+    /// `mCallIncomingNumber=` along with the precise call state — and it works
+    /// for any country code (+91, +1, …) since we never parse or assume a prefix.
+    ///
+    /// State mapping (`mCallState`): 0=idle, 1=ringing, 2=offhook. When offhook
+    /// we read `mForegroundCallState` to tell a still-dialing outgoing call
+    /// (DIALING/ALERTING) from a connected one (ACTIVE).
+    ///
+    /// The incoming number is only populated by Android while ringing, so for
+    /// outgoing/active calls we fall back to the most recent call-log entry,
+    /// which carries the full number too. Returns `nil` if the device isn't
+    /// reachable.
     static func callStatus(_ serial: String) async -> CallStatus? {
-        // Filter on the PHONE side so only the call summary line(s) come back
-        // (a few lines) instead of the full ~1000-line telecom dump. This keeps
-        // the output tiny and the call fast — important since this polls often.
         let result = await Shell.run(ToolLocator.adb,
-            ["-s", serial, "shell", "dumpsys telecom | grep -m1 'Call id='"])
-        // grep exits 1 when there's no match (no active call) — that's not an
-        // error, it means idle. Only a launch failure (negative code) is fatal.
+            ["-s", serial, "shell",
+             "dumpsys telephony.registry | grep -E " +
+             "'mCallState=|mForegroundCallState=|mCallIncomingNumber='"])
         guard result.exitCode >= 0 else { return nil }
 
-        // The authoritative current-call summary is the `[Call id=...]` line,
-        // which carries both `state=` and `handle=tel:NUMBER`. No such line means
-        // there is no call.
-        let line = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard line.contains("Call id=") else {
+        // The fields repeat once per SIM/subscription; the first occurrence of
+        // each is the active voice subscription, which is what we want.
+        func firstValue(_ key: String) -> String? {
+            for line in result.stdout.split(whereSeparator: \.isNewline) {
+                if let r = line.range(of: key) {
+                    return line[r.upperBound...].trimmingCharacters(in: .whitespaces)
+                }
+            }
+            return nil
+        }
+
+        guard let callStateRaw = firstValue("mCallState=").flatMap({ Int($0) }) else {
             return CallStatus(state: .idle, number: nil)
         }
 
-        let state: CallState
-        if line.contains("state=RINGING") {
-            state = .ringing
-        } else if line.contains("state=DIALING") || line.contains("state=CONNECTING") {
-            state = .dialing
-        } else if line.contains("state=ACTIVE") || line.contains("state=HOLDING") {
-            state = .active
-        } else {
-            // NEW/DISCONNECTED/etc. — treat as no active call.
+        // Precise foreground states (android.telephony PreciseCallState):
+        // 1=ACTIVE, 3=DIALING, 4=ALERTING.
+        let fg = firstValue("mForegroundCallState=").flatMap { Int($0) } ?? 0
+        // mCallIncomingNumber is the raw number, but only while ringing.
+        let incoming = firstValue("mCallIncomingNumber=")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .flatMap { $0.isEmpty ? nil : $0 }
+
+        switch callStateRaw {
+        case 1:  // RINGING — incoming, number is in mCallIncomingNumber.
+            return CallStatus(state: .ringing, number: incoming)
+        case 2:  // OFFHOOK — outgoing (dialing/alerting) or connected (active).
+            let state: CallState = (fg == 3 || fg == 4) ? .dialing : .active
+            // No incoming number for these; the latest call-log row has it.
+            let number: String?
+            if let incoming { number = incoming }
+            else { number = await latestCallNumber(serial) }
+            return CallStatus(state: state, number: number)
+        default: // 0 / unknown — no call.
             return CallStatus(state: .idle, number: nil)
         }
+    }
 
-        // Pull the number out of `handle=tel:+123...,` (comma- or space-terminated).
-        var number: String?
-        if let r = line.range(of: "handle=tel:") {
-            let tail = line[r.upperBound...]
-            let value = tail.prefix { $0 != "," && $0 != " " && $0 != "]" }
-            let trimmed = value.trimmingCharacters(in: .whitespaces)
-            if !trimmed.isEmpty { number = trimmed }
-        }
-        return CallStatus(state: state, number: number)
+    /// The phone number of the most recent call-log entry, used to label an
+    /// outgoing/active call (where the live registry doesn't carry a number).
+    /// Returns the full number including country code, or `nil` if unavailable.
+    private static func latestCallNumber(_ serial: String) async -> String? {
+        let result = await Shell.run(ToolLocator.adb,
+            ["-s", serial, "shell",
+             "content query --uri content://call_log/calls " +
+             "--projection number --sort 'date DESC'"])
+        guard result.exitCode == 0,
+              let r = result.stdout.range(of: "number=") else { return nil }
+        let value = result.stdout[r.upperBound...]
+            .prefix { $0 != "," && $0 != "\n" && $0 != "\r" }
+            .trimmingCharacters(in: .whitespaces)
+        return value.isEmpty ? nil : value
     }
 
     /// Resolves a phone number to a saved contact name via the Contacts
@@ -866,18 +898,6 @@ enum ADB {
                                 contactName: nil, lastBody: first.body,
                                 lastDate: first.date, messages: list)
         }
-    }
-
-    /// Opens the phone's SMS composer prefilled with `number` and `body`. The
-    /// user taps send on the phone — reliable and works without being the default
-    /// SMS app (direct send via `isms` is version-fragile and often blocked).
-    static func composeSMS(_ serial: String, number: String, body: String) async {
-        let n = number.trimmingCharacters(in: .whitespaces)
-        guard !n.isEmpty else { return }
-        _ = await Shell.run(ToolLocator.adb,
-            ["-s", serial, "shell", "am", "start", "-a",
-             "android.intent.action.SENDTO", "-d", "sms:\(n)",
-             "--es", "sms_body", body])
     }
 
     /// KeyEvent codes for call control. These are injected as hardware keys, so
