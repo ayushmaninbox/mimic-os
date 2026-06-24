@@ -1643,13 +1643,22 @@ final class AppModel {
                               currentBytes: @escaping @Sendable () async -> Int64?) -> Task<Void, Never> {
         Task { [weak self] in
             while !Task.isCancelled {
-                if let now = await currentBytes(), total > 0 {
+                let startTime = Date()
+                let now = await currentBytes()
+                let elapsed = Date().timeIntervalSince(startTime)
+
+                if let now, total > 0 {
                     let fraction = Double(now) / Double(total)
                     if !fraction.isNaN && !fraction.isInfinite {
                         await MainActor.run { self?.updateProgress(id, bytesTransferred: now, fraction: fraction) }
                     }
                 }
-                try? await Task.sleep(for: .milliseconds(150))
+                
+                // Dynamically throttle sleep time.
+                // If check is fast, sleep 1.0 second.
+                // If check takes T seconds, sleep T * 3.0 seconds to allow standard transfers to proceed unimpeded.
+                let sleepSeconds = max(1.0, elapsed * 3.0)
+                try? await Task.sleep(for: .milliseconds(Int(sleepSeconds * 1000)))
             }
         }
     }

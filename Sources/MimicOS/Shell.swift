@@ -140,16 +140,30 @@ enum Shell {
             }
             process.environment = ToolLocator.toolEnvironment()
 
-            let outPipe = Pipe(); let errPipe = Pipe()
+            let outPipe = Pipe()
+            let errPipe = Pipe()
             process.standardOutput = outPipe
             process.standardError = errPipe
+
+            final class Box: @unchecked Sendable {
+                var outData = Data()
+                var errData = Data()
+            }
+            let box = Box()
+            let outHandle = outPipe.fileHandleForReading
+            let errHandle = errPipe.fileHandleForReading
+            let drainQueue = DispatchQueue(label: "com.ayushman.mimicos.shell.runCancellable", attributes: .concurrent)
+
+            drainQueue.async { box.outData = outHandle.readDataToEndOfFile() }
+            drainQueue.async { box.errData = errHandle.readDataToEndOfFile() }
+
             process.terminationHandler = { proc in
-                let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
-                let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                drainQueue.sync(flags: .barrier) {} // ensure both reads finished
                 continuation.resume(returning: ProcessResult(
                     exitCode: proc.terminationStatus,
-                    stdout: String(decoding: outData, as: UTF8.self),
-                    stderr: String(decoding: errData, as: UTF8.self)))
+                    stdout: String(decoding: box.outData, as: UTF8.self),
+                    stderr: String(decoding: box.errData, as: UTF8.self)
+                ))
             }
             do {
                 try process.run()
